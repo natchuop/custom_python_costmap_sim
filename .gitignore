@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Generated converted maps and previews
+converted_maps/
