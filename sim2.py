@@ -71,6 +71,7 @@ ROBOT_SPEED_CELLS_PER_STEP = 1.0
 
 ROBOT_FOOTPRINT_ROWS = 2
 ROBOT_FOOTPRINT_COLS = 2
+ROBOT_VISUAL_SCALE = 0.5
 
 SPAWN_COLLISION_GRACE_STEPS = 100
 
@@ -4628,10 +4629,15 @@ def draw_robot_footprint(ax, anchor_cell, **kwargs):
     """
     r, c = anchor_cell
 
+    visual_width = ROBOT_FOOTPRINT_COLS * ROBOT_VISUAL_SCALE
+    visual_height = ROBOT_FOOTPRINT_ROWS * ROBOT_VISUAL_SCALE
+    center_x = c - 0.5 + ROBOT_FOOTPRINT_COLS / 2.0
+    center_y = r - 0.5 + ROBOT_FOOTPRINT_ROWS / 2.0
+
     rect = plt.Rectangle(
-        (c - 0.5, r - 0.5),
-        ROBOT_FOOTPRINT_COLS,
-        ROBOT_FOOTPRINT_ROWS,
+        (center_x - visual_width / 2.0, center_y - visual_height / 2.0),
+        visual_width,
+        visual_height,
         fill=False,
         linewidth=2.0,
         zorder=10,
