@@ -69,9 +69,9 @@ ANIMATION_INTERVAL_MS = 1
 CELL_SIZE = 1.0
 ROBOT_SPEED_CELLS_PER_STEP = 1.0
 
-ROBOT_FOOTPRINT_ROWS = 2
-ROBOT_FOOTPRINT_COLS = 2
-ROBOT_VISUAL_SCALE = 0.5
+ROBOT_FOOTPRINT_ROWS = 1
+ROBOT_FOOTPRINT_COLS = 1
+ROBOT_VISUAL_SCALE = 1.0
 
 SPAWN_COLLISION_GRACE_STEPS = 100
 
@@ -100,7 +100,7 @@ ACTION_POINT_MIN_SPACING_RATIO = 0.18
 ACTION_POINT_OBSTACLE_RADIUS = 4
 ACTION_POINT_CORNER_RADIUS = 2
 
-# Do not place goals directly on the boundary. The robot has a 3x3 footprint,
+# Do not place goals directly on the boundary. The robot has a 1x1 footprint,
 # because apparently occupying physical space matters.
 ACTION_POINT_EDGE_MARGIN_CELLS = max(
     ROBOT_FOOTPRINT_ROWS,
@@ -176,7 +176,7 @@ def cell_to_xy(cell):
     """
     Converts the robot's anchor cell to the center of its physical footprint.
 
-    For a 2x2 robot, position_cell is the top-left anchor cell.
+    For a 1x1 robot, position_cell is the top-left anchor cell.
     The visual marker and lidar origin are placed at the footprint center.
     """
     row, col = cell
@@ -200,8 +200,8 @@ def robot_footprint_cells(anchor_cell):
     The robot position is treated as the top-left anchor cell of the footprint.
 
     Example:
-        ROBOT_FOOTPRINT_ROWS = 2
-        ROBOT_FOOTPRINT_COLS = 2
+        ROBOT_FOOTPRINT_ROWS = 1
+        ROBOT_FOOTPRINT_COLS = 1
 
         anchor_cell = (10, 20)
 
@@ -479,7 +479,7 @@ def anchor_enterable_on_static_grid(grid, anchor_cell):
 
 
 def topology_bottleneck_score(grid, cell, radius=3):
-    """Cheap articulation proxy for a 2x2-footprint planning graph.
+    """Cheap articulation proxy for a 1x1-footprint planning graph.
 
     High scores indicate narrow, low-branching regions with obstacles pressing
     from opposing sides. Blocking these areas is operationally meaningful while
@@ -1951,7 +1951,8 @@ def filter_reachable_action_points(action_points, robot_specs, prior_grid):
     Removes action points that no robot can reach from its starting region.
 
     A goal being enterable is not enough. If no robot can route to it with
-    the 2x2 footprint planner, it should not be used as a pickup/dropoff goal.
+    the current robot-footprint planner, it should not be used as a pickup/dropoff
+    goal.
     """
     filtered = []
 
@@ -1982,6 +1983,63 @@ def filter_reachable_action_points(action_points, robot_specs, prior_grid):
         )
 
     return filtered
+
+
+def relocate_starts_for_goals(world, robot_specs, goals, prior_grid):
+    """Ensure every robot can reach at least two of the retained goals."""
+    used_starts = {tuple(spec["start"]) for spec in robot_specs}
+    forbidden_goals = set(goals)
+    free_cells = find_free_cells(prior_grid)
+
+    for spec in robot_specs:
+        start = tuple(spec["start"])
+        reachable_count = sum(
+            route_exists_for_prior(prior_grid, start, goal)
+            for goal in goals
+        )
+        if reachable_count >= 2:
+            continue
+
+        used_starts.discard(start)
+        replacement = None
+        candidates = sorted(
+            free_cells,
+            key=lambda cell: manhattan(tuple(cell), start),
+        )
+
+        for candidate in candidates:
+            try:
+                safe_candidate = nearest_safe_start_cell(
+                    world,
+                    candidate,
+                    forbidden=used_starts.union(forbidden_goals),
+                )
+            except ValueError:
+                continue
+
+            if safe_candidate in used_starts:
+                continue
+
+            candidate_reachability = sum(
+                route_exists_for_prior(prior_grid, safe_candidate, goal)
+                for goal in goals
+            )
+            if candidate_reachability >= 2:
+                replacement = safe_candidate
+                break
+
+        if replacement is None:
+            raise RuntimeError(
+                f"Robot {spec['robot_id']} has no start with access to "
+                "at least two retained goals"
+            )
+
+        spec["start"] = replacement
+        used_starts.add(replacement)
+        print(
+            f"Robot {spec['robot_id']} start relocated for retained goals: "
+            f"{start} -> {replacement}"
+        )
 
 def plan_to_reachable_fallback(
     belief_map,
@@ -3400,7 +3458,13 @@ def validate_start_and_goal(world, robot_specs, goal):
 
         seen_starts.add(start)
 
-def repair_delivery_tasks(world, tasks_by_robot, robot_specs, prior_grid):
+def repair_delivery_tasks(
+    world,
+    tasks_by_robot,
+    robot_specs,
+    prior_grid,
+    action_points=None,
+):
     """
     Keeps only tasks that are reachable for each robot.
 
@@ -3421,6 +3485,39 @@ def repair_delivery_tasks(world, tasks_by_robot, robot_specs, prior_grid):
         start = starts_by_robot[int(robot_id)]
         repaired_tasks = []
 
+        # With smaller footprints, connectivity can differ between robots and
+        # the round-robin task pairing may assign a valid point to the wrong
+        # robot. Keep the task count stable by building reachable replacements
+        # from the same action-point set when that happens.
+        candidate_points = []
+        source_points = action_points
+        if source_points is None:
+            source_points = [
+                point
+                for task in tasks
+                for point in (task.pickup, task.dropoff)
+            ]
+
+        for point in source_points:
+            point = nearest_enterable_cell(world, point)
+            if point not in candidate_points:
+                candidate_points.append(point)
+
+        fallback_pairs = []
+        for pickup in candidate_points:
+            if not route_exists_for_prior(prior_grid, start, pickup):
+                continue
+            for dropoff in candidate_points:
+                if pickup == dropoff:
+                    continue
+                if route_exists_for_prior(prior_grid, pickup, dropoff):
+                    fallback_pairs.append((pickup, dropoff))
+
+        if not fallback_pairs:
+            raise RuntimeError(
+                f"Robot {robot_id} has no reachable delivery tasks from start {start}"
+            )
+
         for task in tasks:
             pickup = nearest_enterable_cell(world, task.pickup)
             dropoff = nearest_enterable_cell(world, task.dropoff)
@@ -3439,12 +3536,12 @@ def repair_delivery_tasks(world, tasks_by_robot, robot_specs, prior_grid):
 
             if not can_reach_pickup or not can_reach_dropoff:
                 print(
-                    f"Skipping unreachable task for Robot {robot_id}: "
+                    f"Replacing unreachable task for Robot {robot_id}: "
                     f"start={start}, pickup={pickup}, dropoff={dropoff}, "
                     f"start_to_pickup={can_reach_pickup}, "
                     f"pickup_to_dropoff={can_reach_dropoff}"
                 )
-                continue
+                pickup, dropoff = fallback_pairs[len(repaired_tasks) % len(fallback_pairs)]
 
             repaired_tasks.append(
                 DeliveryTask(
@@ -3453,16 +3550,15 @@ def repair_delivery_tasks(world, tasks_by_robot, robot_specs, prior_grid):
                 )
             )
 
-        if not repaired_tasks:
-            raise RuntimeError(
-                f"Robot {robot_id} has no reachable delivery tasks from start {start}"
-            )
-
         repaired[robot_id] = repaired_tasks
 
     return repaired
 
-def build_robot_specs_and_goals(world, num_robots=DEFAULT_NUM_ROBOTS):
+def build_robot_specs_and_goals(
+    world,
+    num_robots=DEFAULT_NUM_ROBOTS,
+    prior_grid=None,
+):
     """
     Builds valid robot starts and action points from the actual map.
 
@@ -3541,6 +3637,65 @@ def build_robot_specs_and_goals(world, num_robots=DEFAULT_NUM_ROBOTS):
 
     goals = action_points.copy()
     display_goals = action_points.copy()
+
+    # A smaller footprint can expose connectivity that was hidden by the old
+    # 2x2 start placement. Move any isolated robot to the nearest safe cell
+    # that can reach at least two action points, preserving the robot count.
+    routing_grid = world.grid if prior_grid is None else prior_grid
+    action_point_set = set(action_points)
+
+    for spec in robot_specs:
+        start = tuple(spec["start"])
+        reachable_count = sum(
+            route_exists_for_prior(routing_grid, start, point)
+            for point in action_points
+        )
+
+        if reachable_count >= 2:
+            continue
+
+        old_start = start
+        used_starts.discard(old_start)
+        replacement = None
+
+        candidates = sorted(
+            free_cells,
+            key=lambda cell: manhattan(tuple(cell), old_start),
+        )
+
+        for candidate in candidates:
+            try:
+                safe_candidate = nearest_safe_start_cell(
+                    world,
+                    candidate,
+                    forbidden=used_starts.union(action_point_set),
+                )
+            except ValueError:
+                continue
+
+            if safe_candidate in used_starts:
+                continue
+
+            candidate_reachability = sum(
+                route_exists_for_prior(routing_grid, safe_candidate, point)
+                for point in action_points
+            )
+            if candidate_reachability >= 2:
+                replacement = safe_candidate
+                break
+
+        if replacement is None:
+            raise RuntimeError(
+                f"Robot {spec['robot_id']} has no start with access to "
+                "at least two action points"
+            )
+
+        spec["start"] = replacement
+        used_starts.add(replacement)
+        print(
+            f"Robot {spec['robot_id']} start relocated for footprint: "
+            f"{old_start} -> {replacement}"
+        )
 
     return robot_specs, goals, display_goals
 
@@ -3637,6 +3792,7 @@ def run_simulation(
     robot_specs, goals, display_goals = build_robot_specs_and_goals(
         world,
         num_robots=DEFAULT_NUM_ROBOTS,
+        prior_grid=prior_grid,
     )
 
     goals = filter_reachable_action_points(
@@ -3644,6 +3800,8 @@ def run_simulation(
         robot_specs,
         prior_grid,
     )
+
+    relocate_starts_for_goals(world, robot_specs, goals, prior_grid)
 
     display_goals = goals.copy()
 
@@ -3658,6 +3816,7 @@ def run_simulation(
         tasks_by_robot,
         robot_specs,
         prior_grid,
+        action_points=goals,
     )
 
     goal = goals[0]
