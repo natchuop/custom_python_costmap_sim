@@ -1,61 +1,42 @@
-NSF REU custom simulator: modularize vs main
-================================================
+NSF REU custom simulator: what changed
+=======================================
 
-This branch is the modularized fixed-manifest workflow.  Compared with the latest
-main branch, it adds the map_poisoning package orchestration, versioned scenario
-manifests, fixed attack schedules, per-run CSV/JSON auditing, the Tk GUI controls,
-the default upstream warehouse map, and the five selectable defense methods:
-full_trust, majority_vote, trust_fused, source_linked, and soft_probability.
-It also removes the standalone parity/audit helper scripts and treats the simulator
-as one public modular command.  The validated continuous-motion implementation in
-sim2.py and fusion implementation in defense_method_runner.py remain internal
-runtime components; they are not separate user-selectable engines.
+This version keeps the original warehouse simulation behavior while making the
+experiment easier to run, repeat, compare, and inspect.  The main program now
+uses the modular project workflow, but it still relies on the tested original
+movement and visualization code internally so that robot behavior is preserved.
 
-Detailed difference list
-------------------------
+Main differences from the older version
+----------------------------------------
 
-* **Project structure:** runtime responsibilities are organized under
-  `map_poisoning/` (configuration, scenario authoring, world, sensing, belief,
-  trust, fusion, planning, metrics, rollout, CLI, and UI) instead of being
-  exposed only through one monolithic command path.
-* **Entry point:** `main.py` is the public launcher for both the command line and
-  Tk interface.  There is no engine selector; runs use the modular application
-  workflow.
-* **Scenario reproducibility:** attack events, temporary-obstacle episodes,
-  robot starts, task queues, phase boundaries, and the map are saved in a versioned
-  `scenario_manifest.json`.  Replaying that manifest keeps the scenario fixed
-  while methods change.
-* **Method comparisons:** `--compare` runs `full_trust`, `majority_vote`,
-  `trust_fused`, and `source_linked` against the same manifest.  `soft_probability`
-  remains selectable with `--defense-method` and can be run against that same
-  manifest separately.
-* **Defense behavior:** fusion now has explicit method contracts, active claim
-  replacement for repeated sender/cell claims, trust-aware evidence, route-cost
-  calculations, and method-specific replan accounting.
-* **Trust and evidence logging:** trust updates, report admission, fusion effects,
-  evidence/probability deltas, and audit labels are written to `events.csv` rather
-  than being available only through console output.
-* **Robot metrics:** each run records deliveries, no-path steps, movement steps,
-  total distance, total replans, productive replans, blocked moves, trust timing,
-  and contradiction counts in `run_summary.csv` and `robot_timeseries.csv`.
-* **Map behavior:** the default map is the upstream warehouse map from
-  `custom_map_poisoning_costmap`; the attacker escape corridor fix is applied when
-  that map is loaded.
-* **Attack placement:** fake-obstacle reports are constrained by candidate
-  diversity and robot occupancy, so an obstacle is not placed inside another
-  robot's current footprint.  Adjacent placement remains allowed.
-* **Visualization:** non-headless runs show the warehouse animation, heatmap, and
-  plots through the existing validated simulator visualization path.
-* **Environment setup:** dependency installation and checks are consolidated in
-  `install_dependencies.py`; a separate `requirements.txt` is no longer needed.
-* **Repository cleanup:** obsolete parity/audit runners and verification helpers
-  were removed, and generated outputs, caches, editor state, and temporary files
-  are ignored by Git.
-* **Compatibility boundary:** although the public workflow is modular, `sim2.py`
-  still supplies the validated continuous-motion/footprint-planning loop and
-  visualization, while `defense_method_runner.py` supplies the operational fusion
-  implementation.  Removing those dependencies would be a future port, not a
-  behavior-preserving cleanup.
+* The project has one normal way to start the simulator: `main.py`.
+* The project is organized into smaller areas for the map, robots, sensing,
+  trust, defense methods, attacks, scenario setup, and data collection.
+* A scenario can be saved before a run.  This saves the map, robot starting
+  positions, delivery tasks, temporary obstacles, attack times, and phase times.
+  Every defense method can then be tested on exactly the same situation.
+* The comparison command runs the four main methods together:
+  `full_trust`, `majority_vote`, `trust_fused`, and `source_linked`.
+* `soft_probability` is still available and can be run separately using the
+  same saved scenario.
+* The simulator now records more useful results, including deliveries completed,
+  no-path steps, movement steps, distance traveled, replans, blocked moves,
+  trust changes, and contradictions.
+* Results are saved in easy-to-read CSV files instead of being available only in
+  the terminal.
+* The default map is the warehouse map from the linked GitHub project.  The
+  attacker escape route is kept open so it does not get trapped at the top-left
+  checkpoint area.
+* Fake obstacles are placed with checks so they do not appear directly under
+  another robot.  They may still appear next to a robot.
+* The old standalone comparison and audit helper scripts were removed.  Generated
+  results, caches, editor files, and temporary files are ignored by Git.
+
+There is still one important transition detail: the modular workflow uses the
+tested original movement, planning, fusion, and visualization code internally.
+This was kept intentionally because replacing it all at once could change the
+experiment results.  A future project step could move those pieces completely
+into the modular files, but that is not part of this cleanup.
 
 First-time setup from GitHub
 ----------------------------
@@ -64,72 +45,85 @@ First-time setup from GitHub
     cd custom_map_poisoning_costmap
     python install_dependencies.py --install --include-dev
 
-The dependency installer may be run with the system Python; a virtual environment
-is recommended but not required.  Verify the installation with:
+A virtual environment is recommended, but not required.  Check the installation
+and run the tests with:
 
     python install_dependencies.py --skip-gui
     python -m pytest -q
 
-Run a single simulation
------------------------
+Run one simulation
+------------------
 
     python main.py --headless --no-animation --seed 10 --defense-method source_linked --output-directory outputs/seed10_source
 
-Omit --headless and --no-animation to open the Tk interface and see the heatmap,
-graphs, and animation.  The main output files are run_summary.csv, events.csv,
-robot_timeseries.csv, scenario_manifest.json, audit_report.json, and the resolved
-configuration JSON files in the selected output directory.
+For the normal visual run, leave out `--headless --no-animation`.  The window will
+show the animation, heatmap, and graphs.
 
-Run multiple methods on one scenario
--------------------------------------
+Each output folder contains the main files:
 
-Author a fixed scenario once, then replay it across the primary methods:
+* `run_summary.csv` — one-row summary of the run.
+* `events.csv` — attacks, reports, trust changes, replans, and other events.
+* `robot_timeseries.csv` — robot positions and running totals over time.
+* `scenario_manifest.json` — the exact situation that was run.
+* `audit_report.json` — checks that the saved scenario is valid.
+
+Run multiple methods on the same situation
+-------------------------------------------
+
+First save a scenario:
 
     python main.py --headless --manifest-only --seed 10 --no-animation --output-directory outputs/seed10_manifest
+
+Then compare the four main methods:
+
     python main.py --headless --compare --seed 10 --no-animation --manifest outputs/seed10_manifest/scenario_manifest.json --output-directory outputs/seed10_compare
 
-The comparison creates one subdirectory per method.  To run soft_probability,
-which is an additional selectable method rather than one of the four primary
-comparison defaults, run:
+The comparison folder contains one folder for each method.  To also run
+`soft_probability` on that same scenario:
 
     python main.py --headless --seed 10 --no-animation --manifest outputs/seed10_manifest/scenario_manifest.json --defense-method soft_probability --output-directory outputs/seed10_compare/soft_probability
 
 Important settings
 ------------------
 
---defense-method selects one method.  --compare runs the four primary methods
-(full_trust, majority_vote, trust_fused, source_linked) against the same manifest.
---seed controls deterministic scenario generation.  --attacks accepts a comma-
-separated attack selection or none.  --recon-steps, --attack-steps,
---recovery-steps, --max-steps, and --deliveries-per-robot control run length and
-workload.  --attack-interval-min/max controls attack spacing.  --no-animation is
-for headless runs; without it the visualization is enabled.
+* `--defense-method` chooses the method for one run.
+* `--compare` runs the four main methods using one shared scenario.
+* `--seed` chooses the repeatable random seed.
+* `--attacks` chooses the attack types, separated by commas, or `none`.
+* `--recon-steps`, `--attack-steps`, and `--recovery-steps` set the lengths of
+  the three phases.
+* `--max-steps` limits the total run length.
+* `--deliveries-per-robot` sets the delivery workload.
+* `--attack-interval-min` and `--attack-interval-max` control how often attacks
+  are scheduled.
+* `--no-animation` is useful for faster headless runs.
 
-Items from the implementation plan that remain incomplete
-------------------------------------------------------------
+What is still unfinished
+------------------------
 
-These are intentionally listed, not changed here:
+These items are listed for future work and were not changed here:
 
-* sim2.py still owns the production world, LiDAR, robot, continuous-motion,
-  footprint-planning, and visualization implementation.  The modular files are
-  orchestration/adaptation layers, not a fully independent replacement.
-* The default upstream warehouse-manifest author currently schedules fake_obstacle
-  events.  The generic author_manifest path supports false_clearance and
-  stale_reassertion, but the default warehouse path does not yet use those attack
-  selections when authoring its manifest.
-* The GUI does not expose every advanced CLI setting (phase lengths, attack timing,
-  and fusion constants).
-* Exact scientific parity with every historical protocol/seed is not established;
-  results should be compared using one shared fixed manifest and declared settings.
-* A native modular visualization and native modular robot/world implementation
-  independent of sim2.py have not been completed.
+* The project still uses the tested original robot/world code internally.  A
+  completely independent modular replacement has not been finished.
+* The default warehouse scenario currently creates fake-obstacle attacks.  The
+  other attack types are available in the general scenario builder or in a saved
+  manifest, but the default warehouse builder does not yet automatically create
+  them from the `--attacks` selection.
+* The visual interface does not expose every advanced command-line setting.
+* Exact agreement with every historical experiment has not been established.
+  For fair comparisons, use one saved scenario and keep all settings fixed.
 
-Attack implementation status
------------------------------
+Attack status
+-------------
 
-Yes, false_clearance and stale_reassertion were implemented in the generic
-manifest authoring, manifest schema, audit checks, and attack model.  However,
-the default warehouse authoring path used by main.py currently emits fake_obstacle
-events only.  To exercise the other two attacks reliably, use the generic
-author_manifest path (for example with an explicit map input) or provide a
-pre-authored manifest containing those events, then verify audit_report.json.
+The project includes three attack types:
+
+1. `fake_obstacle` — claims that a clear location is blocked.
+2. `false_clearance` — claims that a temporarily blocked location is clear.
+3. `stale_reassertion` — repeats a blockage claim after the real blockage has
+   cleared.
+
+The last two are implemented in the general scenario-building and validation
+logic.  The default warehouse scenario currently schedules fake obstacles only,
+so use a saved manifest or the general builder when you need to test the other
+two attacks.
