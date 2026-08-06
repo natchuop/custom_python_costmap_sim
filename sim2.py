@@ -39,6 +39,8 @@ TRUST_INITIAL_VALUE = 0.70
 TRUST_REWARD = 0.02
 TRUST_PENALTY = 0.06
 TRUST_MODEL_NAME = "scalar"
+TRUST_BAYES_PRIOR_ALPHA = 7.0
+TRUST_BAYES_PRIOR_BETA = 3.0
 
 SENSOR_RADIUS = 4
 
@@ -239,6 +241,11 @@ SOURCE_LINKED_MIN_TRUST_DELTA = 0.10
 SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
 SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
 
+# Shared replan churn controls. These apply to every defense method so fallback
+# stalls and empty-path retries do not dominate runtime or outcomes.
+PATH_INVALID_REPLAN_COOLDOWN_STEPS = 8
+FALLBACK_GOAL_RETRY_COOLDOWN_STEPS = 20
+
 
 # ============================================================
 # Cell states
@@ -408,14 +415,17 @@ def footprint_cells(top_left, height, width):
     ]
 
 
-def can_place_temporary_footprint(grid, cells):
+def can_place_temporary_footprint(grid, cells, forbidden_cells=None):
     """
     A temporary object footprint is valid only if every cell is normal FREE.
 
     This prevents pallets/carts from being spawned inside walls, shelves,
     pickup/dropoff zones, charging zones, or already blocked areas.
     """
+    forbidden_cells = forbidden_cells or set()
     for cell in cells:
+        if cell in forbidden_cells:
+            return False
         if not can_place_temporary_object(grid, cell):
             return False
 
@@ -609,6 +619,36 @@ def choose_temporary_object_footprints(
     return selected[:blocked_count]
 
 
+def robot_occupied_cells(robots):
+    """Cells currently occupied by any robot footprint."""
+    occupied = set()
+    for robot in robots or []:
+        occupied.update(robot.occupied_cells)
+    return occupied
+
+
+def cell_occupied_by_benign_robot(cell, robots):
+    """True when a benign robot's footprint currently covers this cell."""
+    for robot in robots:
+        if robot.is_malicious:
+            continue
+        if cell in robot.occupied_cells:
+            return True
+    return False
+
+
+def apply_temporary_obstacle_episodes(grid, episodes, step, forbidden_cells=None):
+    """Apply manifest temporary-obstacle episodes, skipping cells occupied by robots."""
+    forbidden_cells = forbidden_cells or set()
+    truth = grid.copy()
+    for episode in episodes:
+        if episode.appearance_step <= step < episode.clearance_step:
+            for cell in episode.cells:
+                if cell not in forbidden_cells:
+                    truth[cell] = CellState.TEMPORARILY_BLOCKED
+    return truth
+
+
 def apply_temporary_footprints(dynamic_grid, temporary_footprints):
     for cells, state in temporary_footprints:
         for r, c in cells:
@@ -652,7 +692,8 @@ class TemporaryBlockageManager:
         self.active_indices = set()
         self.refresh_active_blockages(force=True)
 
-    def refresh_active_blockages(self, force=False):
+    def refresh_active_blockages(self, force=False, forbidden_cells=None):
+        forbidden_cells = forbidden_cells or set()
         if not self.pool:
             self.active_indices = set()
             return
@@ -660,8 +701,41 @@ class TemporaryBlockageManager:
         candidate_indices = list(range(len(self.pool)))
         self.rng.shuffle(candidate_indices)
 
-        active_count = min(self.active_count, len(candidate_indices))
-        self.active_indices = set(candidate_indices[:active_count])
+        eligible = []
+        for idx in candidate_indices:
+            cells, _ = self.pool[idx]
+            if any(cell in forbidden_cells for cell in cells):
+                continue
+            eligible.append(idx)
+            if len(eligible) >= self.active_count:
+                break
+
+        if forbidden_cells and len(eligible) < self.active_count:
+            print(
+                f"Warning: only {len(eligible)} temporary blockages avoid "
+                f"current robot positions (requested {self.active_count})"
+            )
+
+        active_count = min(self.active_count, len(eligible))
+        if active_count == 0 and not force and self.active_indices:
+            kept = [
+                idx
+                for idx in self.active_indices
+                if not any(cell in forbidden_cells for cell in self.pool[idx][0])
+            ]
+            if kept:
+                self.active_indices = set(kept[:min(self.active_count, len(kept))])
+                print("Active temporary blockages (kept prior set avoiding robots):")
+                for idx in sorted(self.active_indices):
+                    cells, state = self.pool[idx]
+                    center_r, center_c = footprint_center(cells)
+                    print(
+                        f"  candidate {idx}: {state_name(state)}, "
+                        f"cells={len(cells)}, center=({center_r:.1f}, {center_c:.1f})"
+                    )
+                return
+
+        self.active_indices = set(eligible[:active_count])
 
         print("Active temporary blockages:")
         for idx in sorted(self.active_indices):
@@ -681,7 +755,8 @@ class TemporaryBlockageManager:
 
         return step % self.change_period == 0
 
-    def build_truth_grid(self):
+    def build_truth_grid(self, forbidden_cells=None):
+        forbidden_cells = forbidden_cells or set()
         dynamic = self.static_grid.copy()
 
         active_footprints = [
@@ -689,15 +764,24 @@ class TemporaryBlockageManager:
             for idx in sorted(self.active_indices)
         ]
 
+        if forbidden_cells:
+            filtered = []
+            for cells, state in active_footprints:
+                kept_cells = [cell for cell in cells if cell not in forbidden_cells]
+                if kept_cells:
+                    filtered.append((kept_cells, state))
+            active_footprints = filtered
+
         return apply_temporary_footprints(dynamic, active_footprints)
 
-    def update_world_if_needed(self, world, step):
+    def update_world_if_needed(self, world, step, robots=None):
         if not self.should_update(step):
             return False
 
+        forbidden_cells = robot_occupied_cells(robots)
         print(f"Changing temporary blockages at step {step}")
-        self.refresh_active_blockages()
-        world.grid = self.build_truth_grid()
+        self.refresh_active_blockages(forbidden_cells=forbidden_cells)
+        world.grid = self.build_truth_grid(forbidden_cells=forbidden_cells)
         return True
 
 def make_dynamic_grid_with_auto_temporary_objects(static_grid):
@@ -1339,7 +1423,11 @@ def make_trust_model(robot_id):
         return ScalarTrustModel(self_id=robot_id)
 
     if TRUST_MODEL_NAME == "bayesian":
-        return BayesianTrustModel(self_id=robot_id)
+        return BayesianTrustModel(
+            self_id=robot_id,
+            prior_alpha=TRUST_BAYES_PRIOR_ALPHA,
+            prior_beta=TRUST_BAYES_PRIOR_BETA,
+        )
 
     raise ValueError(f"Unknown TRUST_MODEL_NAME: {TRUST_MODEL_NAME}")
 
@@ -1762,6 +1850,31 @@ class RobotBeliefMap:
         if self.defense_runner is not None:
             self.defense_runner.set_time(timestamp)
 
+    def _direct_free_observation(self, cell):
+        r, c = tuple(cell)
+        return (
+            self.source[r, c] == "self_sensor"
+            and CellState(int(self.belief[r, c])) in (
+                CellState.FREE,
+                CellState.PICKUP,
+                CellState.DROPOFF,
+                CellState.CHARGING,
+            )
+        )
+
+    def footprint_is_peer_hard_blocked(self, footprint, timestamp=None):
+        """Peer hard blocks apply only where direct sensing has not verified free."""
+        if self.defense_runner is None:
+            return False
+
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        for footprint_cell in footprint:
+            if self._direct_free_observation(footprint_cell):
+                continue
+            if self.defense_runner.is_hard_blocked(footprint_cell, now):
+                return True
+        return False
+
     def is_blocked_for_planning(self, cell):
         footprint = robot_footprint_cells(cell)
 
@@ -1784,13 +1897,7 @@ class RobotBeliefMap:
             ) and self.source[r, c] in ("initial_map", "self_sensor"):
                 return True
 
-        if (
-            self.defense_runner is not None
-            and self.defense_runner.footprint_is_hard_blocked(
-                footprint,
-                self.current_timestamp,
-            )
-        ):
+        if self.footprint_is_peer_hard_blocked(footprint):
             return True
 
         return False
@@ -1821,10 +1928,22 @@ class RobotBeliefMap:
                 max_cost = max(max_cost, 3.0)
 
         if self.defense_runner is not None:
-            peer_cost = self.defense_runner.footprint_cost(
-                robot_footprint_cells(cell),
-                self.current_timestamp,
-            )
+            # A recipient's fresh local FREE observation is authoritative for
+            # that cell.  Peer evidence remains stored for audit/trust, but it
+            # must not keep adding a routing penalty after direct verification.
+            # Directly observed blocks were already returned as hard blocks by
+            # ``is_blocked_for_planning`` above.
+            peer_cost = 1.0
+            for footprint_cell in robot_footprint_cells(cell):
+                if self._direct_free_observation(footprint_cell):
+                    continue
+                peer_cost = max(
+                    peer_cost,
+                    self.defense_runner.routing_cost(
+                        footprint_cell,
+                        self.current_timestamp,
+                    ),
+                )
             if math.isinf(peer_cost):
                 return float("inf")
             max_cost = max(max_cost, peer_cost)
@@ -2275,7 +2394,7 @@ def can_report_fake_block_cell(cell, world, goals, robots):
     if is_near_any_goal(cell, goals):
         return False
 
-    if is_near_any_benign_robot(cell, robots):
+    if cell_occupied_by_benign_robot(cell, robots):
         return False
 
     return True
@@ -2374,7 +2493,7 @@ def is_valid_recon_attack_cell(cell, world, goals, robots, traffic_heatmap):
     if is_near_any_goal(cell, goals):
         return False
 
-    if is_near_any_benign_robot(cell, robots):
+    if cell_occupied_by_benign_robot(cell, robots):
         return False
 
     report_cells = fake_object_report_cells(
@@ -2689,6 +2808,9 @@ class GridRobot:
             "small_route_risk_drop": 0,
             "cooldown": 0,
         }
+        self.last_path_invalid_replan_step = -10**9
+        self.last_fallback_goal_retry_step = -10**9
+        self.replanned_this_step = False
 
         # Detailed instrumentation for separating useful route adaptation from
         # repeated planning churn.
@@ -2752,11 +2874,45 @@ class GridRobot:
 
         return self.path[self.path_index + 1]
 
+    def _cell_has_direct_free_observation(self, cell):
+        r, c = tuple(cell)
+        return (
+            self.belief_map.source[r, c] == "self_sensor"
+            and CellState(int(self.belief_map.belief[r, c])) in (
+                CellState.FREE,
+                CellState.PICKUP,
+                CellState.DROPOFF,
+                CellState.CHARGING,
+            )
+        )
+
+    def should_replan_for_path_state(self, timestamp=None):
+        """Return True when the current path is unusable and a replan is due."""
+        step = self.current_step if timestamp is None else int(timestamp)
+
+        if not self.path_invalid_or_empty():
+            return False
+
+        if step - self.last_path_invalid_replan_step < PATH_INVALID_REPLAN_COOLDOWN_STEPS:
+            return False
+
+        if (
+            self.using_fallback_path
+            and self.path
+            and self.path_index + 1 >= len(self.path)
+            and step - self.last_fallback_goal_retry_step < FALLBACK_GOAL_RETRY_COOLDOWN_STEPS
+        ):
+            return False
+
+        return True
+
     def plan_path(self, reason="unspecified", timestamp=None, phase=None):
         old_remaining = list(self.path[self.path_index:]) if self.path else []
         old_next_five = old_remaining[:5]
         old_goal = tuple(self.goal)
+        event_step = self.current_step if timestamp is None else int(timestamp)
 
+        tried_real_goal = False
         try:
             self.path, self.last_plan_stats = self.planner.plan(
                 self.belief_map,
@@ -2764,11 +2920,14 @@ class GridRobot:
                 self.goal,
             )
             self.using_fallback_path = False
+            tried_real_goal = True
 
         except RuntimeError:
             if not ENABLE_FALLBACK_EXPLORATION:
                 raise
 
+            tried_real_goal = True
+            self.last_fallback_goal_retry_step = event_step
             self.path, self.last_plan_stats = plan_to_reachable_fallback(
                 self.belief_map,
                 self.position,
@@ -2778,10 +2937,19 @@ class GridRobot:
 
         self.path_index = 0
         self.replan_count += 1
+        self.replanned_this_step = True
+
+        reason_text = str(reason)
+        if (
+            "path_invalid" in reason_text
+            or reason_text == "path_invalid_or_empty"
+        ):
+            self.last_path_invalid_replan_step = event_step
+        if tried_real_goal and not self.using_fallback_path:
+            self.last_fallback_goal_retry_step = event_step
 
         new_path = list(self.path)
         new_next_five = new_path[:5]
-        event_step = self.current_step if timestamp is None else int(timestamp)
         event_phase = self.current_phase if phase is None else str(phase)
 
         replan_context = self.source_linked_replan_context or {}
@@ -2865,6 +3033,19 @@ class GridRobot:
         for anchor in anchors:
             for cell in robot_footprint_cells(anchor):
                 cell = tuple(cell)
+                r, c = cell
+                # Match the planner: a direct local FREE observation suppresses
+                # peer risk, so it cannot justify a source-linked replan.
+                if (
+                    self.belief_map.source[r, c] == "self_sensor"
+                    and CellState(int(self.belief_map.belief[r, c])) in (
+                        CellState.FREE,
+                        CellState.PICKUP,
+                        CellState.DROPOFF,
+                        CellState.CHARGING,
+                    )
+                ):
+                    continue
                 if cell not in seen:
                     seen.add(cell)
                     cells.append(cell)
@@ -2994,11 +3175,25 @@ class GridRobot:
     def reports_affect_remaining_route(self, reports):
         if not reports or not self.path:
             return False
-        remaining = set(self.path[self.path_index:])
+
+        remaining = list(self.path[self.path_index:])
         for report in reports:
+            target = tuple(report.target_cell)
+
+            if self._cell_has_direct_free_observation(target):
+                continue
+
+            if (
+                report.claim == ClaimType.FREE
+                and not report.is_malicious
+                and self.defense_method != "majority_vote"
+            ):
+                continue
+
             for anchor in remaining:
-                if tuple(report.target_cell) in robot_footprint_cells(anchor):
+                if target in robot_footprint_cells(anchor):
                     return True
+
         return False
 
     def process_inbox(self):
@@ -3129,7 +3324,10 @@ class GridRobot:
         if self.motion_target_cell is not None:
             return self.advance_continuous_motion()
 
-        if self.path_invalid_or_empty():
+        if (
+            not self.replanned_this_step
+            and self.should_replan_for_path_state()
+        ):
             try:
                 self.plan_path(
                     reason="path_invalid_during_move",
@@ -3187,7 +3385,7 @@ class GridRobot:
         self,
         observations,
         timestamp,
-        attack_phase_started=False,
+        attack_phase_active=False,
     ):
         """
         Honest robots report what they directly observe.
@@ -3196,7 +3394,7 @@ class GridRobot:
         """
         reports = []
 
-        if self.is_malicious and attack_phase_started:
+        if self.is_malicious and attack_phase_active:
             for cell, observed_state in observations.items():
                 observed_state = CellState(int(observed_state))
 
@@ -3554,6 +3752,30 @@ def repair_delivery_tasks(
 
     return repaired
 
+
+def refine_action_points(world, action_points, forbidden, target_count, excluded):
+    """Drop excluded cells and refill to the target count with strategic picks."""
+    excluded_set = frozenset(tuple(cell) for cell in excluded)
+    points = [tuple(cell) for cell in action_points if tuple(cell) not in excluded_set]
+    blocked = set(forbidden).union(points).union(excluded_set)
+
+    while len(points) < target_count:
+        extra = choose_strategic_action_points(
+            world,
+            target_count - len(points),
+            forbidden=blocked,
+        )
+
+        for point in extra:
+            cell = tuple(point)
+            if cell in excluded_set or cell in points:
+                continue
+            points.append(cell)
+            blocked.add(cell)
+
+    return points
+
+
 def build_robot_specs_and_goals(
     world,
     num_robots=DEFAULT_NUM_ROBOTS,
@@ -3633,6 +3855,22 @@ def build_robot_specs_and_goals(
             world,
             count=DEFAULT_NUM_ACTION_POINTS,
             forbidden=used_starts,
+        )
+
+    try:
+        from map_poisoning.map_io import WAREHOUSE_EXCLUDED_ACTION_POINTS
+
+        excluded = WAREHOUSE_EXCLUDED_ACTION_POINTS
+    except ImportError:
+        excluded = frozenset()
+
+    if excluded:
+        action_points = refine_action_points(
+            world,
+            action_points,
+            used_starts,
+            DEFAULT_NUM_ACTION_POINTS,
+            excluded,
         )
 
     goals = action_points.copy()
@@ -3765,6 +4003,11 @@ def run_simulation(
     max_steps=MAX_STEPS,
     random_seed=RANDOM_SEED,
     experiment_mode=EXPERIMENT_MODE,
+    attack_events=None,
+    obstacle_episodes=None,
+    manifest_robot_starts=None,
+    manifest_task_queues=None,
+    manifest_malicious_robot_id=None,
 ):
     np.random.seed(random_seed)
 
@@ -3779,8 +4022,9 @@ def run_simulation(
     world = GridWorld(grid)
 
     temp_blockage_manager = None
+    fixed_obstacle_episodes = tuple(obstacle_episodes or ())
 
-    if ENABLE_DYNAMIC_TEMP_BLOCKAGES and prior_grid is not None:
+    if ENABLE_DYNAMIC_TEMP_BLOCKAGES and prior_grid is not None and not fixed_obstacle_episodes:
         temp_blockage_manager = TemporaryBlockageManager(
             prior_grid,
             active_count=TEMP_ACTIVE_OBJECT_COUNT_BLOCKED,
@@ -3788,6 +4032,12 @@ def run_simulation(
             seed=random_seed,
         )
         world.grid = temp_blockage_manager.build_truth_grid()
+    elif fixed_obstacle_episodes:
+        world.grid = prior_grid.copy()
+        for episode in fixed_obstacle_episodes:
+            if episode.appearance_step <= 0 < episode.clearance_step:
+                for cell in episode.cells:
+                    world.grid[cell] = CellState.TEMPORARILY_BLOCKED
 
     robot_specs, goals, display_goals = build_robot_specs_and_goals(
         world,
@@ -3795,46 +4045,72 @@ def run_simulation(
         prior_grid=prior_grid,
     )
 
-    goals = filter_reachable_action_points(
-        goals,
-        robot_specs,
-        prior_grid,
-    )
+    if manifest_robot_starts and manifest_task_queues:
+        robot_specs = [
+            {"robot_id": robot_id, "start": tuple(manifest_robot_starts[robot_id])}
+            for robot_id in range(DEFAULT_NUM_ROBOTS)
+        ]
+        tasks_by_robot = {
+            robot_id: [
+                DeliveryTask(pickup=tuple(task.pickup), dropoff=tuple(task.dropoff))
+                for task in manifest_task_queues[robot_id]
+            ]
+            for robot_id in manifest_task_queues
+        }
+        goals = display_goals.copy()
+    else:
+        goals = filter_reachable_action_points(
+            goals,
+            robot_specs,
+            prior_grid,
+        )
 
-    relocate_starts_for_goals(world, robot_specs, goals, prior_grid)
+        relocate_starts_for_goals(world, robot_specs, goals, prior_grid)
 
-    display_goals = goals.copy()
+        display_goals = goals.copy()
 
-    tasks_by_robot = build_delivery_tasks(
-        goals,
-        num_robots=DEFAULT_NUM_ROBOTS,
-        tasks_per_robot=tasks_per_robot,
-    )
+        tasks_by_robot = build_delivery_tasks(
+            goals,
+            num_robots=DEFAULT_NUM_ROBOTS,
+            tasks_per_robot=tasks_per_robot,
+        )
 
-    tasks_by_robot = repair_delivery_tasks(
-        world,
-        tasks_by_robot,
-        robot_specs,
-        prior_grid,
-        action_points=goals,
-    )
+        tasks_by_robot = repair_delivery_tasks(
+            world,
+            tasks_by_robot,
+            robot_specs,
+            prior_grid,
+            action_points=goals,
+        )
 
     goal = goals[0]
+
+    # Manifest tasks and starts are authored against the static prior grid; do not
+    # validate them on a step-0 truth grid that already includes temp blockages.
+    validation_world = (
+        GridWorld(prior_grid)
+        if manifest_robot_starts and manifest_task_queues
+        else world
+    )
 
     for robot_id, tasks in tasks_by_robot.items():
         for task in tasks:
             validate_start_and_goal(
-                world,
+                validation_world,
                 [{"robot_id": robot_id, "start": task.pickup}],
                 task.dropoff,
             )
 
-    validate_start_and_goal(world, robot_specs, goal)
+    validate_start_and_goal(validation_world, robot_specs, goal)
 
-    malicious_robot_id = choose_malicious_robot_id(
-        robot_specs,
-        goals,
-        prior_grid,
+    malicious_robot_id = (
+        int(manifest_malicious_robot_id)
+        if manifest_malicious_robot_id is not None
+        else choose_malicious_robot_id(
+            robot_specs,
+            goals,
+            prior_grid,
+        )
     )
 
     robots = []
@@ -3958,6 +4234,7 @@ def run_simulation(
         for robot in robots:
             robot.current_step = step
             robot.current_phase = current_phase
+            robot.replanned_this_step = False
 
         active_malicious_fake_objects = {
             cell: created_step
@@ -3968,9 +4245,24 @@ def run_simulation(
             changed_temp_blockages = temp_blockage_manager.update_world_if_needed(
                 world,
                 step,
+                robots=robots,
             )
 
             if changed_temp_blockages:
+                for robot in robots:
+                    robot.path = []
+                    robot.path_index = 0
+                    robot.motion_target_cell = None
+                    robot.motion_target_xy = None
+        elif fixed_obstacle_episodes:
+            rebuilt = apply_temporary_obstacle_episodes(
+                prior_grid,
+                fixed_obstacle_episodes,
+                step,
+                forbidden_cells=robot_occupied_cells(robots),
+            )
+            if not np.array_equal(rebuilt, world.grid):
+                world.grid = rebuilt
                 for robot in robots:
                     robot.path = []
                     robot.path_index = 0
@@ -4011,7 +4303,7 @@ def run_simulation(
                     robot.make_observation_reports(
                         observations,
                         step,
-                        attack_phase_started=attack_phase_started,
+                        attack_phase_active=(current_phase == "ATTACK"),
                     )
                 )
 
@@ -4039,6 +4331,8 @@ def run_simulation(
             print(f"\n--- ATTACK INJECTION STOPPED AT STEP {step}; RECOVERY PHASE STARTING ---")
 
         should_inject_fake_object = (
+            attack_events is None
+            and
             enable_malicious_reports
             and attack_phase_started
             and attack_injection_stop_step is None
@@ -4078,8 +4372,28 @@ def run_simulation(
                     placed_malicious_fake_object_centers.append(center)
                     last_malicious_fake_object_step = step
 
+        fixed_attack_injected = False
+        if attack_events is not None:
+            for event in attack_events:
+                if int(event.step) != step:
+                    continue
+                fixed_attack_injected = True
+                for cell in event.cells:
+                    reports_by_sender[event.sender_id].append(
+                        PeerReport(
+                            sender_id=event.sender_id,
+                            target_cell=tuple(cell),
+                            claim=ClaimType(int(event.claim)),
+                            timestamp=int(event.observation_step),
+                            is_malicious=True,
+                        )
+                    )
+
         # 3. Broadcast reports periodically.
-        if COMMUNICATION_PERIOD_STEPS > 0 and step % COMMUNICATION_PERIOD_STEPS == 0:
+        # Fixed-manifest attacks have an explicit delivery step.  They must not
+        # disappear merely because that step falls between normal periodic
+        # broadcasts (for example step 470 with a four-step cadence).
+        if COMMUNICATION_PERIOD_STEPS > 0 and (step % COMMUNICATION_PERIOD_STEPS == 0 or fixed_attack_injected):
             broadcast_reports(robots, reports_by_sender)
 
             for sender_id, reports in reports_by_sender.items():
@@ -4105,7 +4419,7 @@ def run_simulation(
                     active_malicious_fake_objects[tuple(report.target_cell)] = step
 
             route_affected = robot.reports_affect_remaining_route(accepted)
-            path_invalid = robot.path_invalid_or_empty()
+            path_invalid = robot.should_replan_for_path_state(step)
             trust_reweight = bool(robot.defense_replan_needed)
             should_replan = route_affected or trust_reweight or path_invalid
 
@@ -4259,7 +4573,7 @@ def run_simulation(
 
         log["traffic_heatmap"].append(traffic_heatmap.copy())
         log["phase"].append(
-            "ATTACK" if attack_phase_started else "RECONNAISSANCE"
+            current_phase
         )
 
         for robot in robots:

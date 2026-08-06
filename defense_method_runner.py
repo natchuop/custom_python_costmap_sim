@@ -25,6 +25,8 @@ BLOCKED_CLAIM = 1
 CONGESTED_CLAIM = 2
 
 DEFENSE_METHODS = (
+    "full_trust",
+    "majority_vote",
     "hard_threshold",
     "soft_probability",
     "time_decay",
@@ -110,6 +112,11 @@ class DefenseMethodRunner:
         self.config.validate()
 
         self.claims_by_cell: DefaultDict[Cell, List[StoredClaim]] = defaultdict(list)
+        # Operational fusion uses one current claim per sender and cell.  The
+        # append-only history remains available for audit counters, but a sender
+        # cannot amplify a claim merely by repeatedly refreshing it.
+        self.active_claims: Dict[Tuple[int, Cell], StoredClaim] = {}
+        self.claim_history: List[StoredClaim] = []
         self.current_timestamp = 0
         self.total_reports_seen = 0
         self.total_reports_stored = 0
@@ -124,6 +131,8 @@ class DefenseMethodRunner:
 
     def clear(self) -> None:
         self.claims_by_cell.clear()
+        self.active_claims.clear()
+        self.claim_history.clear()
 
     def add_report(self, report) -> bool:
         """Store a report and return True when it can influence the method."""
@@ -146,10 +155,21 @@ class DefenseMethodRunner:
             is_malicious=bool(getattr(report, "is_malicious", False)),
         )
 
-        if self._is_duplicate(stored):
+        key = (stored.sender_id, cell)
+        previous = self.active_claims.get(key)
+        if previous is not None:
+            # An older delayed report is retained only as audit history; it
+            # cannot replace the newer operational state.
+            if stored.timestamp < previous.timestamp:
+                self.claim_history.append(stored)
+                return False
+            self.claims_by_cell[cell].remove(previous)
+        elif self._is_duplicate(stored):
             return False
 
         self.claims_by_cell[cell].append(stored)
+        self.active_claims[key] = stored
+        self.claim_history.append(stored)
         self.total_reports_stored += 1
         return True
 
@@ -187,6 +207,12 @@ class DefenseMethodRunner:
             else:
                 del self.claims_by_cell[cell]
 
+        self.active_claims = {
+            key: claim
+            for key, claim in self.active_claims.items()
+            if now - claim.timestamp <= self.config.max_claim_age
+        }
+
         self.total_reports_pruned += removed
         return removed
 
@@ -214,7 +240,7 @@ class DefenseMethodRunner:
     ) -> float:
         method = self.method
 
-        if method in ("hard_threshold", "soft_probability"):
+        if method in ("full_trust", "majority_vote", "hard_threshold", "soft_probability"):
             return claim.confidence
 
         if method == "time_decay":
@@ -240,6 +266,12 @@ class DefenseMethodRunner:
 
     def evidence(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "majority_vote":
+            votes = 0
+            for claim in self.claims_by_cell.get(tuple(cell), ()):
+                if now - claim.timestamp <= self.config.max_claim_age:
+                    votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
+            return float(votes)
         total = 0.0
 
         for claim in self.claims_by_cell.get(tuple(cell), ()):
@@ -318,11 +350,18 @@ class DefenseMethodRunner:
         """Return peer-derived traversal cost for a cell."""
         if self.method == "hard_threshold":
             return math.inf if self.is_hard_blocked(cell, timestamp) else 1.0
+        if self.method == "majority_vote":
+            # Majority is a discrete baseline, not a soft evidence method.
+            # Positive votes block; free majorities, ties, and no votes add no
+            # peer traversal penalty.
+            return math.inf if self.evidence(cell, timestamp) > 0.0 else 1.0
 
         risk = self.normalized_occupied_risk(cell, timestamp)
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
     def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None) -> bool:
+        if self.method == "majority_vote":
+            return self.evidence(cell, timestamp) > 0.0
         if self.method != "hard_threshold":
             return False
         probability = self.occupancy_probability(cell, timestamp)
