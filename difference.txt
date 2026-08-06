@@ -11,6 +11,52 @@ as one public modular command.  The validated continuous-motion implementation i
 sim2.py and fusion implementation in defense_method_runner.py remain internal
 runtime components; they are not separate user-selectable engines.
 
+Detailed difference list
+------------------------
+
+* **Project structure:** runtime responsibilities are organized under
+  `map_poisoning/` (configuration, scenario authoring, world, sensing, belief,
+  trust, fusion, planning, metrics, rollout, CLI, and UI) instead of being
+  exposed only through one monolithic command path.
+* **Entry point:** `main.py` is the public launcher for both the command line and
+  Tk interface.  There is no engine selector; runs use the modular application
+  workflow.
+* **Scenario reproducibility:** attack events, temporary-obstacle episodes,
+  robot starts, task queues, phase boundaries, and the map are saved in a versioned
+  `scenario_manifest.json`.  Replaying that manifest keeps the scenario fixed
+  while methods change.
+* **Method comparisons:** `--compare` runs `full_trust`, `majority_vote`,
+  `trust_fused`, and `source_linked` against the same manifest.  `soft_probability`
+  remains selectable with `--defense-method` and can be run against that same
+  manifest separately.
+* **Defense behavior:** fusion now has explicit method contracts, active claim
+  replacement for repeated sender/cell claims, trust-aware evidence, route-cost
+  calculations, and method-specific replan accounting.
+* **Trust and evidence logging:** trust updates, report admission, fusion effects,
+  evidence/probability deltas, and audit labels are written to `events.csv` rather
+  than being available only through console output.
+* **Robot metrics:** each run records deliveries, no-path steps, movement steps,
+  total distance, total replans, productive replans, blocked moves, trust timing,
+  and contradiction counts in `run_summary.csv` and `robot_timeseries.csv`.
+* **Map behavior:** the default map is the upstream warehouse map from
+  `custom_map_poisoning_costmap`; the attacker escape corridor fix is applied when
+  that map is loaded.
+* **Attack placement:** fake-obstacle reports are constrained by candidate
+  diversity and robot occupancy, so an obstacle is not placed inside another
+  robot's current footprint.  Adjacent placement remains allowed.
+* **Visualization:** non-headless runs show the warehouse animation, heatmap, and
+  plots through the existing validated simulator visualization path.
+* **Environment setup:** dependency installation and checks are consolidated in
+  `install_dependencies.py`; a separate `requirements.txt` is no longer needed.
+* **Repository cleanup:** obsolete parity/audit runners and verification helpers
+  were removed, and generated outputs, caches, editor state, and temporary files
+  are ignored by Git.
+* **Compatibility boundary:** although the public workflow is modular, `sim2.py`
+  still supplies the validated continuous-motion/footprint-planning loop and
+  visualization, while `defense_method_runner.py` supplies the operational fusion
+  implementation.  Removing those dependencies would be a future port, not a
+  behavior-preserving cleanup.
+
 First-time setup from GitHub
 ----------------------------
 
