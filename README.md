@@ -8,7 +8,8 @@ the ROS occupancy-map converter, and the AWS RoboMaker small warehouse world.
 From PowerShell in this folder:
 
 ```powershell
-.\.venv\Scripts\python.exe .\main.py
+python .\install_dependencies.py --install
+python .\main.py
 ```
 
 Or use the launcher:
@@ -26,15 +27,15 @@ For a quick headless test:
 Headless single run, manifest authoring, and fixed-manifest comparison:
 
 ```powershell
-.\.venv\Scripts\python.exe .\main.py --headless --no-animation
-.\.venv\Scripts\python.exe .\main.py --headless --manifest-only --output-directory outputs\scenario
-.\.venv\Scripts\python.exe .\main.py --headless --compare --manifest outputs\scenario\scenario_manifest.json --output-directory outputs\comparison
+python .\main.py --headless --no-animation
+python .\main.py --headless --manifest-only --output-directory outputs\scenario
+python .\main.py --headless --compare --manifest outputs\scenario\scenario_manifest.json --output-directory outputs\comparison
 ```
 
 Run the dependency check before installation or on a new machine:
 
 ```powershell
-.\.venv\Scripts\python.exe .\install_dependencies.py --install --include-dev
+python .\install_dependencies.py --install --include-dev
 ```
 
 `sim2.py` remains available as the legacy implementation during migration.

@@ -1,23 +1,137 @@
-"""Thin Tkinter launcher.  Import this module only for interactive use."""
+"""Tkinter launcher for interactive simulator runs."""
 from __future__ import annotations
+
 import tkinter as tk
 from tkinter import messagebox, ttk
+
 from .application import run
 from .cli import config_from_args
+from .config import ALL_METHODS
+from .models import AttackType
+
 
 def launch(args) -> None:
-    root=tk.Tk(); root.title("Modular Map-Poisoning Simulator"); root.geometry("650x420")
-    notebook=ttk.Notebook(root); notebook.pack(fill="both",expand=True,padx=10,pady=10)
-    basic=ttk.Frame(notebook,padding=12); advanced=ttk.Frame(notebook,padding=12); notebook.add(basic,text="Run"); notebook.add(advanced,text="Advanced")
-    values={"seed":tk.StringVar(value=str(args.seed)),"method":tk.StringVar(value=args.defense_method),"attacks":tk.StringVar(value=args.attacks),"output":tk.StringVar(value=args.output_directory),"recon":tk.StringVar(value=str(args.recon_steps)),"attack":tk.StringVar(value=str(args.attack_steps)),"recovery":tk.StringVar(value=str(args.recovery_steps))}
-    def field(parent,label,key,row): ttk.Label(parent,text=label).grid(row=row,column=0,sticky="w",pady=5); ttk.Entry(parent,textvariable=values[key],width=42).grid(row=row,column=1,sticky="ew",pady=5)
-    field(basic,"Seed", "seed",0); field(basic,"Defense method", "method",1); field(basic,"Attacks", "attacks",2); field(basic,"Output directory", "output",3)
-    field(advanced,"Reconnaissance steps", "recon",0); field(advanced,"Poisoning steps", "attack",1); field(advanced,"Recovery steps", "recovery",2)
-    basic.columnconfigure(1,weight=1); advanced.columnconfigure(1,weight=1)
-    def execute(compare=False):
+    """Show the interactive run configuration window in one compact view."""
+    root = tk.Tk()
+    root.title("Modular Map-Poisoning Simulator")
+    root.geometry("720x720")
+    root.minsize(640, 650)
+    form = ttk.Frame(root, padding=14)
+    form.pack(fill="both", expand=True)
+
+    values = {
+        "seed": tk.StringVar(value=str(args.seed)),
+        "method": tk.StringVar(value=args.defense_method),
+        "engine": tk.StringVar(value=args.engine),
+        "trust_model": tk.StringVar(value=args.trust_model),
+        "admission_policy": tk.StringVar(value=args.admission_policy),
+        "output": tk.StringVar(value=args.output_directory),
+        "manifest": tk.StringVar(value=args.manifest_path or ""),
+        "recon": tk.StringVar(value=str(args.recon_steps)),
+        "attack": tk.StringVar(value=str(args.attack_steps)),
+        "recovery": tk.StringVar(value=str(args.recovery_steps)),
+        "deliveries": tk.StringVar(value=str(args.deliveries_per_robot)),
+        "max_steps": tk.StringVar(value="" if args.max_steps is None else str(args.max_steps)),
+        "interval_min": tk.StringVar(value=str(args.attack_interval_min)),
+        "interval_max": tk.StringVar(value=str(args.attack_interval_max)),
+        "compare": tk.BooleanVar(value=args.compare),
+        "animation": tk.BooleanVar(value=not args.no_animation),
+    }
+    selected_attacks = set() if args.attacks == "none" else set(args.attacks.split(","))
+    attack_enabled = {
+        attack.value: tk.BooleanVar(value=attack.value in selected_attacks)
+        for attack in AttackType
+    }
+
+    def entry(label, key, row):
+        ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=values[key], width=43).grid(
+            row=row, column=1, columnspan=2, sticky="ew", pady=4
+        )
+
+    def dropdown(label, key, choices, row):
+        ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Combobox(
+            form, textvariable=values[key], values=choices, state="readonly", width=40
+        ).grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+
+    ttk.Label(form, text="Run configuration", font=("TkDefaultFont", 12, "bold")).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 7)
+    )
+    entry("Seed", "seed", 1)
+    dropdown("Simulator engine", "engine", ("legacy", "modular"), 2)
+    ttk.Label(
+        form,
+        text="Legacy is recommended: it preserves the established behavior and shows the heatmap and animation.",
+        wraplength=515,
+    ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 4))
+    dropdown("Defense method", "method", ALL_METHODS, 4)
+    entry("Output directory", "output", 5)
+    entry("Fixed manifest (optional)", "manifest", 6)
+    ttk.Checkbutton(form, text="Compare all primary defenses", variable=values["compare"]).grid(
+        row=7, column=0, columnspan=3, sticky="w", pady=(7, 2)
+    )
+    ttk.Checkbutton(
+        form,
+        text="Show reconnaissance heatmap and simulation animation (legacy engine)",
+        variable=values["animation"],
+    ).grid(row=8, column=0, columnspan=3, sticky="w", pady=2)
+
+    ttk.Separator(form).grid(row=9, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
+        row=10, column=0, columnspan=3, sticky="w", pady=(0, 4)
+    )
+    entry("Reconnaissance steps", "recon", 11)
+    entry("Poisoning steps", "attack", 12)
+    entry("Recovery steps", "recovery", 13)
+    entry("Deliveries per robot", "deliveries", 14)
+    entry("Maximum steps (optional)", "max_steps", 15)
+    entry("Attack interval: minimum steps", "interval_min", 16)
+    entry("Attack interval: maximum steps", "interval_max", 17)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 18)
+    dropdown(
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 19
+    )
+    attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
+    attacks_frame.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    for column, attack in enumerate(AttackType):
+        ttk.Checkbutton(
+            attacks_frame,
+            text=attack.value.replace("_", " ").title(),
+            variable=attack_enabled[attack.value],
+        ).grid(row=0, column=column, sticky="w", padx=(0, 12))
+
+    form.columnconfigure(1, weight=1)
+
+    def execute() -> None:
         try:
-            args.seed=int(values["seed"].get()); args.defense_method=values["method"].get(); args.attacks=values["attacks"].get(); args.output_directory=values["output"].get(); args.recon_steps=int(values["recon"].get()); args.attack_steps=int(values["attack"].get()); args.recovery_steps=int(values["recovery"].get())
-            result=run(config_from_args(args),comparison=compare); messagebox.showinfo("Completed",f"Created results in {args.output_directory}")
-        except Exception as exc: messagebox.showerror("Unable to run",str(exc))
-    ttk.Button(basic,text="Run single defense",command=lambda:execute(False)).grid(row=5,column=0,pady=24,sticky="w"); ttk.Button(basic,text="Compare primary defenses",command=lambda:execute(True)).grid(row=5,column=1,pady=24,sticky="e")
+            args.seed = int(values["seed"].get())
+            args.engine = values["engine"].get()
+            args.defense_method = values["method"].get()
+            args.output_directory = values["output"].get()
+            args.manifest_path = values["manifest"].get().strip() or None
+            args.compare = values["compare"].get()
+            args.no_animation = not values["animation"].get()
+            args.recon_steps = int(values["recon"].get())
+            args.attack_steps = int(values["attack"].get())
+            args.recovery_steps = int(values["recovery"].get())
+            args.deliveries_per_robot = int(values["deliveries"].get())
+            max_steps = values["max_steps"].get().strip()
+            args.max_steps = int(max_steps) if max_steps else None
+            args.attack_interval_min = int(values["interval_min"].get())
+            args.attack_interval_max = int(values["interval_max"].get())
+            args.trust_model = values["trust_model"].get()
+            args.admission_policy = values["admission_policy"].get()
+            enabled = [name for name, variable in attack_enabled.items() if variable.get()]
+            args.attacks = ",".join(enabled) if enabled else "none"
+
+            run(config_from_args(args), comparison=args.compare)
+            messagebox.showinfo("Completed", f"Created results in {args.output_directory}")
+        except Exception as exc:
+            messagebox.showerror("Unable to run", str(exc))
+
+    footer = ttk.Frame(form)
+    footer.grid(row=21, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+    ttk.Label(footer, text="Close each Matplotlib window to continue to the next one.").pack(side="left")
+    ttk.Button(footer, text="Run", command=execute).pack(side="right")
     root.mainloop()

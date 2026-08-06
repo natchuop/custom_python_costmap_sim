@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Iterable
+import math
 
 from .admission import decide
 from .belief import RobotBeliefMap
@@ -48,6 +49,7 @@ class ModularRobot:
     blocked_moves: int = 0
     productive_replans: int = 0
     replan_records: list[ReplanRecord] = field(default_factory=list)
+    no_path_causes: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self): self.position = self.start
     @property
@@ -63,7 +65,9 @@ class ModularRobot:
         for report in self.inbox:
             policy=decide(self.admission_policy, self.trust.score(report.sender_id), self.trust_threshold)
             if policy.accepted:
-                self.fusion.add(report, policy.influence); self.pending[report.report_id]=report; accepted.append((report, policy))
+                previous=self.fusion.add(report, policy.influence)
+                if previous is not None: self.pending.pop(previous.report.report_id, None)
+                self.pending[report.report_id]=report; accepted.append((report, policy))
                 route_affected = route_affected or report.target_cell in self.remaining_route()
         self.inbox.clear()
         return accepted, route_affected
@@ -85,7 +89,7 @@ class ModularRobot:
             observed=by_cell.get(report.target_cell)
             if observed is None: continue
             age=step-report.observation_step
-            outcome=VerificationOutcome.CONFIRMED if observed.claim == report.claim else (VerificationOutcome.HONEST_STALE_OR_EXPIRED if age > 20 else VerificationOutcome.CONTRADICTED_FRESH)
+            outcome=VerificationOutcome.CONFIRMED if observed.claim == report.claim else (VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED if age > self.fusion.max_claim_age else VerificationOutcome.CONTRADICTED_FRESH)
             evidence_before=self.fusion.evidence(report.target_cell,step); probability_before=self.fusion.probability(report.target_cell,step)
             old_trust,new_trust=self.trust.update(report.sender_id,outcome)
             evidence_after=self.fusion.evidence(report.target_cell,step); probability_after=self.fusion.probability(report.target_cell,step)
@@ -99,6 +103,21 @@ class ModularRobot:
         new=list(self.path or ()); new_cost=sum(self.fusion.routing_cost(cell,step) for cell in new) if new else None
         changed=old != new; self.total_replans += 1; self.productive_replans += int(changed)
         self.replan_records.append(ReplanRecord(step,reason,old_cost,new_cost,len(old),len(new),changed)); return bool(self.path)
+
+    def classify_no_path(self, world, step: int) -> str:
+        """Explain a no-path event without consulting attack audit labels."""
+        truth = astar(self.position, self.goal, lambda cell: math.inf if world.state(cell, step) == ClaimType.BLOCKED else 1.)
+        if truth is None:
+            cause = "truth_disconnected"
+        else:
+            direct = astar(self.position, self.goal, lambda cell: math.inf if self.belief.direct_state(cell) == ClaimType.BLOCKED else 1.)
+            if direct is None:
+                cause = "direct_belief_disconnected"
+            else:
+                operational = astar(self.position, self.goal, lambda cell: self.belief.traversal_cost(cell, step, self.fusion))
+                cause = "peer_fusion_disconnected" if operational is None else "planner_or_state_error"
+        self.no_path_causes[cause] = self.no_path_causes.get(cause, 0) + 1
+        return cause
 
     def move(self, world, step: int) -> str:
         if self.position == self.goal:

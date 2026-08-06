@@ -38,4 +38,8 @@ class RobotBeliefMap:
         state = self.direct_state(cell)
         if state == ClaimType.BLOCKED:
             return math.inf
+        if state == ClaimType.FREE:
+            # A fresh local sensor observation takes precedence over peer
+            # blockage evidence until this recipient observes the cell again.
+            return 1.0
         return fusion.routing_cost(cell, step)

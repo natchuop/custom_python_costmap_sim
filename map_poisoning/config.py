@@ -24,16 +24,21 @@ class PhaseConfig:
 @dataclass(frozen=True)
 class AttackConfig:
     enabled: tuple[str, ...] = tuple(item.value for item in AttackType)
-    interval_min: int = 40
-    interval_max: int = 80
+    interval_min: int = 20
+    interval_max: int = 20
     candidate_top_k: int = 12
     broadcast: bool = True
     global_awareness: bool = True
+    # Rapid interactive runs can contain many actions; this is still a hard
+    # cap, while spacing/minimum-unique checks diagnose concentration.
+    max_uses_per_footprint: int = 20
+    min_center_spacing: int = 3
+    min_unique_footprints: int = 3
 
 
 @dataclass(frozen=True)
 class TrustConfig:
-    model: str = "bayesian"
+    model: str = "scalar"
     prior_alpha: float = 7.0
     prior_beta: float = 3.0
     threshold: float = 0.55
@@ -42,7 +47,7 @@ class TrustConfig:
 @dataclass(frozen=True)
 class FusionConfig:
     method: str = "source_linked"
-    admission_policy: str = "auto_soft"
+    admission_policy: str = "accept_all"
     decay_rate: float = 0.006
     cost_scale: float = 14.0
     cost_exponent: float = 1.5
@@ -87,6 +92,7 @@ class SimulationConfig:
         if self.phases.recon_steps <= 0 or self.phases.attack_steps < 0 or self.phases.recovery_steps <= 0: raise ValueError("phase lengths must be positive (attack may be zero)")
         if self.attacks.interval_min < 1 or self.attacks.interval_max < self.attacks.interval_min: raise ValueError("invalid attack interval")
         if self.attacks.candidate_top_k < 1: raise ValueError("attack candidate_top_k must be positive")
+        if self.attacks.max_uses_per_footprint < 1 or self.attacks.min_center_spacing < 0 or self.attacks.min_unique_footprints < 1: raise ValueError("invalid attack diversity settings")
         if self.trust.model not in {"bayesian", "scalar"}: raise ValueError("trust model must be bayesian or scalar")
         if self.trust.prior_alpha <= 0 or self.trust.prior_beta <= 0: raise ValueError("Bayesian priors must be positive")
         if not 0 <= self.trust.threshold <= 1: raise ValueError("trust threshold must be in [0, 1]")

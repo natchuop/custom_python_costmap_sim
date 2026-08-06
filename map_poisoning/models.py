@@ -29,7 +29,10 @@ class AttackType(str, Enum):
 class VerificationOutcome(str, Enum):
     CONFIRMED = "confirmed"
     CONTRADICTED_FRESH = "contradicted_fresh"
-    HONEST_STALE_OR_EXPIRED = "honest_stale_or_expired"
+    TEMPORALLY_AMBIGUOUS_OR_EXPIRED = "temporally_ambiguous_or_expired"
+    # Compatibility name for old CSV readers.  It no longer implies honesty or
+    # rewards trust; audit-only truth labels belong outside operational code.
+    HONEST_STALE_OR_EXPIRED = "temporally_ambiguous_or_expired"
     UNRESOLVED = "unresolved"
 
 
@@ -116,4 +119,3 @@ class TrustUpdate:
     new_trust: float
     step: int
     outcome: VerificationOutcome
-

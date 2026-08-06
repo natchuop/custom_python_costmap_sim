@@ -39,6 +39,8 @@ TRUST_INITIAL_VALUE = 0.70
 TRUST_REWARD = 0.02
 TRUST_PENALTY = 0.06
 TRUST_MODEL_NAME = "scalar"
+TRUST_BAYES_PRIOR_ALPHA = 7.0
+TRUST_BAYES_PRIOR_BETA = 3.0
 
 SENSOR_RADIUS = 4
 
@@ -238,6 +240,11 @@ SOURCE_LINKED_REPLAN_COOLDOWN_STEPS = 25
 SOURCE_LINKED_MIN_TRUST_DELTA = 0.10
 SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
 SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
+
+# Shared replan churn controls. These apply to every defense method so fallback
+# stalls and empty-path retries do not dominate runtime or outcomes.
+PATH_INVALID_REPLAN_COOLDOWN_STEPS = 8
+FALLBACK_GOAL_RETRY_COOLDOWN_STEPS = 20
 
 
 # ============================================================
@@ -1339,7 +1346,11 @@ def make_trust_model(robot_id):
         return ScalarTrustModel(self_id=robot_id)
 
     if TRUST_MODEL_NAME == "bayesian":
-        return BayesianTrustModel(self_id=robot_id)
+        return BayesianTrustModel(
+            self_id=robot_id,
+            prior_alpha=TRUST_BAYES_PRIOR_ALPHA,
+            prior_beta=TRUST_BAYES_PRIOR_BETA,
+        )
 
     raise ValueError(f"Unknown TRUST_MODEL_NAME: {TRUST_MODEL_NAME}")
 
@@ -1762,6 +1773,31 @@ class RobotBeliefMap:
         if self.defense_runner is not None:
             self.defense_runner.set_time(timestamp)
 
+    def _direct_free_observation(self, cell):
+        r, c = tuple(cell)
+        return (
+            self.source[r, c] == "self_sensor"
+            and CellState(int(self.belief[r, c])) in (
+                CellState.FREE,
+                CellState.PICKUP,
+                CellState.DROPOFF,
+                CellState.CHARGING,
+            )
+        )
+
+    def footprint_is_peer_hard_blocked(self, footprint, timestamp=None):
+        """Peer hard blocks apply only where direct sensing has not verified free."""
+        if self.defense_runner is None:
+            return False
+
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        for footprint_cell in footprint:
+            if self._direct_free_observation(footprint_cell):
+                continue
+            if self.defense_runner.is_hard_blocked(footprint_cell, now):
+                return True
+        return False
+
     def is_blocked_for_planning(self, cell):
         footprint = robot_footprint_cells(cell)
 
@@ -1784,13 +1820,7 @@ class RobotBeliefMap:
             ) and self.source[r, c] in ("initial_map", "self_sensor"):
                 return True
 
-        if (
-            self.defense_runner is not None
-            and self.defense_runner.footprint_is_hard_blocked(
-                footprint,
-                self.current_timestamp,
-            )
-        ):
+        if self.footprint_is_peer_hard_blocked(footprint):
             return True
 
         return False
@@ -1821,10 +1851,22 @@ class RobotBeliefMap:
                 max_cost = max(max_cost, 3.0)
 
         if self.defense_runner is not None:
-            peer_cost = self.defense_runner.footprint_cost(
-                robot_footprint_cells(cell),
-                self.current_timestamp,
-            )
+            # A recipient's fresh local FREE observation is authoritative for
+            # that cell.  Peer evidence remains stored for audit/trust, but it
+            # must not keep adding a routing penalty after direct verification.
+            # Directly observed blocks were already returned as hard blocks by
+            # ``is_blocked_for_planning`` above.
+            peer_cost = 1.0
+            for footprint_cell in robot_footprint_cells(cell):
+                if self._direct_free_observation(footprint_cell):
+                    continue
+                peer_cost = max(
+                    peer_cost,
+                    self.defense_runner.routing_cost(
+                        footprint_cell,
+                        self.current_timestamp,
+                    ),
+                )
             if math.isinf(peer_cost):
                 return float("inf")
             max_cost = max(max_cost, peer_cost)
@@ -2689,6 +2731,9 @@ class GridRobot:
             "small_route_risk_drop": 0,
             "cooldown": 0,
         }
+        self.last_path_invalid_replan_step = -10**9
+        self.last_fallback_goal_retry_step = -10**9
+        self.replanned_this_step = False
 
         # Detailed instrumentation for separating useful route adaptation from
         # repeated planning churn.
@@ -2752,11 +2797,45 @@ class GridRobot:
 
         return self.path[self.path_index + 1]
 
+    def _cell_has_direct_free_observation(self, cell):
+        r, c = tuple(cell)
+        return (
+            self.belief_map.source[r, c] == "self_sensor"
+            and CellState(int(self.belief_map.belief[r, c])) in (
+                CellState.FREE,
+                CellState.PICKUP,
+                CellState.DROPOFF,
+                CellState.CHARGING,
+            )
+        )
+
+    def should_replan_for_path_state(self, timestamp=None):
+        """Return True when the current path is unusable and a replan is due."""
+        step = self.current_step if timestamp is None else int(timestamp)
+
+        if not self.path_invalid_or_empty():
+            return False
+
+        if step - self.last_path_invalid_replan_step < PATH_INVALID_REPLAN_COOLDOWN_STEPS:
+            return False
+
+        if (
+            self.using_fallback_path
+            and self.path
+            and self.path_index + 1 >= len(self.path)
+            and step - self.last_fallback_goal_retry_step < FALLBACK_GOAL_RETRY_COOLDOWN_STEPS
+        ):
+            return False
+
+        return True
+
     def plan_path(self, reason="unspecified", timestamp=None, phase=None):
         old_remaining = list(self.path[self.path_index:]) if self.path else []
         old_next_five = old_remaining[:5]
         old_goal = tuple(self.goal)
+        event_step = self.current_step if timestamp is None else int(timestamp)
 
+        tried_real_goal = False
         try:
             self.path, self.last_plan_stats = self.planner.plan(
                 self.belief_map,
@@ -2764,11 +2843,14 @@ class GridRobot:
                 self.goal,
             )
             self.using_fallback_path = False
+            tried_real_goal = True
 
         except RuntimeError:
             if not ENABLE_FALLBACK_EXPLORATION:
                 raise
 
+            tried_real_goal = True
+            self.last_fallback_goal_retry_step = event_step
             self.path, self.last_plan_stats = plan_to_reachable_fallback(
                 self.belief_map,
                 self.position,
@@ -2778,10 +2860,19 @@ class GridRobot:
 
         self.path_index = 0
         self.replan_count += 1
+        self.replanned_this_step = True
+
+        reason_text = str(reason)
+        if (
+            "path_invalid" in reason_text
+            or reason_text == "path_invalid_or_empty"
+        ):
+            self.last_path_invalid_replan_step = event_step
+        if tried_real_goal and not self.using_fallback_path:
+            self.last_fallback_goal_retry_step = event_step
 
         new_path = list(self.path)
         new_next_five = new_path[:5]
-        event_step = self.current_step if timestamp is None else int(timestamp)
         event_phase = self.current_phase if phase is None else str(phase)
 
         replan_context = self.source_linked_replan_context or {}
@@ -2865,6 +2956,19 @@ class GridRobot:
         for anchor in anchors:
             for cell in robot_footprint_cells(anchor):
                 cell = tuple(cell)
+                r, c = cell
+                # Match the planner: a direct local FREE observation suppresses
+                # peer risk, so it cannot justify a source-linked replan.
+                if (
+                    self.belief_map.source[r, c] == "self_sensor"
+                    and CellState(int(self.belief_map.belief[r, c])) in (
+                        CellState.FREE,
+                        CellState.PICKUP,
+                        CellState.DROPOFF,
+                        CellState.CHARGING,
+                    )
+                ):
+                    continue
                 if cell not in seen:
                     seen.add(cell)
                     cells.append(cell)
@@ -2994,11 +3098,25 @@ class GridRobot:
     def reports_affect_remaining_route(self, reports):
         if not reports or not self.path:
             return False
-        remaining = set(self.path[self.path_index:])
+
+        remaining = list(self.path[self.path_index:])
         for report in reports:
+            target = tuple(report.target_cell)
+
+            if self._cell_has_direct_free_observation(target):
+                continue
+
+            if (
+                report.claim == ClaimType.FREE
+                and not report.is_malicious
+                and self.defense_method != "majority_vote"
+            ):
+                continue
+
             for anchor in remaining:
-                if tuple(report.target_cell) in robot_footprint_cells(anchor):
+                if target in robot_footprint_cells(anchor):
                     return True
+
         return False
 
     def process_inbox(self):
@@ -3129,7 +3247,10 @@ class GridRobot:
         if self.motion_target_cell is not None:
             return self.advance_continuous_motion()
 
-        if self.path_invalid_or_empty():
+        if (
+            not self.replanned_this_step
+            and self.should_replan_for_path_state()
+        ):
             try:
                 self.plan_path(
                     reason="path_invalid_during_move",
@@ -3187,7 +3308,7 @@ class GridRobot:
         self,
         observations,
         timestamp,
-        attack_phase_started=False,
+        attack_phase_active=False,
     ):
         """
         Honest robots report what they directly observe.
@@ -3196,7 +3317,7 @@ class GridRobot:
         """
         reports = []
 
-        if self.is_malicious and attack_phase_started:
+        if self.is_malicious and attack_phase_active:
             for cell, observed_state in observations.items():
                 observed_state = CellState(int(observed_state))
 
@@ -3959,6 +4080,7 @@ def run_simulation(
         for robot in robots:
             robot.current_step = step
             robot.current_phase = current_phase
+            robot.replanned_this_step = False
 
         active_malicious_fake_objects = {
             cell: created_step
@@ -4012,7 +4134,7 @@ def run_simulation(
                     robot.make_observation_reports(
                         observations,
                         step,
-                        attack_phase_started=attack_phase_started,
+                        attack_phase_active=(current_phase == "ATTACK"),
                     )
                 )
 
@@ -4081,10 +4203,12 @@ def run_simulation(
                     placed_malicious_fake_object_centers.append(center)
                     last_malicious_fake_object_step = step
 
+        fixed_attack_injected = False
         if attack_events is not None:
             for event in attack_events:
                 if int(event.step) != step:
                     continue
+                fixed_attack_injected = True
                 for cell in event.cells:
                     reports_by_sender[event.sender_id].append(
                         PeerReport(
@@ -4097,7 +4221,10 @@ def run_simulation(
                     )
 
         # 3. Broadcast reports periodically.
-        if COMMUNICATION_PERIOD_STEPS > 0 and step % COMMUNICATION_PERIOD_STEPS == 0:
+        # Fixed-manifest attacks have an explicit delivery step.  They must not
+        # disappear merely because that step falls between normal periodic
+        # broadcasts (for example step 470 with a four-step cadence).
+        if COMMUNICATION_PERIOD_STEPS > 0 and (step % COMMUNICATION_PERIOD_STEPS == 0 or fixed_attack_injected):
             broadcast_reports(robots, reports_by_sender)
 
             for sender_id, reports in reports_by_sender.items():
@@ -4123,7 +4250,7 @@ def run_simulation(
                     active_malicious_fake_objects[tuple(report.target_cell)] = step
 
             route_affected = robot.reports_affect_remaining_route(accepted)
-            path_invalid = robot.path_invalid_or_empty()
+            path_invalid = robot.should_replan_for_path_state(step)
             trust_reweight = bool(robot.defense_replan_needed)
             should_replan = route_affected or trust_reweight or path_invalid
 
@@ -4277,7 +4404,7 @@ def run_simulation(
 
         log["traffic_heatmap"].append(traffic_heatmap.copy())
         log["phase"].append(
-            "ATTACK" if attack_phase_started else "RECONNAISSANCE"
+            current_phase
         )
 
         for robot in robots:

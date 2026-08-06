@@ -19,7 +19,6 @@ class BayesianTrustModel(TrustModel):
         before = self.score(sender_id); a, b = self._value(sender_id)
         if outcome == VerificationOutcome.CONFIRMED: a += 1
         elif outcome == VerificationOutcome.CONTRADICTED_FRESH: b += 1
-        elif outcome == VerificationOutcome.HONEST_STALE_OR_EXPIRED: a += .05
         self.values[sender_id] = [a, b]
         return before, self.score(sender_id)
 
@@ -30,7 +29,7 @@ class ScalarTrustModel(TrustModel):
     def score(self, sender_id: int) -> float: return self.values.get(sender_id, self.initial)
     def update(self, sender_id: int, outcome: VerificationOutcome) -> tuple[float, float]:
         before = self.score(sender_id)
-        delta = {VerificationOutcome.CONFIRMED: .06, VerificationOutcome.CONTRADICTED_FRESH: -.18, VerificationOutcome.HONEST_STALE_OR_EXPIRED: .01}.get(outcome, 0)
+        delta = {VerificationOutcome.CONFIRMED: .06, VerificationOutcome.CONTRADICTED_FRESH: -.18}.get(outcome, 0)
         self.values[sender_id] = min(1., max(0., before + delta))
         return before, self.values[sender_id]
 
