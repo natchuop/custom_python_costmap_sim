@@ -25,6 +25,8 @@ BLOCKED_CLAIM = 1
 CONGESTED_CLAIM = 2
 
 DEFENSE_METHODS = (
+    "full_trust",
+    "majority_vote",
     "hard_threshold",
     "soft_probability",
     "time_decay",
@@ -214,7 +216,7 @@ class DefenseMethodRunner:
     ) -> float:
         method = self.method
 
-        if method in ("hard_threshold", "soft_probability"):
+        if method in ("full_trust", "majority_vote", "hard_threshold", "soft_probability"):
             return claim.confidence
 
         if method == "time_decay":
@@ -240,6 +242,12 @@ class DefenseMethodRunner:
 
     def evidence(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "majority_vote":
+            votes = 0
+            for claim in self.claims_by_cell.get(tuple(cell), ()):
+                if now - claim.timestamp <= self.config.max_claim_age:
+                    votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
+            return float(votes)
         total = 0.0
 
         for claim in self.claims_by_cell.get(tuple(cell), ()):

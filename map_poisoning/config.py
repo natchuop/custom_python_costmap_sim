@@ -14,9 +14,9 @@ ALL_METHODS = PRIMARY_METHODS + LEGACY_METHODS
 
 @dataclass(frozen=True)
 class PhaseConfig:
-    recon_steps: int = 500
+    recon_steps: int = 450
     attack_steps: int = 1200
-    recovery_steps: int = 800
+    recovery_steps: int = 750
     @property
     def total_steps(self) -> int: return self.recon_steps + self.attack_steps + self.recovery_steps
 
@@ -78,7 +78,8 @@ class SimulationConfig:
     map_npy: str | None = None
     map_movingai: str | None = None
     manifest_path: str | None = None
-    deliveries_per_robot: int = 4
+    deliveries_per_robot: int = 100
+    engine: str = "legacy"
     max_steps: int | None = None
 
     def validate(self) -> None:
@@ -94,6 +95,7 @@ class SimulationConfig:
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai: raise ValueError("use one map source")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
+        if self.engine not in {"legacy", "modular"}: raise ValueError("engine must be legacy or modular")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
 
     @property

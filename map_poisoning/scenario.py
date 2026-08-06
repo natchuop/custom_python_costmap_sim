@@ -6,7 +6,8 @@ from pathlib import Path
 from .config import SimulationConfig
 from .models import AttackEvent, AttackType, ClaimType, TemporaryObstacleEpisode
 from .rng import derived_seed, named_rng
-from .world import demo_grid, make_episodes
+from .world import demo_grid
+from .planning import astar
 
 SCHEMA_VERSION = 1
 
@@ -28,13 +29,35 @@ class ScenarioManifest:
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
 def _cell_choice(rng, cells): return cells[rng.randrange(min(len(cells), 12))]
 
+def _nominal_route_cells(grid) -> list[tuple[int, int]]:
+    """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
+    rows, cols=grid.shape
+    starts=((2,2),(rows-3,cols-3),(2,cols-3))
+    targets=((rows-3,2),(2,cols-3),(rows-3,cols-3),(2,2))
+    routes=[]
+    for index,start in enumerate(starts):
+        for offset in (0,1,2):
+            goal=targets[(index+offset)%len(targets)]
+            route=astar(start,goal,lambda cell: float("inf") if not (0 <= cell[0] < rows and 0 <= cell[1] < cols) or grid[cell] else 1.0)
+            if route: routes.extend(route)
+    excluded=set(starts)|set(targets)
+    return [cell for cell in routes if cell not in excluded]
+
 def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     config.validate(); grid = demo_grid() if grid is None else grid
-    phases = config.phases; episodes = make_episodes(grid, config.seed, phases.total_steps, config.temporary_blockage_change_period_steps)
+    phases = config.phases
     rng = named_rng(config.seed, "attack_scheduler")
     enabled = [AttackType(x) for x in config.attacks.enabled]
     benign = (1, 2, 3); sender = 0; events=[]; bag=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
     free = [(r,c) for r in range(1,grid.shape[0]-1) for c in range(1,grid.shape[1]-1) if not grid[r,c]]
+    route_cells=_nominal_route_cells(grid) or free
+    # Temporary obstacles are part of the fixed scenario and deliberately sit
+    # on nominal traffic corridors so clearance/stale ablations affect behavior.
+    episodes=[]
+    for episode_index,appearance in enumerate(range(config.temporary_blockage_change_period_steps//2, phases.total_steps, config.temporary_blockage_change_period_steps)):
+        cell=route_cells[(episode_index*7 + rng.randrange(min(12,len(route_cells)))) % len(route_cells)]
+        episodes.append(TemporaryObstacleEpisode(f"obstacle-{episode_index:03}",(cell,),appearance,min(phases.total_steps,appearance+config.temporary_blockage_change_period_steps//2)))
+    episodes=tuple(episodes)
     while step < phases.recon_steps + phases.attack_steps and enabled:
         if not bag:
             bag = enabled.copy(); rng.shuffle(bag)
@@ -42,7 +65,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         if feasible:
             kind = feasible[0]; bag.remove(kind)
             episode = None
-            if kind == AttackType.FAKE_OBSTACLE: cell, claim, observation = _cell_choice(rng, free), ClaimType.BLOCKED, step
+            if kind == AttackType.FAKE_OBSTACLE: cell, claim, observation = _cell_choice(rng, route_cells), ClaimType.BLOCKED, step
             elif kind == AttackType.FALSE_CLEARANCE:
                 episode = _cell_choice(rng, [e for e in episodes if e.appearance_step <= step < e.clearance_step]); cell, claim, observation = episode.cells[0], ClaimType.FREE, step
             else:

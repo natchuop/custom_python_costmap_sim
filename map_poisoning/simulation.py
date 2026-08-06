@@ -1,22 +1,25 @@
-"""Headless replay loop.  Attack authoring is intentionally absent from this module."""
+"""Headless manifest replay with independent benign robot belief and behavior."""
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-from .admission import decide
+
 from .config import SimulationConfig
 from .fusion import FusionEngine
 from .metrics import CsvMetrics
-from .models import ClaimReport, ClaimType, SimulationPhase, VerificationOutcome
-from .planning import astar
+from .models import ClaimReport, ClaimType, DeliveryTask, SimulationPhase
+from .robot import ModularRobot
 from .scenario import ScenarioManifest
 from .trust import make_trust_model
-from .world import World, demo_grid
+from .world import World
+
 
 def phase_at(step: int, manifest: ScenarioManifest) -> SimulationPhase:
     if step < manifest.phase_boundaries["reconnaissance_end"]: return SimulationPhase.RECONNAISSANCE
     if step < manifest.phase_boundaries["attack_end"]: return SimulationPhase.ATTACK
     return SimulationPhase.RECOVERY
+
 
 @dataclass
 class RunResult:
@@ -25,117 +28,83 @@ class RunResult:
     manifest: ScenarioManifest
     summary: dict
 
-@dataclass
-class BenignRobotState:
-    robot_id: int
-    position: tuple[int, int]
-    goals: tuple[tuple[int, int], ...]
-    goal_index: int = 0
-    path: list[tuple[int, int]] | None = None
-    deliveries_completed: int = 0
-    no_path_steps: int = 0
-    movement_steps: int = 0
-    total_distance: float = 0.0
-    total_replans: int = 0
 
-    @property
-    def goal(self): return self.goals[self.goal_index]
+def _build_robots(config: SimulationConfig, world: World, method: str, ids: tuple[int, ...]) -> dict[int, ModularRobot]:
+    rows, cols=world.static_grid.shape
+    starts=((2,2),(rows-3,cols-3),(2,cols-3))
+    targets=((rows-3,2),(2,cols-3),(rows-3,cols-3),(2,2))
+    robots={}
+    for index, robot_id in enumerate(ids):
+        tasks=tuple(DeliveryTask(f"r{robot_id}-task-{task}", targets[(index+task)%4],targets[(index+task+2)%4]) for task in range(config.deliveries_per_robot))
+        trust=make_trust_model(config.trust.model,config.trust.prior_alpha,config.trust.prior_beta)
+        fusion=FusionEngine(method,trust.score,decay_rate=config.fusion.decay_rate,max_claim_age=config.fusion.max_claim_age,cost_scale=config.fusion.cost_scale,cost_exponent=config.fusion.cost_exponent,blocked_probability_threshold=config.fusion.blocked_probability_threshold)
+        from .belief import RobotBeliefMap
+        robots[robot_id]=ModularRobot(robot_id,starts[index],tasks,RobotBeliefMap(world.static_grid),trust,fusion,config.trust.threshold,config.fusion.admission_policy)
+    return robots
 
-    def finish_delivery(self):
-        self.deliveries_completed += 1
-        self.goal_index = (self.goal_index + 1) % len(self.goals)
-        self.path = None
 
 def replay(config: SimulationConfig, manifest: ScenarioManifest, method: str, output_directory: Path) -> RunResult:
-    grid=np.asarray(manifest.static_grid, dtype=np.uint8); world=World(grid, manifest.obstacle_episodes)
-    trust=make_trust_model(config.trust.model, config.trust.prior_alpha, config.trust.prior_beta)
-    fusion=FusionEngine(method, trust.score, decay_rate=config.fusion.decay_rate, max_claim_age=config.fusion.max_claim_age, cost_scale=config.fusion.cost_scale, cost_exponent=config.fusion.cost_exponent, blocked_probability_threshold=config.fusion.blocked_probability_threshold)
-    metrics=CsvMetrics(); attacks={event.step:event for event in manifest.attack_events}; pending=[]; received=accepted=contradicted=0
-    total=min(config.total_steps, manifest.phase_boundaries["total"])
-    fusion_effect_count = 0
-    fusion_absolute_delta_total = 0.0
-    malicious_fusion_effect_count = 0
-    malicious_fusion_absolute_delta_total = 0.0
-    starts=((2,2),(grid.shape[0]-3,grid.shape[1]-3),(2,grid.shape[1]-3))
-    all_goals=((grid.shape[0]-3,2),(2,grid.shape[1]-3),(grid.shape[0]-3,grid.shape[1]-3))
-    robots={robot_id: BenignRobotState(robot_id, starts[index], tuple(all_goals[(index+offset) % len(all_goals)] for offset in (0,1))) for index,robot_id in enumerate(manifest.benign_robot_ids)}
-    replan_requested = {robot_id: True for robot_id in robots}
+    grid=np.asarray(manifest.static_grid,dtype=np.uint8); world=World(grid,manifest.obstacle_episodes)
+    robots=_build_robots(config,world,method,manifest.benign_robot_ids)
+    metrics=CsvMetrics(); attacks={event.step:event for event in manifest.attack_events}; audit={report_id:event for event in manifest.attack_events for report_id in event.report_ids}
+    total=min(config.total_steps,manifest.phase_boundaries["total"]); received=accepted=contradicted=0
+    retroactive_changes=retroactive_delta=0.; malicious_retroactive=malicious_delta=0.
+    last_shared_direct: dict[tuple[int, tuple[int, int]], ClaimType] = {}
     for step in range(total):
         phase=phase_at(step,manifest)
-        if step in (manifest.phase_boundaries["reconnaissance_end"], manifest.phase_boundaries["attack_end"]): metrics.event(step,"phase_transition",phase=phase.value)
+        if step in (manifest.phase_boundaries["reconnaissance_end"],manifest.phase_boundaries["attack_end"]): metrics.event(step,"phase_transition",method=method,phase=phase.value)
+        # Direct sensing is authoritative and verification is recipient-specific.
+        observations={robot_id:robot.sense(world,step) for robot_id,robot in robots.items()}
+        for robot_id,robot in robots.items():
+            for report,outcome,old,new,ev_before,ev_after,p_before,p_after in robot.verify(observations[robot_id],step):
+                delta=ev_after-ev_before; malicious=report.report_id in audit
+                if outcome.value=="contradicted_fresh": contradicted+=1
+                if delta:
+                    retroactive_changes+=1; retroactive_delta+=abs(delta)
+                    if malicious: malicious_retroactive+=1; malicious_delta+=abs(delta)
+                metrics.trust_update(step,method=method,report_id=report.report_id,sender_id=report.sender_id,recipient_id=robot_id,outcome=outcome.value,old_trust=old,new_trust=new)
+                metrics.fusion_effect(step,method=method,report_id=report.report_id,sender_id=report.sender_id,recipient_id=robot_id,cell=report.target_cell,evidence_before=ev_before,evidence_after=ev_after,probability_before=p_before,probability_after=p_after,outcome=outcome.value,phase=phase.value,observation_age=step-report.observation_step,scenario_event_id=report.scenario_event_id)
+        # Honest benign robots share only their direct observations at the communication cadence.
+        if step % config.communication_period_steps == 0:
+            for sender_id,items in observations.items():
+                for item in items:
+                    share_key=(sender_id,item.cell)
+                    if last_shared_direct.get(share_key) == item.claim:
+                        continue
+                    last_shared_direct[share_key]=item.claim
+                    report=ClaimReport(f"direct-{sender_id}-{step}-{item.cell[0]}-{item.cell[1]}",sender_id,item.cell,item.claim,step,step,step)
+                    for recipient_id,recipient in robots.items():
+                        if recipient_id != sender_id: recipient.receive(report); received+=1
+            # During recon/recovery the attacker sends honest local observations.
+            if phase != SimulationPhase.ATTACK:
+                attacker_cell=(2+(step//config.communication_period_steps)%(grid.shape[0]-4),2)
+                report=ClaimReport(f"honest-{step:05}",manifest.malicious_robot_id,attacker_cell,world.state(attacker_cell,step),step,step,step)
+                metrics.event(step,"honest_report_sent",method=method,report_id=report.report_id,sender_id=report.sender_id,target_cell=attacker_cell,claim=report.claim.name,phase=phase.value)
+                for recipient in robots.values(): recipient.receive(report); received+=1
         event=attacks.get(step)
         if event:
-            metrics.event(step,"attack_action_injected",scenario_event_id=event.event_id,attack_type=event.attack_type.value,target_cell=event.cells[0],sender_id=event.sender_id,recipients=";".join(map(str,event.recipients)))
-            for cell, report_id in zip(event.cells,event.report_ids):
+            metrics.event(step,"attack_action_injected",method=method,scenario_event_id=event.event_id,attack_type=event.attack_type.value,target_cell=event.cells[0],sender_id=event.sender_id,recipients=";".join(map(str,event.recipients)))
+            for cell,report_id in zip(event.cells,event.report_ids):
                 report=ClaimReport(report_id,event.sender_id,cell,event.claim,event.observation_step,step,step,scenario_event_id=event.event_id)
-                # Audit values stay in logging only; fusion receives the operational report.
-                metrics.event(step,"report_sent",report_id=report_id,scenario_event_id=event.event_id,attack_type=event.attack_type.value,target_cell=cell,claim=event.claim.name,sender_id=event.sender_id,recipients=";".join(map(str,event.recipients)),malicious_audit=True)
-                for recipient in event.recipients:
-                    received += 1; admission=decide(config.fusion.admission_policy,trust.score(report.sender_id),config.trust.threshold)
-                    metrics.event(step,"admission",report_id=report_id,recipient_id=recipient,accepted=admission.accepted,influence=admission.influence,reason=admission.reason)
-                    if admission.accepted: fusion.add(report,admission.influence); accepted += 1; pending.append((step+1,report,recipient))
-                    replan_requested[recipient] = True
-        # Honest attacker reports during reconnaissance/recovery demonstrate normal reporting continues.
-        if phase != SimulationPhase.ATTACK and step % config.communication_period_steps == 0:
-            cell=(2 + (step//config.communication_period_steps) % (grid.shape[0]-4), 2)
-            claim=world.state(cell,step); report=ClaimReport(f"honest-{step:05}",manifest.malicious_robot_id,cell,claim,step,step,step)
-            metrics.event(step,"honest_report_sent",report_id=report.report_id,sender_id=report.sender_id,target_cell=cell,claim=claim.name,phase=phase.value)
-            for recipient in manifest.benign_robot_ids:
-                fusion.add(report,1.); pending.append((step+1,report,recipient)); replan_requested[recipient] = True
-        for due,report,recipient in [x for x in pending if x[0] == step]:
-            actual=world.state(report.target_cell,step)
-            age=step-report.observation_step
-            outcome=VerificationOutcome.CONFIRMED if actual == report.claim else (VerificationOutcome.HONEST_STALE_OR_EXPIRED if age > 20 else VerificationOutcome.CONTRADICTED_FRESH)
-            evidence_before = fusion.evidence(report.target_cell, step)
-            probability_before = fusion.probability(report.target_cell, step)
-            old,new=trust.update(report.sender_id,outcome)
-            evidence_after = fusion.evidence(report.target_cell, step)
-            probability_after = fusion.probability(report.target_cell, step)
-            evidence_delta = evidence_after - evidence_before
-            if evidence_delta != 0.0:
-                fusion_effect_count += 1
-                fusion_absolute_delta_total += abs(evidence_delta)
-                if report.scenario_event_id:
-                    malicious_fusion_effect_count += 1
-                    malicious_fusion_absolute_delta_total += abs(evidence_delta)
-                # Only source-linked fusion changes stored evidence after a trust update.
-                replan_requested[recipient] = True
-            if outcome == VerificationOutcome.CONTRADICTED_FRESH: contradicted += 1
-            metrics.trust_update(step, method=method, report_id=report.report_id,
-                                 sender_id=report.sender_id, recipient_id=recipient,
-                                 outcome=outcome.value, old_trust=old, new_trust=new)
-            metrics.fusion_effect(step, method=method, report_id=report.report_id,
-                                  sender_id=report.sender_id, recipient_id=recipient,
-                                  cell=report.target_cell, evidence_before=evidence_before,
-                                  evidence_after=evidence_after,
-                                  probability_before=probability_before,
-                                  probability_after=probability_after, outcome=outcome.value,
-                                  phase=phase.value, observation_age=age,
-                                  scenario_event_id=report.scenario_event_id)
-        pending[:]=[x for x in pending if x[0] > step]
-        for robot in robots.values():
-            if robot.position == robot.goal:
-                robot.finish_delivery()
-                replan_requested[robot.robot_id] = True
-            if replan_requested[robot.robot_id] or not robot.path:
-                def traversal_cost(cell):
-                    if world.state(cell, step) == ClaimType.BLOCKED: return float("inf")
-                    return fusion.routing_cost(cell, step)
-                robot.path = astar(robot.position, robot.goal, traversal_cost)
-                robot.total_replans += 1
-                replan_requested[robot.robot_id] = False
-            if robot.path:
-                robot.position = robot.path.pop(0)
-                robot.movement_steps += 1
-                robot.total_distance += 1.0
-            else:
-                robot.no_path_steps += 1
+                metrics.event(step,"report_sent",method=method,report_id=report_id,scenario_event_id=event.event_id,attack_type=event.attack_type.value,target_cell=cell,claim=event.claim.name,sender_id=event.sender_id,recipients=";".join(map(str,event.recipients)),malicious_audit=True)
+                for recipient_id in event.recipients: robots[recipient_id].receive(report); received+=1
+        # Each recipient independently admits reports, decides whether its own route is affected, and moves.
+        for robot_id,robot in robots.items():
+            inbox_accepted,route_affected=robot.process_inbox(step); accepted+=len(inbox_accepted)
+            reason="initial_or_empty" if not robot.path else ""
+            if route_affected: reason="peer_claim_on_route"
+            if not robot.path or route_affected: robot.replan(step,reason)
+            action=robot.move(world,step)
+            if action=="blocked_move": robot.replan(step,"direct_blocked_move")
+            if action=="task_transition": robot.replan(step,"task_transition")
+            if robot.replan_records and robot.replan_records[-1].step==step:
+                record=robot.replan_records[-1]
+                metrics.event(step,"replan",method=method,robot_id=robot_id,reason=record.reason,old_path_cost=record.old_path_cost,new_path_cost=record.new_path_cost,old_path_length=record.old_path_length,new_path_length=record.new_path_length,path_changed=record.changed)
+            metrics.event(step,"robot_action",method=method,robot_id=robot_id,action=action,position=robot.position,goal=robot.goal)
         if step % config.logging.timeseries_period_steps == 0:
-            active_cells = tuple(fusion.claims)
-            active_evidence = sum(fusion.evidence(cell, step) for cell in active_cells)
-            mean_probability = (sum(fusion.probability(cell, step) for cell in active_cells) / len(active_cells)) if active_cells else 0.0
             for robot in robots.values():
-                metrics.sample(step=step,phase=phase.value,method=method,robot_id=robot.robot_id,position=robot.position,goal=robot.goal,deliveries_completed=robot.deliveries_completed,benign_no_path_steps=robot.no_path_steps,benign_movement_steps=robot.movement_steps,benign_total_distance=robot.total_distance,benign_total_replans=robot.total_replans,attacker_trust=trust.score(manifest.malicious_robot_id),active_claim_cells=len(active_cells),active_peer_evidence=active_evidence,mean_peer_occupancy_probability=mean_probability,reports_received=received)
-    summary={"method":method,"seed":config.seed,"steps_completed":total,"attack_actions":len([e for e in manifest.attack_events if e.step < total]),"benign_total_deliveries_completed":sum(robot.deliveries_completed for robot in robots.values()),"benign_no_path_steps":sum(robot.no_path_steps for robot in robots.values()),"benign_movement_steps":sum(robot.movement_steps for robot in robots.values()),"benign_total_distance":sum(robot.total_distance for robot in robots.values()),"benign_total_replans":sum(robot.total_replans for robot in robots.values()),"reports_received":received,"reports_accepted":accepted,"fresh_contradictions":contradicted,"trust_updates_with_retroactive_evidence_change":fusion_effect_count,"total_absolute_retroactive_evidence_delta":fusion_absolute_delta_total,"malicious_report_retroactive_evidence_changes":malicious_fusion_effect_count,"malicious_report_absolute_retroactive_evidence_delta":malicious_fusion_absolute_delta_total,"final_attacker_trust":trust.score(manifest.malicious_robot_id),"manifest_hash":manifest.map_hash}
+                active_cells=tuple(robot.fusion.claims); evidence=sum(robot.fusion.evidence(cell,step) for cell in active_cells)
+                metrics.sample(step=step,phase=phase.value,method=method,robot_id=robot.robot_id,position=robot.position,goal=robot.goal,carrying=robot.carrying,deliveries_completed=robot.deliveries_completed,benign_no_path_steps=robot.no_path_steps,benign_movement_steps=robot.movement_steps,benign_total_distance=robot.total_distance,benign_total_replans=robot.total_replans,productive_replans=robot.productive_replans,blocked_moves=robot.blocked_moves,attacker_trust=robot.trust.score(manifest.malicious_robot_id),active_claim_cells=len(active_cells),active_peer_evidence=evidence,reports_received=received)
+    summary={"method":method,"seed":config.seed,"steps_completed":total,"attack_actions":len(manifest.attack_events),"benign_total_deliveries_completed":sum(r.deliveries_completed for r in robots.values()),"benign_no_path_steps":sum(r.no_path_steps for r in robots.values()),"benign_movement_steps":sum(r.movement_steps for r in robots.values()),"benign_total_distance":sum(r.total_distance for r in robots.values()),"benign_total_replans":sum(r.total_replans for r in robots.values()),"benign_productive_replans":sum(r.productive_replans for r in robots.values()),"benign_blocked_moves":sum(r.blocked_moves for r in robots.values()),"reports_received":received,"reports_accepted":accepted,"fresh_contradictions":contradicted,"trust_updates_with_retroactive_evidence_change":retroactive_changes,"total_absolute_retroactive_evidence_delta":retroactive_delta,"malicious_report_retroactive_evidence_changes":malicious_retroactive,"malicious_report_absolute_retroactive_evidence_delta":malicious_delta,"final_attacker_trust_mean":sum(r.trust.score(manifest.malicious_robot_id) for r in robots.values())/len(robots),"manifest_hash":manifest.map_hash}
     output_directory.mkdir(parents=True,exist_ok=True); metrics.write(output_directory,summary)
     return RunResult(output_directory,method,manifest,summary)

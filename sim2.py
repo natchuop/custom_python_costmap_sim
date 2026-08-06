@@ -3765,6 +3765,7 @@ def run_simulation(
     max_steps=MAX_STEPS,
     random_seed=RANDOM_SEED,
     experiment_mode=EXPERIMENT_MODE,
+    attack_events=None,
 ):
     np.random.seed(random_seed)
 
@@ -4039,6 +4040,8 @@ def run_simulation(
             print(f"\n--- ATTACK INJECTION STOPPED AT STEP {step}; RECOVERY PHASE STARTING ---")
 
         should_inject_fake_object = (
+            attack_events is None
+            and
             enable_malicious_reports
             and attack_phase_started
             and attack_injection_stop_step is None
@@ -4077,6 +4080,21 @@ def run_simulation(
 
                     placed_malicious_fake_object_centers.append(center)
                     last_malicious_fake_object_step = step
+
+        if attack_events is not None:
+            for event in attack_events:
+                if int(event.step) != step:
+                    continue
+                for cell in event.cells:
+                    reports_by_sender[event.sender_id].append(
+                        PeerReport(
+                            sender_id=event.sender_id,
+                            target_cell=tuple(cell),
+                            claim=ClaimType(int(event.claim)),
+                            timestamp=int(event.observation_step),
+                            is_malicious=True,
+                        )
+                    )
 
         # 3. Broadcast reports periodically.
         if COMMUNICATION_PERIOD_STEPS > 0 and step % COMMUNICATION_PERIOD_STEPS == 0:
