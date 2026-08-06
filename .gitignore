@@ -4,3 +4,8 @@ __pycache__/
 
 # Generated converted maps and previews
 converted_maps/
+
+# Simulation artifacts
+outputs/
+_verify*/
+_verification*/

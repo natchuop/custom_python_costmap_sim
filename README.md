@@ -1,6 +1,6 @@
 # NSF REU custom simulator
 
-This folder contains the standalone multi-robot simulator, the defense runner,
+This folder contains the modular standalone multi-robot simulator, the legacy defense runner,
 the ROS occupancy-map converter, and the AWS RoboMaker small warehouse world.
 
 ## Run
@@ -8,7 +8,7 @@ the ROS occupancy-map converter, and the AWS RoboMaker small warehouse world.
 From PowerShell in this folder:
 
 ```powershell
-.\.venv\Scripts\python.exe .\sim2.py --map-npy ".\converted_maps\maps_005_map_rotated\static_grid.npy"
+.\.venv\Scripts\python.exe .\main.py
 ```
 
 Or use the launcher:
@@ -22,6 +22,22 @@ For a quick headless test:
 ```powershell
 .\run_sim.ps1 -NoAnimation -MaxSteps 10 -DeliveriesPerRobot 1
 ```
+
+Headless single run, manifest authoring, and fixed-manifest comparison:
+
+```powershell
+.\.venv\Scripts\python.exe .\main.py --headless --no-animation
+.\.venv\Scripts\python.exe .\main.py --headless --manifest-only --output-directory outputs\scenario
+.\.venv\Scripts\python.exe .\main.py --headless --compare --manifest outputs\scenario\scenario_manifest.json --output-directory outputs\comparison
+```
+
+Run the dependency check before installation or on a new machine:
+
+```powershell
+.\.venv\Scripts\python.exe .\install_dependencies.py --install --include-dev
+```
+
+`sim2.py` remains available as the legacy implementation during migration.
 
 The old path under `C:\Users\ashut\...` is not needed; all paths here are
 relative to this project.
