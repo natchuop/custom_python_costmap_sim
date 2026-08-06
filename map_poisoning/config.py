@@ -8,8 +8,8 @@ from typing import Any
 from .models import AttackType
 
 PRIMARY_METHODS = ("full_trust", "majority_vote", "trust_fused", "source_linked")
-LEGACY_METHODS = ("hard_threshold", "soft_probability", "time_decay")
-ALL_METHODS = PRIMARY_METHODS + LEGACY_METHODS
+ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay")
+ALL_METHODS = PRIMARY_METHODS + ADDITIONAL_METHODS
 
 
 @dataclass(frozen=True)
@@ -24,8 +24,8 @@ class PhaseConfig:
 @dataclass(frozen=True)
 class AttackConfig:
     enabled: tuple[str, ...] = tuple(item.value for item in AttackType)
-    interval_min: int = 20
-    interval_max: int = 20
+    interval_min: int = 50
+    interval_max: int = 50
     candidate_top_k: int = 12
     broadcast: bool = True
     global_awareness: bool = True
@@ -84,7 +84,6 @@ class SimulationConfig:
     map_movingai: str | None = None
     manifest_path: str | None = None
     deliveries_per_robot: int = 100
-    engine: str = "legacy"
     max_steps: int | None = None
 
     def validate(self) -> None:
@@ -101,7 +100,6 @@ class SimulationConfig:
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai: raise ValueError("use one map source")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
-        if self.engine not in {"legacy", "modular"}: raise ValueError("engine must be legacy or modular")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
 
     @property

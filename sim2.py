@@ -415,14 +415,17 @@ def footprint_cells(top_left, height, width):
     ]
 
 
-def can_place_temporary_footprint(grid, cells):
+def can_place_temporary_footprint(grid, cells, forbidden_cells=None):
     """
     A temporary object footprint is valid only if every cell is normal FREE.
 
     This prevents pallets/carts from being spawned inside walls, shelves,
     pickup/dropoff zones, charging zones, or already blocked areas.
     """
+    forbidden_cells = forbidden_cells or set()
     for cell in cells:
+        if cell in forbidden_cells:
+            return False
         if not can_place_temporary_object(grid, cell):
             return False
 
@@ -616,6 +619,36 @@ def choose_temporary_object_footprints(
     return selected[:blocked_count]
 
 
+def robot_occupied_cells(robots):
+    """Cells currently occupied by any robot footprint."""
+    occupied = set()
+    for robot in robots or []:
+        occupied.update(robot.occupied_cells)
+    return occupied
+
+
+def cell_occupied_by_benign_robot(cell, robots):
+    """True when a benign robot's footprint currently covers this cell."""
+    for robot in robots:
+        if robot.is_malicious:
+            continue
+        if cell in robot.occupied_cells:
+            return True
+    return False
+
+
+def apply_temporary_obstacle_episodes(grid, episodes, step, forbidden_cells=None):
+    """Apply manifest temporary-obstacle episodes, skipping cells occupied by robots."""
+    forbidden_cells = forbidden_cells or set()
+    truth = grid.copy()
+    for episode in episodes:
+        if episode.appearance_step <= step < episode.clearance_step:
+            for cell in episode.cells:
+                if cell not in forbidden_cells:
+                    truth[cell] = CellState.TEMPORARILY_BLOCKED
+    return truth
+
+
 def apply_temporary_footprints(dynamic_grid, temporary_footprints):
     for cells, state in temporary_footprints:
         for r, c in cells:
@@ -659,7 +692,8 @@ class TemporaryBlockageManager:
         self.active_indices = set()
         self.refresh_active_blockages(force=True)
 
-    def refresh_active_blockages(self, force=False):
+    def refresh_active_blockages(self, force=False, forbidden_cells=None):
+        forbidden_cells = forbidden_cells or set()
         if not self.pool:
             self.active_indices = set()
             return
@@ -667,8 +701,41 @@ class TemporaryBlockageManager:
         candidate_indices = list(range(len(self.pool)))
         self.rng.shuffle(candidate_indices)
 
-        active_count = min(self.active_count, len(candidate_indices))
-        self.active_indices = set(candidate_indices[:active_count])
+        eligible = []
+        for idx in candidate_indices:
+            cells, _ = self.pool[idx]
+            if any(cell in forbidden_cells for cell in cells):
+                continue
+            eligible.append(idx)
+            if len(eligible) >= self.active_count:
+                break
+
+        if forbidden_cells and len(eligible) < self.active_count:
+            print(
+                f"Warning: only {len(eligible)} temporary blockages avoid "
+                f"current robot positions (requested {self.active_count})"
+            )
+
+        active_count = min(self.active_count, len(eligible))
+        if active_count == 0 and not force and self.active_indices:
+            kept = [
+                idx
+                for idx in self.active_indices
+                if not any(cell in forbidden_cells for cell in self.pool[idx][0])
+            ]
+            if kept:
+                self.active_indices = set(kept[:min(self.active_count, len(kept))])
+                print("Active temporary blockages (kept prior set avoiding robots):")
+                for idx in sorted(self.active_indices):
+                    cells, state = self.pool[idx]
+                    center_r, center_c = footprint_center(cells)
+                    print(
+                        f"  candidate {idx}: {state_name(state)}, "
+                        f"cells={len(cells)}, center=({center_r:.1f}, {center_c:.1f})"
+                    )
+                return
+
+        self.active_indices = set(eligible[:active_count])
 
         print("Active temporary blockages:")
         for idx in sorted(self.active_indices):
@@ -688,7 +755,8 @@ class TemporaryBlockageManager:
 
         return step % self.change_period == 0
 
-    def build_truth_grid(self):
+    def build_truth_grid(self, forbidden_cells=None):
+        forbidden_cells = forbidden_cells or set()
         dynamic = self.static_grid.copy()
 
         active_footprints = [
@@ -696,15 +764,24 @@ class TemporaryBlockageManager:
             for idx in sorted(self.active_indices)
         ]
 
+        if forbidden_cells:
+            filtered = []
+            for cells, state in active_footprints:
+                kept_cells = [cell for cell in cells if cell not in forbidden_cells]
+                if kept_cells:
+                    filtered.append((kept_cells, state))
+            active_footprints = filtered
+
         return apply_temporary_footprints(dynamic, active_footprints)
 
-    def update_world_if_needed(self, world, step):
+    def update_world_if_needed(self, world, step, robots=None):
         if not self.should_update(step):
             return False
 
+        forbidden_cells = robot_occupied_cells(robots)
         print(f"Changing temporary blockages at step {step}")
-        self.refresh_active_blockages()
-        world.grid = self.build_truth_grid()
+        self.refresh_active_blockages(forbidden_cells=forbidden_cells)
+        world.grid = self.build_truth_grid(forbidden_cells=forbidden_cells)
         return True
 
 def make_dynamic_grid_with_auto_temporary_objects(static_grid):
@@ -2317,7 +2394,7 @@ def can_report_fake_block_cell(cell, world, goals, robots):
     if is_near_any_goal(cell, goals):
         return False
 
-    if is_near_any_benign_robot(cell, robots):
+    if cell_occupied_by_benign_robot(cell, robots):
         return False
 
     return True
@@ -2416,7 +2493,7 @@ def is_valid_recon_attack_cell(cell, world, goals, robots, traffic_heatmap):
     if is_near_any_goal(cell, goals):
         return False
 
-    if is_near_any_benign_robot(cell, robots):
+    if cell_occupied_by_benign_robot(cell, robots):
         return False
 
     report_cells = fake_object_report_cells(
@@ -3675,6 +3752,30 @@ def repair_delivery_tasks(
 
     return repaired
 
+
+def refine_action_points(world, action_points, forbidden, target_count, excluded):
+    """Drop excluded cells and refill to the target count with strategic picks."""
+    excluded_set = frozenset(tuple(cell) for cell in excluded)
+    points = [tuple(cell) for cell in action_points if tuple(cell) not in excluded_set]
+    blocked = set(forbidden).union(points).union(excluded_set)
+
+    while len(points) < target_count:
+        extra = choose_strategic_action_points(
+            world,
+            target_count - len(points),
+            forbidden=blocked,
+        )
+
+        for point in extra:
+            cell = tuple(point)
+            if cell in excluded_set or cell in points:
+                continue
+            points.append(cell)
+            blocked.add(cell)
+
+    return points
+
+
 def build_robot_specs_and_goals(
     world,
     num_robots=DEFAULT_NUM_ROBOTS,
@@ -3754,6 +3855,22 @@ def build_robot_specs_and_goals(
             world,
             count=DEFAULT_NUM_ACTION_POINTS,
             forbidden=used_starts,
+        )
+
+    try:
+        from map_poisoning.map_io import WAREHOUSE_EXCLUDED_ACTION_POINTS
+
+        excluded = WAREHOUSE_EXCLUDED_ACTION_POINTS
+    except ImportError:
+        excluded = frozenset()
+
+    if excluded:
+        action_points = refine_action_points(
+            world,
+            action_points,
+            used_starts,
+            DEFAULT_NUM_ACTION_POINTS,
+            excluded,
         )
 
     goals = action_points.copy()
@@ -3887,6 +4004,10 @@ def run_simulation(
     random_seed=RANDOM_SEED,
     experiment_mode=EXPERIMENT_MODE,
     attack_events=None,
+    obstacle_episodes=None,
+    manifest_robot_starts=None,
+    manifest_task_queues=None,
+    manifest_malicious_robot_id=None,
 ):
     np.random.seed(random_seed)
 
@@ -3901,8 +4022,9 @@ def run_simulation(
     world = GridWorld(grid)
 
     temp_blockage_manager = None
+    fixed_obstacle_episodes = tuple(obstacle_episodes or ())
 
-    if ENABLE_DYNAMIC_TEMP_BLOCKAGES and prior_grid is not None:
+    if ENABLE_DYNAMIC_TEMP_BLOCKAGES and prior_grid is not None and not fixed_obstacle_episodes:
         temp_blockage_manager = TemporaryBlockageManager(
             prior_grid,
             active_count=TEMP_ACTIVE_OBJECT_COUNT_BLOCKED,
@@ -3910,6 +4032,12 @@ def run_simulation(
             seed=random_seed,
         )
         world.grid = temp_blockage_manager.build_truth_grid()
+    elif fixed_obstacle_episodes:
+        world.grid = prior_grid.copy()
+        for episode in fixed_obstacle_episodes:
+            if episode.appearance_step <= 0 < episode.clearance_step:
+                for cell in episode.cells:
+                    world.grid[cell] = CellState.TEMPORARILY_BLOCKED
 
     robot_specs, goals, display_goals = build_robot_specs_and_goals(
         world,
@@ -3917,46 +4045,72 @@ def run_simulation(
         prior_grid=prior_grid,
     )
 
-    goals = filter_reachable_action_points(
-        goals,
-        robot_specs,
-        prior_grid,
-    )
+    if manifest_robot_starts and manifest_task_queues:
+        robot_specs = [
+            {"robot_id": robot_id, "start": tuple(manifest_robot_starts[robot_id])}
+            for robot_id in range(DEFAULT_NUM_ROBOTS)
+        ]
+        tasks_by_robot = {
+            robot_id: [
+                DeliveryTask(pickup=tuple(task.pickup), dropoff=tuple(task.dropoff))
+                for task in manifest_task_queues[robot_id]
+            ]
+            for robot_id in manifest_task_queues
+        }
+        goals = display_goals.copy()
+    else:
+        goals = filter_reachable_action_points(
+            goals,
+            robot_specs,
+            prior_grid,
+        )
 
-    relocate_starts_for_goals(world, robot_specs, goals, prior_grid)
+        relocate_starts_for_goals(world, robot_specs, goals, prior_grid)
 
-    display_goals = goals.copy()
+        display_goals = goals.copy()
 
-    tasks_by_robot = build_delivery_tasks(
-        goals,
-        num_robots=DEFAULT_NUM_ROBOTS,
-        tasks_per_robot=tasks_per_robot,
-    )
+        tasks_by_robot = build_delivery_tasks(
+            goals,
+            num_robots=DEFAULT_NUM_ROBOTS,
+            tasks_per_robot=tasks_per_robot,
+        )
 
-    tasks_by_robot = repair_delivery_tasks(
-        world,
-        tasks_by_robot,
-        robot_specs,
-        prior_grid,
-        action_points=goals,
-    )
+        tasks_by_robot = repair_delivery_tasks(
+            world,
+            tasks_by_robot,
+            robot_specs,
+            prior_grid,
+            action_points=goals,
+        )
 
     goal = goals[0]
+
+    # Manifest tasks and starts are authored against the static prior grid; do not
+    # validate them on a step-0 truth grid that already includes temp blockages.
+    validation_world = (
+        GridWorld(prior_grid)
+        if manifest_robot_starts and manifest_task_queues
+        else world
+    )
 
     for robot_id, tasks in tasks_by_robot.items():
         for task in tasks:
             validate_start_and_goal(
-                world,
+                validation_world,
                 [{"robot_id": robot_id, "start": task.pickup}],
                 task.dropoff,
             )
 
-    validate_start_and_goal(world, robot_specs, goal)
+    validate_start_and_goal(validation_world, robot_specs, goal)
 
-    malicious_robot_id = choose_malicious_robot_id(
-        robot_specs,
-        goals,
-        prior_grid,
+    malicious_robot_id = (
+        int(manifest_malicious_robot_id)
+        if manifest_malicious_robot_id is not None
+        else choose_malicious_robot_id(
+            robot_specs,
+            goals,
+            prior_grid,
+        )
     )
 
     robots = []
@@ -4091,9 +4245,24 @@ def run_simulation(
             changed_temp_blockages = temp_blockage_manager.update_world_if_needed(
                 world,
                 step,
+                robots=robots,
             )
 
             if changed_temp_blockages:
+                for robot in robots:
+                    robot.path = []
+                    robot.path_index = 0
+                    robot.motion_target_cell = None
+                    robot.motion_target_xy = None
+        elif fixed_obstacle_episodes:
+            rebuilt = apply_temporary_obstacle_episodes(
+                prior_grid,
+                fixed_obstacle_episodes,
+                step,
+                forbidden_cells=robot_occupied_cells(robots),
+            )
+            if not np.array_equal(rebuilt, world.grid):
+                world.grid = rebuilt
                 for robot in robots:
                     robot.path = []
                     robot.path_index = 0

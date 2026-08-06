@@ -1,7 +1,7 @@
 # NSF REU custom simulator
 
-This folder contains the modular standalone multi-robot simulator, the legacy defense runner,
-the ROS occupancy-map converter, and the AWS RoboMaker small warehouse world.
+This folder contains the modular multi-robot simulator, its fixed-manifest replay and
+defense methods, the ROS occupancy-map converter, and the AWS RoboMaker warehouse world.
 
 ## Run
 
@@ -38,7 +38,18 @@ Run the dependency check before installation or on a new machine:
 python .\install_dependencies.py --install --include-dev
 ```
 
-`sim2.py` remains available as the legacy implementation during migration.
+The public entry point is the modular package (`main.py` and `map_poisoning/`).  The
+current replay deliberately keeps `sim2.py` and `defense_method_runner.py` as internal
+behavioral components: they provide the validated continuous-motion, warehouse-layout,
+LiDAR, and fusion implementations used by the modular manifest adapter.  They are not
+separate selectable engines.
+
+To compare all five supported methods on one fixed seed-10 manifest:
+
+```powershell
+python .\main.py --headless --manifest-only --seed 10 --no-animation --output-directory outputs\seed10_manifest
+python .\main.py --headless --compare --manifest outputs\seed10_manifest\scenario_manifest.json --seed 10 --no-animation --output-directory outputs\seed10_compare
+```
 
 The old path under `C:\Users\ashut\...` is not needed; all paths here are
 relative to this project.

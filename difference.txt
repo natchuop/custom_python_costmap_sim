@@ -1,0 +1,89 @@
+NSF REU custom simulator: modularize vs main
+================================================
+
+This branch is the modularized fixed-manifest workflow.  Compared with the latest
+main branch, it adds the map_poisoning package orchestration, versioned scenario
+manifests, fixed attack schedules, per-run CSV/JSON auditing, the Tk GUI controls,
+the default upstream warehouse map, and the five selectable defense methods:
+full_trust, majority_vote, trust_fused, source_linked, and soft_probability.
+It also removes the standalone parity/audit helper scripts and treats the simulator
+as one public modular command.  The validated continuous-motion implementation in
+sim2.py and fusion implementation in defense_method_runner.py remain internal
+runtime components; they are not separate user-selectable engines.
+
+First-time setup from GitHub
+----------------------------
+
+    git clone https://github.com/natchuop/custom_map_poisoning_costmap.git
+    cd custom_map_poisoning_costmap
+    python install_dependencies.py --install --include-dev
+
+The dependency installer may be run with the system Python; a virtual environment
+is recommended but not required.  Verify the installation with:
+
+    python install_dependencies.py --skip-gui
+    python -m pytest -q
+
+Run a single simulation
+-----------------------
+
+    python main.py --headless --no-animation --seed 10 --defense-method source_linked --output-directory outputs/seed10_source
+
+Omit --headless and --no-animation to open the Tk interface and see the heatmap,
+graphs, and animation.  The main output files are run_summary.csv, events.csv,
+robot_timeseries.csv, scenario_manifest.json, audit_report.json, and the resolved
+configuration JSON files in the selected output directory.
+
+Run multiple methods on one scenario
+-------------------------------------
+
+Author a fixed scenario once, then replay it across the primary methods:
+
+    python main.py --headless --manifest-only --seed 10 --no-animation --output-directory outputs/seed10_manifest
+    python main.py --headless --compare --seed 10 --no-animation --manifest outputs/seed10_manifest/scenario_manifest.json --output-directory outputs/seed10_compare
+
+The comparison creates one subdirectory per method.  To run soft_probability,
+which is an additional selectable method rather than one of the four primary
+comparison defaults, run:
+
+    python main.py --headless --seed 10 --no-animation --manifest outputs/seed10_manifest/scenario_manifest.json --defense-method soft_probability --output-directory outputs/seed10_compare/soft_probability
+
+Important settings
+------------------
+
+--defense-method selects one method.  --compare runs the four primary methods
+(full_trust, majority_vote, trust_fused, source_linked) against the same manifest.
+--seed controls deterministic scenario generation.  --attacks accepts a comma-
+separated attack selection or none.  --recon-steps, --attack-steps,
+--recovery-steps, --max-steps, and --deliveries-per-robot control run length and
+workload.  --attack-interval-min/max controls attack spacing.  --no-animation is
+for headless runs; without it the visualization is enabled.
+
+Items from the implementation plan that remain incomplete
+------------------------------------------------------------
+
+These are intentionally listed, not changed here:
+
+* sim2.py still owns the production world, LiDAR, robot, continuous-motion,
+  footprint-planning, and visualization implementation.  The modular files are
+  orchestration/adaptation layers, not a fully independent replacement.
+* The default upstream warehouse-manifest author currently schedules fake_obstacle
+  events.  The generic author_manifest path supports false_clearance and
+  stale_reassertion, but the default warehouse path does not yet use those attack
+  selections when authoring its manifest.
+* The GUI does not expose every advanced CLI setting (phase lengths, attack timing,
+  and fusion constants).
+* Exact scientific parity with every historical protocol/seed is not established;
+  results should be compared using one shared fixed manifest and declared settings.
+* A native modular visualization and native modular robot/world implementation
+  independent of sim2.py have not been completed.
+
+Attack implementation status
+-----------------------------
+
+Yes, false_clearance and stale_reassertion were implemented in the generic
+manifest authoring, manifest schema, audit checks, and attack model.  However,
+the default warehouse authoring path used by main.py currently emits fake_obstacle
+events only.  To exercise the other two attacks reliably, use the generic
+author_manifest path (for example with an explicit map input) or provide a
+pre-authored manifest containing those events, then verify audit_report.json.

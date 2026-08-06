@@ -1,6 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.pyo
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
 
 # Generated converted maps and previews
 converted_maps/
@@ -10,3 +17,7 @@ outputs/
 _verify*/
 _verification*/
 verification_outputs/
+
+# Local editor and tooling state
+.idea/
+.vscode/

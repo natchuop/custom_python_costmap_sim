@@ -8,11 +8,10 @@ from .models import Cell, ClaimType, DirectObservation
 
 
 class RobotBeliefMap:
-    """A robot's local, directly observed view of the world.
+    """A robot's local, directly observed view of the world."""
 
-    Peer claims are never written into this map.  They are retained by that
-    robot's fusion engine so changing source trust can safely reweight them.
-    """
+    UNKNOWN_TRAVERSAL_COST = 3.0
+
     def __init__(self, static_grid: np.ndarray):
         self.static_grid = np.asarray(static_grid, dtype=np.uint8)
         self.rows, self.cols = self.static_grid.shape
@@ -34,12 +33,29 @@ class RobotBeliefMap:
         item = self.direct.get(cell)
         return item.claim if item else None
 
+    def has_direct_free(self, cell: Cell) -> bool:
+        return self.direct_state(cell) == ClaimType.FREE
+
+    def is_blocked_for_planning(self, cell: Cell, fusion, step: int) -> bool:
+        if not self.in_bounds(cell) or self.static_grid[cell]:
+            return True
+        direct = self.direct_state(cell)
+        if direct == ClaimType.BLOCKED:
+            return True
+        if direct == ClaimType.FREE:
+            return fusion.footprint_hard_blocked([cell], step)
+        return fusion.footprint_hard_blocked([cell], step)
+
     def traversal_cost(self, cell: Cell, step: int, fusion) -> float:
-        state = self.direct_state(cell)
-        if state == ClaimType.BLOCKED:
+        if not self.in_bounds(cell) or self.static_grid[cell]:
             return math.inf
-        if state == ClaimType.FREE:
-            # A fresh local sensor observation takes precedence over peer
-            # blockage evidence until this recipient observes the cell again.
+        if self.is_blocked_for_planning(cell, fusion, step):
+            return math.inf
+        direct = self.direct_state(cell)
+        if direct == ClaimType.FREE:
             return 1.0
-        return fusion.routing_cost(cell, step)
+        max_cost = self.UNKNOWN_TRAVERSAL_COST if direct is None else 1.0
+        peer_cost = fusion.routing_cost(cell, step)
+        if math.isinf(peer_cost):
+            return math.inf
+        return max(max_cost, peer_cost)

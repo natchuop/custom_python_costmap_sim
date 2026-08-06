@@ -22,7 +22,6 @@ def launch(args) -> None:
     values = {
         "seed": tk.StringVar(value=str(args.seed)),
         "method": tk.StringVar(value=args.defense_method),
-        "engine": tk.StringVar(value=args.engine),
         "trust_model": tk.StringVar(value=args.trust_model),
         "admission_policy": tk.StringVar(value=args.admission_policy),
         "output": tk.StringVar(value=args.output_directory),
@@ -59,41 +58,35 @@ def launch(args) -> None:
         row=0, column=0, columnspan=3, sticky="w", pady=(0, 7)
     )
     entry("Seed", "seed", 1)
-    dropdown("Simulator engine", "engine", ("legacy", "modular"), 2)
-    ttk.Label(
-        form,
-        text="Legacy is recommended: it preserves the established behavior and shows the heatmap and animation.",
-        wraplength=515,
-    ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 4))
-    dropdown("Defense method", "method", ALL_METHODS, 4)
-    entry("Output directory", "output", 5)
-    entry("Fixed manifest (optional)", "manifest", 6)
+    dropdown("Defense method", "method", ALL_METHODS, 2)
+    entry("Output directory", "output", 3)
+    entry("Fixed manifest (optional)", "manifest", 4)
     ttk.Checkbutton(form, text="Compare all primary defenses", variable=values["compare"]).grid(
-        row=7, column=0, columnspan=3, sticky="w", pady=(7, 2)
+        row=5, column=0, columnspan=3, sticky="w", pady=(7, 2)
     )
     ttk.Checkbutton(
         form,
-        text="Show reconnaissance heatmap and simulation animation (legacy engine)",
+        text="Show reconnaissance heatmap and simulation animation",
         variable=values["animation"],
-    ).grid(row=8, column=0, columnspan=3, sticky="w", pady=2)
+    ).grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
 
-    ttk.Separator(form).grid(row=9, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Separator(form).grid(row=7, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
-        row=10, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        row=8, column=0, columnspan=3, sticky="w", pady=(0, 4)
     )
-    entry("Reconnaissance steps", "recon", 11)
-    entry("Poisoning steps", "attack", 12)
-    entry("Recovery steps", "recovery", 13)
-    entry("Deliveries per robot", "deliveries", 14)
-    entry("Maximum steps (optional)", "max_steps", 15)
-    entry("Attack interval: minimum steps", "interval_min", 16)
-    entry("Attack interval: maximum steps", "interval_max", 17)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 18)
+    entry("Reconnaissance steps", "recon", 9)
+    entry("Poisoning steps", "attack", 10)
+    entry("Recovery steps", "recovery", 11)
+    entry("Deliveries per robot", "deliveries", 12)
+    entry("Maximum steps (optional)", "max_steps", 13)
+    entry("Attack interval: minimum steps", "interval_min", 14)
+    entry("Attack interval: maximum steps", "interval_max", 15)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 16)
     dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 19
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 17
     )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame,
@@ -106,7 +99,6 @@ def launch(args) -> None:
     def execute() -> None:
         try:
             args.seed = int(values["seed"].get())
-            args.engine = values["engine"].get()
             args.defense_method = values["method"].get()
             args.output_directory = values["output"].get()
             args.manifest_path = values["manifest"].get().strip() or None

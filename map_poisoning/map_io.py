@@ -45,3 +45,8 @@ def default_warehouse_map() -> np.ndarray:
     # floor while preserving the rest of the upstream layout.
     grid[10:13, 8] = 0
     return grid
+
+
+# Lower checkpoint in the attacker bay column (col 8).  The upper bay checkpoint
+# at (3, 8) stays; this one crowded the escape corridor visually and in routing.
+WAREHOUSE_EXCLUDED_ACTION_POINTS: frozenset[tuple[int, int]] = frozenset({(9, 8)})

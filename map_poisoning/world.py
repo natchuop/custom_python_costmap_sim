@@ -12,7 +12,20 @@ def demo_grid(rows: int = 32, cols: int = 42) -> np.ndarray:
     return grid
 
 class World:
-    def __init__(self, static_grid: np.ndarray, episodes: tuple[TemporaryObstacleEpisode, ...]): self.static_grid, self.episodes = static_grid, episodes
+    def __init__(self, static_grid: np.ndarray, episodes: tuple[TemporaryObstacleEpisode, ...]):
+        self.static_grid = static_grid
+        self.episodes = episodes
+
+    def truth_grid(self, step: int) -> np.ndarray:
+        import sim2
+
+        grid = np.array(self.static_grid, dtype=np.int16)
+        for episode in self.episodes:
+            if episode.appearance_step <= step < episode.clearance_step:
+                for cell in episode.cells:
+                    grid[cell] = int(sim2.CellState.TEMPORARILY_BLOCKED)
+        return grid
+
     def state(self, cell: tuple[int, int], step: int) -> ClaimType:
         r, c = cell
         if not (0 <= r < self.static_grid.shape[0] and 0 <= c < self.static_grid.shape[1]) or self.static_grid[cell]: return ClaimType.BLOCKED

@@ -257,7 +257,7 @@ def smoke_test_yaml() -> str:
 
 def check_project_files(project_root: Path) -> list[CheckResult]:
     root = project_root.expanduser().resolve()
-    expected = ("main.py", "sim2.py", "defense_method_runner.py")
+    expected = ("main.py", "map_poisoning", "sim2.py", "defense_method_runner.py")
     results: list[CheckResult] = []
 
     if not root.exists():
