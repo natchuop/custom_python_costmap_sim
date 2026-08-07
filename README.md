@@ -32,6 +32,20 @@ python .\main.py --headless --manifest-only --output-directory outputs\scenario
 python .\main.py --headless --compare --manifest outputs\scenario\scenario_manifest.json --output-directory outputs\comparison
 ```
 
+Fixed experimental scenarios are available for the converted warehouse maps. The
+preset validates the map shape/hash and uses the same starts and delivery points
+for every seed and defense method:
+
+```powershell
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_002_map\static_grid.npy --scenario-preset warehouse_002 --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map002
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map\static_grid.npy --scenario-preset warehouse_005 --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map005
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map_rotated\static_grid.npy --scenario-preset warehouse_005_rotated --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map005_rotated
+```
+
+The fixed coordinates and converted-map SHA-256 hashes are defined in
+`map_poisoning/scenario_presets.py`. The rotated preset is explicit; the default
+warehouse authoring path remains unchanged when no custom map is supplied.
+
 Run the dependency check before installation or on a new machine:
 
 ```powershell

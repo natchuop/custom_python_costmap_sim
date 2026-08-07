@@ -75,7 +75,15 @@ ROBOT_FOOTPRINT_ROWS = 1
 ROBOT_FOOTPRINT_COLS = 1
 ROBOT_VISUAL_SCALE = 1.0
 
-SPAWN_COLLISION_GRACE_STEPS = 100
+# Physical traffic coordination is active from the first simulation step.
+SPAWN_COLLISION_GRACE_STEPS = 0
+
+TRAFFIC_REPLAN_WAIT_THRESHOLD = 3
+TRAFFIC_REPLAN_COOLDOWN_STEPS = 5
+TRAFFIC_LOOKAHEAD_CELLS = 6
+TRAFFIC_CELL_PENALTY = 4.0
+TRAFFIC_DEADLOCK_WAIT_THRESHOLD = 10
+TRAFFIC_JOINT_REPEAT_THRESHOLD = 5
 
 START_CLEARANCE_CELLS = 1
 START_SEARCH_MAX_RADIUS = 8
@@ -1532,6 +1540,7 @@ class GridWorld:
 
                 observations[cell] = self.truth_state(cell)
 
+        visible_robot_cells = set()
         if robot_positions is not None:
             for cell in robot_positions:
                 if not self.in_bounds(cell):
@@ -1540,9 +1549,12 @@ class GridWorld:
                 if cell == center_cell:
                     continue
 
-                observations[cell] = CellState.OCCUPIED_DYNAMIC
+                visible_robot_cells.add(tuple(cell))
 
-        return observations
+        for cell in visible_robot_cells:
+            observations.pop(cell, None)
+
+        return observations, visible_robot_cells
 
     def observe_cells_lidar(
         self,
@@ -1602,6 +1614,7 @@ class GridWorld:
 
             rays.append(ray_points)
 
+        visible_robot_cells = set()
         if robot_positions is not None:
             for cell in robot_positions:
                 if not self.in_bounds(cell):
@@ -1610,9 +1623,15 @@ class GridWorld:
                 # Other robots are only added if they are inside lidar range.
                 other_xy = cell_to_xy(cell)
                 if np.linalg.norm(other_xy - origin) <= max_range_world:
-                    observations[cell] = CellState.OCCUPIED_DYNAMIC
+                    visible_robot_cells.add(tuple(cell))
 
-        return observations, rays
+        # A robot body is traffic metadata, never an environmental observation.
+        # Removing it also prevents a peer claim at that cell from being
+        # verified merely because another robot happened to occupy it.
+        for cell in visible_robot_cells:
+            observations.pop(cell, None)
+
+        return observations, rays, visible_robot_cells
 
 # ============================================================
 # Belief map
@@ -1986,7 +2005,7 @@ class AStarPlanner4:
         # Manhattan distance is appropriate for 4-direction movement.
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    def plan(self, belief_map, start, goal):
+    def plan(self, belief_map, start, goal, traffic_costs=None, hard_reservations=None):
         if not belief_map.in_bounds(start):
             raise RuntimeError(f"start out of bounds: {start}")
 
@@ -2015,7 +2034,11 @@ class AStarPlanner4:
                 break
 
             for neighbor in self.neighbors_4(current):
+                if hard_reservations and neighbor in hard_reservations and neighbor != goal:
+                    continue
                 step_cost = belief_map.traversal_cost(neighbor)
+                if traffic_costs:
+                    step_cost += float(traffic_costs.get(neighbor, 0.0))
 
                 if math.isinf(step_cost):
                     continue
@@ -2812,6 +2835,14 @@ class GridRobot:
         self.last_fallback_goal_retry_step = -10**9
         self.replanned_this_step = False
 
+        # Physical traffic state is deliberately separate from belief/trust.
+        self.consecutive_traffic_waits = 0
+        self.total_traffic_waits = 0
+        self.last_traffic_move_step = -1
+        self.traffic_replan_count = 0
+        self.traffic_wait_steps = []
+        self.traffic_deadlock_active = False
+
         # Detailed instrumentation for separating useful route adaptation from
         # repeated planning churn.
         self.replan_events = []
@@ -2906,7 +2937,8 @@ class GridRobot:
 
         return True
 
-    def plan_path(self, reason="unspecified", timestamp=None, phase=None):
+    def plan_path(self, reason="unspecified", timestamp=None, phase=None,
+                  traffic_costs=None, hard_reservations=None):
         old_remaining = list(self.path[self.path_index:]) if self.path else []
         old_next_five = old_remaining[:5]
         old_goal = tuple(self.goal)
@@ -2918,6 +2950,8 @@ class GridRobot:
                 self.belief_map,
                 self.position,
                 self.goal,
+                traffic_costs=traffic_costs,
+                hard_reservations=hard_reservations,
             )
             self.using_fallback_path = False
             tried_real_goal = True
@@ -2937,6 +2971,8 @@ class GridRobot:
 
         self.path_index = 0
         self.replan_count += 1
+        if str(reason).startswith("traffic_"):
+            self.traffic_replan_count += 1
         self.replanned_this_step = True
 
         reason_text = str(reason)
@@ -3006,7 +3042,7 @@ class GridRobot:
         if timestamp % CONFIDENCE_DECAY_UPDATE_PERIOD_STEPS == 0:
             self.belief_map.apply_confidence_decay(timestamp)
 
-        observations, lidar_rays = world.observe_cells_lidar(
+        observations, lidar_rays, visible_robot_cells = world.observe_cells_lidar(
             self.position_xy,
             max_range_cells=LIDAR_RANGE_CELLS,
             num_rays=LIDAR_NUM_RAYS,
@@ -3018,7 +3054,7 @@ class GridRobot:
 
         self.verify_pending_claims(observations, timestamp)
 
-        return changed, observations, lidar_rays
+        return changed, observations, lidar_rays, visible_robot_cells
 
     def _source_linked_route_cells(self):
         """Return unique footprint cells along the near-term remaining route."""
@@ -3322,7 +3358,11 @@ class GridRobot:
 
         # If already moving toward a cell, continue that movement.
         if self.motion_target_cell is not None:
-            return self.advance_continuous_motion()
+            moved, event = self.advance_continuous_motion()
+            if moved:
+                self.consecutive_traffic_waits = 0
+                self.last_traffic_move_step = self.current_step
+            return moved, event
 
         if (
             not self.replanned_this_step
@@ -3347,25 +3387,34 @@ class GridRobot:
 
             return False, "no_next_cell"
 
-        collision_positions = None if ignore_robot_collisions else occupied_by_other_robots
-
-        if not world.can_enter(next_cell, collision_positions):
+        # Check environmental truth separately from temporary robot traffic.
+        if not world.can_enter(next_cell, None):
             r, c = next_cell
             self.belief_map.belief[r, c] = CellState.OCCUPIED_DYNAMIC
             self.belief_map.confidence[r, c] = 1.0
-            self.belief_map.source[r, c] = "blocked_move"
+            self.belief_map.source[r, c] = "blocked_world"
 
             self.path = []
             self.path_index = 0
             self.motion_target_cell = None
             self.motion_target_xy = None
 
-            return False, "blocked_move"
+            return False, "blocked_world"
+
+        if not ignore_robot_collisions and not world.can_enter(next_cell, occupied_by_other_robots):
+            self.consecutive_traffic_waits += 1
+            self.total_traffic_waits += 1
+            self.traffic_wait_steps.append(self.current_step)
+            return False, "traffic_wait"
 
         self.motion_target_cell = tuple(next_cell)
         self.motion_target_xy = cell_to_xy(next_cell)
 
-        return self.advance_continuous_motion()
+        moved, event = self.advance_continuous_motion()
+        if moved:
+            self.consecutive_traffic_waits = 0
+            self.last_traffic_move_step = self.current_step
+        return moved, event
 
     def should_share_observation(self, cell, claim, timestamp):
         """Share changed observations immediately and periodically refresh stable ones."""
@@ -3994,6 +4043,152 @@ def broadcast_reports(robots, reports_by_sender):
                 robot.receive_report(report)
 
 
+def coordinate_robot_intents(robots, world, step, traffic_state=None):
+    """Resolve one-step footprint intents before any robot moves.
+
+    This is intentionally local and defense-independent: it only uses physical
+    positions, current paths, and wait age. It never writes robot occupancy into
+    a belief map or consults trust.
+    """
+    if traffic_state is None:
+        traffic_state = getattr(coordinate_robot_intents, "_default_state", None)
+        if traffic_state is None or step == 0:
+            traffic_state = coordinate_robot_intents._default_state = {}
+    intents = {}
+    for robot in robots:
+        current = set(robot_footprint_cells(robot.position))
+        if robot.completed:
+            target = None
+        elif robot.motion_target_cell is not None:
+            target = tuple(robot.motion_target_cell)
+        else:
+            target = robot.current_planned_next_cell()
+        intents[robot.robot_id] = {
+            "robot": robot,
+            "current": current,
+            "target": set(robot_footprint_cells(target)) if target is not None else set(),
+            "target_anchor": target,
+            "moving": robot.motion_target_cell is not None,
+            "approved": False,
+        }
+
+    joint_positions = tuple(sorted((robot.robot_id, tuple(robot.position)) for robot in robots))
+    joint_counts = traffic_state.setdefault("joint_counts", {})
+    joint_counts[joint_positions] = joint_counts.get(joint_positions, 0) + 1
+    repeated_joint_state = joint_counts[joint_positions] >= TRAFFIC_JOINT_REPEAT_THRESHOLD
+
+    ordered = sorted(
+        intents.values(),
+        key=lambda item: (
+            0 if item["moving"] else 1,
+            -item["robot"].consecutive_traffic_waits,
+            (item["robot"].robot_id - step) % max(1, len(robots)),
+        ),
+    )
+    events = []
+    approved = {}
+    for item in ordered:
+        robot = item["robot"]
+        target = item["target"]
+        if not target:
+            approved[robot.robot_id] = True
+            item["approved"] = True
+            if robot.traffic_deadlock_active:
+                events.append({
+                    "step": step, "event_type": "traffic_deadlock_recovered",
+                    "robot_id": robot.robot_id, "other_robot_ids": (),
+                    "requested_cell": None, "wait_age": robot.consecutive_traffic_waits,
+                })
+                robot.traffic_deadlock_active = False
+            continue
+
+        conflict_kind = None
+        conflict_with = []
+        for other in intents.values():
+            if other is item:
+                continue
+            if target & other["target"] and other["approved"]:
+                conflict_kind = "traffic_vertex_conflict"
+                conflict_with.append(other["robot"].robot_id)
+                break
+            if target & other["current"]:
+                # A may enter only after the occupant has an approved, distinct
+                # destination. This also rejects head-on swaps.
+                swap = bool(other["target"] & item["current"])
+                if (swap and other["approved"]) or (not swap and not other["approved"]) or target & other["target"]:
+                    conflict_kind = "traffic_swap_conflict" if swap else "traffic_reservation_conflict"
+                    conflict_with.append(other["robot"].robot_id)
+                    break
+        if conflict_kind:
+            robot.consecutive_traffic_waits += 1
+            robot.total_traffic_waits += 1
+            robot.traffic_wait_steps.append(step)
+            events.append({
+                "step": step, "event_type": conflict_kind, "robot_id": robot.robot_id,
+                "other_robot_ids": tuple(conflict_with), "requested_cell": item["target_anchor"],
+                "wait_age": robot.consecutive_traffic_waits,
+            })
+            approved[robot.robot_id] = False
+        else:
+            approved[robot.robot_id] = True
+            item["approved"] = True
+            if robot.traffic_deadlock_active:
+                events.append({
+                    "step": step, "event_type": "traffic_deadlock_recovered",
+                    "robot_id": robot.robot_id, "other_robot_ids": (),
+                    "requested_cell": item["target_anchor"],
+                    "wait_age": robot.consecutive_traffic_waits,
+                })
+                robot.traffic_deadlock_active = False
+
+    # Repeated waiting gets a temporary traffic-cost replan. Costs are local,
+    # finite, and never copied into RobotBeliefMap.
+    for item in ordered:
+        robot = item["robot"]
+        if robot.consecutive_traffic_waits < TRAFFIC_REPLAN_WAIT_THRESHOLD:
+            continue
+        if step - getattr(robot, "last_traffic_replan_step", -10**9) < TRAFFIC_REPLAN_COOLDOWN_STEPS:
+            continue
+        costs = {}
+        hard = set()
+        for other in robots:
+            if other.robot_id == robot.robot_id:
+                continue
+            hard.update(robot_footprint_cells(other.position))
+            if other.motion_target_cell is not None:
+                hard.update(robot_footprint_cells(other.motion_target_cell))
+            for cell in other.path[other.path_index:other.path_index + TRAFFIC_LOOKAHEAD_CELLS]:
+                costs[tuple(cell)] = TRAFFIC_CELL_PENALTY
+        try:
+            robot.plan_path(
+                reason="traffic_replan",
+                timestamp=step,
+                phase=robot.current_phase,
+                traffic_costs=costs,
+                hard_reservations=hard,
+            )
+            robot.last_traffic_replan_step = step
+            events.append({
+                "step": step, "event_type": "traffic_replan", "robot_id": robot.robot_id,
+                "other_robot_ids": (), "requested_cell": robot.current_planned_next_cell(),
+                "wait_age": robot.consecutive_traffic_waits,
+            })
+            if (
+                robot.consecutive_traffic_waits >= TRAFFIC_DEADLOCK_WAIT_THRESHOLD
+                and not robot.traffic_deadlock_active
+            ) or (repeated_joint_state and not robot.traffic_deadlock_active):
+                robot.traffic_deadlock_active = True
+                events.append({
+                    "step": step, "event_type": "traffic_deadlock_detected",
+                    "robot_id": robot.robot_id, "other_robot_ids": tuple(conflict_with),
+                    "requested_cell": item["target_anchor"],
+                    "wait_age": robot.consecutive_traffic_waits,
+                })
+        except RuntimeError:
+            pass
+    return approved, events
+
+
 def run_simulation(
     grid=None,
     prior_grid=None,
@@ -4185,6 +4380,7 @@ def run_simulation(
         },
         "reports": [],
         "trust_events": [],
+        "traffic_events": [],
         "malicious_robot_id": malicious_robot_id,
         "goal": goal,
         "goals": goals,
@@ -4206,6 +4402,7 @@ def run_simulation(
             pass
 
     traffic_heatmap = np.zeros_like(world.grid, dtype=int)
+    traffic_state = {}
 
     recon_goal_visit_counts = {
         tuple(goal): 0
@@ -4286,7 +4483,7 @@ def run_simulation(
             else:
                 other_robot_positions = all_robot_positions - robot.occupied_cells
 
-            changed, observations, lidar_rays = robot.update_from_sensor(
+            changed, observations, lidar_rays, visible_robot_cells = robot.update_from_sensor(
                 world,
                 step,
                 all_robot_positions=other_robot_positions,
@@ -4460,31 +4657,24 @@ def run_simulation(
                     f"old_len={len(old_path)} new_len={len(robot.path)}"
                 )
 
-        # 5. Move robots one cell.
-        occupied_positions = {robot.position for robot in robots}
-
-        # Move order is fixed for now. Later you can randomize or prioritize.
+        # 5. Propose and resolve all physical movement intents before moving.
+        approvals, traffic_events = coordinate_robot_intents(robots, world, step, traffic_state)
+        log["traffic_events"].extend(traffic_events)
+        traffic_by_robot = {event["robot_id"]: event for event in traffic_events}
         for robot in robots:
-            other_positions = set()
+            if not approvals.get(robot.robot_id, True):
+                event = "traffic_wait"
+            else:
+                moved, event = robot.move_one_cell(
+                    world,
+                    set(),
+                    ignore_robot_collisions=True,
+                )
 
-            for other in robots:
-                if other.robot_id == robot.robot_id:
-                    continue
-
-                other_positions.update(other.occupied_cells)
-
-            ignore_robot_collisions = step < SPAWN_COLLISION_GRACE_STEPS
-
-            moved, event = robot.move_one_cell(
-                world,
-                other_positions,
-                ignore_robot_collisions=ignore_robot_collisions,
-            )
-
-            if event == "blocked_move":
+            if event == "blocked_world":
                 try:
                     robot.plan_path(
-                        reason="blocked_move",
+                        reason="blocked_world",
                         timestamp=step,
                         phase=current_phase,
                     )
@@ -4655,7 +4845,8 @@ def compute_experiment_metrics(robots, log):
         for robot in robots
     }
 
-    blocked_moves = {rid: events.count("blocked_move") for rid, events in events_by_robot.items()}
+    blocked_world = {rid: events.count("blocked_world") for rid, events in events_by_robot.items()}
+    traffic_waits = {rid: events.count("traffic_wait") for rid, events in events_by_robot.items()}
     no_path_counts = {rid: events.count("no_path") for rid, events in events_by_robot.items()}
     movement_steps = {
         rid: sum(event in ("moved_cell", "moved_continuous") for event in events)
@@ -4742,6 +4933,11 @@ def compute_experiment_metrics(robots, log):
     useful_replan_ratio = {}
     expanded_nodes_total = {}
 
+    traffic_event_counts = {}
+    for event in log.get("traffic_events", []):
+        kind = event.get("event_type")
+        traffic_event_counts[kind] = traffic_event_counts.get(kind, 0) + 1
+
     for robot in robots:
         rid = robot.robot_id
         reason_counts = {}
@@ -4797,7 +4993,33 @@ def compute_experiment_metrics(robots, log):
         "replans_per_robot": replans,
         "replans_per_delivery": replans_per_delivery,
         "movement_steps_per_delivery": movement_steps_per_delivery,
-        "blocked_moves_per_robot": blocked_moves,
+        "blocked_world_per_robot": blocked_world,
+        "blocked_moves_per_robot": blocked_world,
+        "traffic_wait_steps_per_robot": traffic_waits,
+        "max_consecutive_traffic_waits_per_robot": {
+            robot.robot_id: max(
+                [robot.consecutive_traffic_waits]
+                + [sum(1 for event in events_by_robot[robot.robot_id][i:j] if event == "traffic_wait")
+                   for i in range(len(events_by_robot[robot.robot_id]))
+                   for j in range(i + 1, min(len(events_by_robot[robot.robot_id]) + 1, i + TRAFFIC_DEADLOCK_WAIT_THRESHOLD + 1))]
+            )
+            for robot in robots
+        },
+        "traffic_event_counts": traffic_event_counts,
+        "vertex_conflicts_detected": traffic_event_counts.get("traffic_vertex_conflict", 0),
+        "head_on_swap_conflicts_detected": traffic_event_counts.get("traffic_swap_conflict", 0),
+        "reservation_conflicts_detected": traffic_event_counts.get("traffic_reservation_conflict", 0),
+        "traffic_replans": traffic_event_counts.get("traffic_replan", 0),
+        "deadlocks_detected": traffic_event_counts.get("traffic_deadlock_detected", 0),
+        "deadlocks_recovered": traffic_event_counts.get("traffic_deadlock_recovered", 0),
+        "robot_overlap_violations": sum(
+            1 for positions in zip(*[log["robots"][robot.robot_id]["position"] for robot in robots])
+            if len(set(positions)) != len(positions)
+        ),
+        "prevented_robot_conflicts": sum(
+            traffic_event_counts.get(kind, 0)
+            for kind in ("traffic_vertex_conflict", "traffic_swap_conflict", "traffic_reservation_conflict")
+        ),
         "no_path_count_per_robot": no_path_counts,
         "benign_total_completed_deliveries": benign_completed,
         "benign_total_replans": sum(replans[rid] for rid in benign_ids),
@@ -5292,7 +5514,9 @@ def animate(world, robots, log):
                 rid = robot.robot_id
                 lidar_rays = log["robots"][rid]["lidar_rays"][frame]
 
-                ray_color = "cyan" if not robot.is_malicious else "magenta"
+                # Use a darker teal for benign lidar so the rays remain visible
+                # against the white map while staying distinct from malicious magenta.
+                ray_color = "#008b8b" if not robot.is_malicious else "magenta"
 
                 new_lidar_lines = draw_lidar_rays(
                     truth_ax,

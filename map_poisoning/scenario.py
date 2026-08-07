@@ -11,6 +11,7 @@ from .rng import derived_seed, named_rng
 from .temp_obstacles import export_temp_episodes
 from .world import demo_grid
 from .planning import astar
+from .scenario_presets import preset_for_hash, preset_for_id, validate_fixed_preset
 
 SCHEMA_VERSION = 2
 
@@ -41,11 +42,9 @@ class ScenarioManifest:
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
 def _cell_choice(rng, cells): return cells[rng.randrange(min(len(cells), 12))]
 
-def _nominal_route_cells(grid) -> list[tuple[int, int]]:
+def _nominal_route_cells(grid, starts, targets) -> list[tuple[int, int]]:
     """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
     rows, cols=grid.shape
-    starts=((2,2),(rows-3,cols-3),(2,cols-3))
-    targets=((rows-3,2),(2,cols-3),(rows-3,cols-3),(2,2))
     routes=[]
     for index,start in enumerate(starts):
         for offset in (0,1,2):
@@ -55,14 +54,43 @@ def _nominal_route_cells(grid) -> list[tuple[int, int]]:
     excluded=set(starts)|set(targets)
     return [cell for cell in routes if cell not in excluded]
 
+
+def build_fixed_task_queues(benign_ids, delivery_points, deliveries_per_robot):
+    """Use a cyclic, seed-independent pickup/dropoff schedule for each robot."""
+    if len(delivery_points) < 2:
+        raise ValueError("at least two delivery points are required")
+    return {
+        robot_id: tuple(
+            DeliveryTask(
+                f"r{robot_id}-task-{index}",
+                delivery_points[(robot_id + index) % len(delivery_points)],
+                delivery_points[(robot_id + index + 2) % len(delivery_points)],
+            )
+            for index in range(deliveries_per_robot)
+        )
+        for robot_id in benign_ids
+    }
+
 def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     config.validate(); grid = demo_grid() if grid is None else grid
+    preset = preset_for_id(config.scenario_preset) if config.scenario_preset else preset_for_hash(_hash(grid))
+    if config.scenario_preset:
+        validate_fixed_preset(grid, preset)
+    elif preset is not None:
+        raise ValueError(f"map matches scenario preset {preset.preset_id}; pass --scenario-preset {preset.preset_id} for fixed experiment geometry")
     phases = config.phases
     rng = named_rng(config.seed, "attack_scheduler")
     enabled = [AttackType(x) for x in config.attacks.enabled]
     benign = (1, 2); sender = 0; events=[]; bag=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
     free = [(r,c) for r in range(1,grid.shape[0]-1) for c in range(1,grid.shape[1]-1) if not grid[r,c]]
-    route_cells=_nominal_route_cells(grid) or free
+    rows, cols = grid.shape
+    if preset:
+        starts_tuple = tuple(preset.robot_starts[index] for index in sorted(preset.robot_starts))
+        targets = preset.delivery_points
+    else:
+        starts_tuple = ((2, 2), (rows - 3, cols - 3), (2, cols - 3))
+        targets = ((rows - 3, 2), (2, cols - 3), (rows - 3, cols - 3), (2, 2))
+    route_cells=_nominal_route_cells(grid, starts_tuple, targets) or free
     # Temporary obstacles are part of the fixed scenario and deliberately sit
     # on nominal traffic corridors so clearance/stale ablations affect behavior.
     episodes=[]
@@ -93,9 +121,10 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
-    starts={0:(2,2),1:(grid.shape[0]-3,grid.shape[1]-3),2:(2,grid.shape[1]-3)}
-    targets=((grid.shape[0]-3,2),(2,grid.shape[1]-3),(grid.shape[0]-3,grid.shape[1]-3),(2,2))
-    queues={rid:tuple(DeliveryTask(f"r{rid}-task-{i}",targets[(rid+i)%4],targets[(rid+i+2)%4]) for i in range(config.deliveries_per_robot)) for rid in benign}
+    starts = dict(preset.robot_starts) if preset else {0: starts_tuple[0], 1: starts_tuple[1], 2: starts_tuple[2]}
+    # The legacy rollout requires a navigable task for every robot. The attacker
+    # gets one deterministic navigation task, not the benign delivery queue.
+    queues={sender: (DeliveryTask("r0-attacker-navigation", targets[0], targets[1]),), **build_fixed_task_queues(benign, targets, config.deliveries_per_robot)}
     warnings=() if len(set(selected)) >= min(config.attacks.min_unique_footprints,len(selected)) else ("concentrated_attack_manifest",)
     # Script the attacker independently of defense-dependent benign routes.
     attacker_route=tuple(route_cells) or tuple(free)

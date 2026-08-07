@@ -136,6 +136,17 @@ def collect_rollout_metrics(
             method=method,
             **{key: value for key, value in event.items() if key != "step"},
         )
+    for traffic_event in log.get("traffic_events", []):
+        collector.event(
+            traffic_event["step"],
+            traffic_event["event_type"],
+            method=method,
+            **{
+                key: value
+                for key, value in traffic_event.items()
+                if key not in {"step", "event_type"}
+            },
+        )
 
     for robot in robots:
         rid = robot.robot_id
@@ -182,7 +193,18 @@ def collect_rollout_metrics(
         "benign_total_distance": calculated["benign_total_grid_distance"],
         "benign_total_replans": calculated["benign_total_replans"],
         "benign_productive_replans": calculated["benign_next_five_changed_replans"],
+        "benign_blocked_world": sum(calculated["blocked_world_per_robot"][r.robot_id] for r in benign),
         "benign_blocked_moves": sum(calculated["blocked_moves_per_robot"][r.robot_id] for r in benign),
+        "benign_traffic_wait_steps": sum(calculated["traffic_wait_steps_per_robot"][r.robot_id] for r in benign),
+        "traffic_event_counts": calculated["traffic_event_counts"],
+        "vertex_conflicts_detected": calculated["vertex_conflicts_detected"],
+        "head_on_swap_conflicts_detected": calculated["head_on_swap_conflicts_detected"],
+        "reservation_conflicts_detected": calculated["reservation_conflicts_detected"],
+        "traffic_replans": calculated["traffic_replans"],
+        "deadlocks_detected": calculated["deadlocks_detected"],
+        "deadlocks_recovered": calculated["deadlocks_recovered"],
+        "robot_overlap_violations": calculated["robot_overlap_violations"],
+        "prevented_robot_conflicts": calculated["prevented_robot_conflicts"],
         "time_to_distrust_malicious_robot": calculated["time_to_distrust_malicious_robot"],
         "malicious_verified_false_reports": calculated["malicious_verified_false_reports"],
         "fresh_contradictions": contradicted,
