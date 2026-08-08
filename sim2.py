@@ -131,11 +131,11 @@ ATTACK_TRAFFIC_HIGH_PERCENTILE = 90
 
 # Fake object footprint. It may visually overlap walls, but only free/action cells
 # will receive malicious BLOCKED reports.
-MALICIOUS_FAKE_OBJECT_ROWS = 4
-MALICIOUS_FAKE_OBJECT_COLS = 7
+MALICIOUS_FAKE_OBJECT_ROWS = 6
+MALICIOUS_FAKE_OBJECT_COLS = 9
 
 # Prefer fake objects that block several usable cells, not one sad pixel of deception.
-MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS = 8
+MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS = 12
 
 # Add a new malicious fake object periodically during the attack phase.
 MALICIOUS_FAKE_OBJECT_INJECTION_PERIOD_STEPS = 20
@@ -690,6 +690,7 @@ class TemporaryBlockageManager:
             )
 
         self.active_indices = set()
+        self.current_footprints = {}
         self.refresh_active_blockages(force=True)
 
     def refresh_active_blockages(self, force=False, forbidden_cells=None):
@@ -698,7 +699,23 @@ class TemporaryBlockageManager:
             self.active_indices = set()
             return
 
-        candidate_indices = list(range(len(self.pool)))
+        # Existing objects persist and move a small distance.  Only empty
+        # slots are filled from the candidate pool; this prevents the old
+        # disappear/reappear teleport behavior.
+        if not force:
+            for idx in tuple(self.active_indices):
+                cells, state = self.current_footprints.get(idx, self.pool[idx])
+                moved = None
+                direction = ((idx % 3) - 1, ((idx // 3) % 3) - 1)
+                for sign in (1, -1):
+                    dr, dc = direction[0] * sign, direction[1] * sign
+                    candidate = [(r + dr, c + dc) for r, c in cells]
+                    if candidate and all(cell not in forbidden_cells for cell in candidate) and can_place_temporary_footprint(self.static_grid, candidate):
+                        moved = candidate
+                        break
+                if moved is not None:
+                    self.current_footprints[idx] = (moved, state)
+        candidate_indices = [idx for idx in range(len(self.pool)) if idx not in self.active_indices]
         self.rng.shuffle(candidate_indices)
 
         eligible = []
@@ -735,7 +752,10 @@ class TemporaryBlockageManager:
                     )
                 return
 
-        self.active_indices = set(eligible[:active_count])
+        kept = [idx for idx in self.active_indices if idx in self.current_footprints]
+        self.active_indices = set((kept + eligible)[:active_count])
+        for idx in self.active_indices:
+            self.current_footprints.setdefault(idx, self.pool[idx])
 
         print("Active temporary blockages:")
         for idx in sorted(self.active_indices):
@@ -760,7 +780,7 @@ class TemporaryBlockageManager:
         dynamic = self.static_grid.copy()
 
         active_footprints = [
-            self.pool[idx]
+            self.current_footprints.get(idx, self.pool[idx])
             for idx in sorted(self.active_indices)
         ]
 
@@ -2619,9 +2639,9 @@ def recon_heatmap_attack_candidates(
     # Prefer medium traffic plus enough cells to create a meaningful fake blockage.
     candidates.sort(
         key=lambda item: (
+            ATTACK_BOTTLENECK_SCORE_WEIGHT * item["bottleneck_score"],
             item["affected_victims"],
             item["path_overlap"],
-            ATTACK_BOTTLENECK_SCORE_WEIGHT * item["bottleneck_score"],
             item["path_proximity_score"],
             item["report_cell_count"],
             item["traffic_score"],

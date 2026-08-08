@@ -1,8 +1,14 @@
 from dataclasses import replace
-from map_poisoning.config import FusionConfig, SimulationConfig
+from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, VisualizationConfig
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.models import ClaimReport, ClaimType, DeliveryTask, VerificationOutcome
 from map_poisoning.scenario import author_manifest
+from map_poisoning.models import AttackType
+from map_poisoning.rollout import run_manifest_rollout
+from map_poisoning.sensing import lidar_observations
+from map_poisoning.world import demo_grid
+import sim2
+from sim2 import CellState, TemporaryBlockageManager
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.robot import ModularRobot
 from map_poisoning.trust import BayesianTrustModel
@@ -10,6 +16,77 @@ import numpy as np
 
 def test_same_seed_same_manifest():
     assert author_manifest(SimulationConfig()).to_dict() == author_manifest(SimulationConfig()).to_dict()
+
+
+def test_seed_selects_attack_types_per_event():
+    seen = set()
+    for seed in range(12):
+        config = SimulationConfig(
+            seed=seed,
+            phases=PhaseConfig(20, 80, 20),
+            attacks=AttackConfig(interval_min=10, interval_max=10),
+        )
+        manifest = author_manifest(config)
+        assert manifest.attack_events
+        assert {event.attack_type for event in manifest.attack_events} <= set(AttackType)
+        seen.update(event.attack_type for event in manifest.attack_events)
+    assert seen == set(AttackType)
+
+
+def test_lidar_detects_temporary_obstacle_in_view():
+    grid = np.zeros((10, 10), dtype=int)
+    grid[[0, -1], :] = 1
+    grid[:, [0, -1]] = 1
+    grid[5, 4] = int(CellState.TEMPORARILY_BLOCKED)
+    observations = lidar_observations(grid, (5, 2))
+    assert observations[(5, 4)] == ClaimType.BLOCKED
+
+
+def test_temporary_objects_shift_without_teleporting():
+    manager = TemporaryBlockageManager(demo_grid(24, 30), active_count=1, change_period=10, seed=3)
+    before_index = next(iter(manager.active_indices))
+    before = manager.current_footprints[before_index][0]
+    manager.refresh_active_blockages()
+    after_index = next(iter(manager.active_indices))
+    after = manager.current_footprints[after_index][0]
+    before_center = tuple(round(value, 1) for value in sim2.footprint_center(before))
+    after_center = tuple(round(value, 1) for value in sim2.footprint_center(after))
+    assert after_index == before_index
+    assert abs(after_center[0] - before_center[0]) + abs(after_center[1] - before_center[1]) <= 2
+
+
+def test_each_attack_type_reaches_benign_replanning():
+    for seed in (0, 2, 4):
+        config = SimulationConfig(
+            seed=seed,
+            phases=PhaseConfig(20, 80, 20),
+            attacks=AttackConfig(interval_min=10, interval_max=10),
+            visualization=VisualizationConfig(False),
+            max_steps=100,
+            deliveries_per_robot=1,
+        )
+        manifest = author_manifest(config)
+        _, robots, log = run_manifest_rollout(config, manifest, "source_linked")
+        assert any(report["is_malicious"] for report in log["reports"])
+        first_attack_step = manifest.attack_events[0].step
+        assert any(
+            record["step"] >= first_attack_step
+            for robot in robots if not robot.is_malicious
+            for record in robot.replan_events
+        )
+
+
+def test_fake_obstacles_use_enlarged_footprints():
+    config = SimulationConfig(
+        seed=0,
+        phases=PhaseConfig(20, 80, 20),
+        attacks=AttackConfig(interval_min=10, interval_max=10),
+    )
+    manifest = author_manifest(config)
+    fake_events = [event for event in manifest.attack_events if event.attack_type == AttackType.FAKE_OBSTACLE]
+    assert fake_events
+    assert max(len(event.cells) for event in fake_events) >= 15
+    assert all(not manifest.static_grid[r][c] for event in fake_events for r, c in event.cells)
 
 def test_source_linked_is_retroactive_and_trust_fused_is_not():
     trust={0:.7}; score=lambda sender: trust[sender]

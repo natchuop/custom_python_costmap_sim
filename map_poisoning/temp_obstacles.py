@@ -25,7 +25,7 @@ def export_temp_episodes(
             manager.refresh_active_blockages()
         cells: list[tuple[int, int]] = []
         for pool_index in sorted(manager.active_indices):
-            footprint_cells, _ = manager.pool[pool_index]
+            footprint_cells, _ = manager.current_footprints.get(pool_index, manager.pool[pool_index])
             cells.extend(tuple(cell) for cell in footprint_cells)
         unique = tuple(dict.fromkeys(cells))
         if unique:

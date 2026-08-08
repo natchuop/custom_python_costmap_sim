@@ -60,42 +60,45 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     phases = config.phases
     rng = named_rng(config.seed, "attack_scheduler")
     enabled = [AttackType(x) for x in config.attacks.enabled]
-    benign = (1, 2); sender = 0; events=[]; bag=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
+    benign = (1, 2); sender = 0; events=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
     free = [(r,c) for r in range(1,grid.shape[0]-1) for c in range(1,grid.shape[1]-1) if not grid[r,c]]
     route_cells=_nominal_route_cells(grid) or free
     # Temporary obstacles are part of the fixed scenario and deliberately sit
     # on nominal traffic corridors so clearance/stale ablations affect behavior.
     episodes=[]
-    for episode_index,appearance in enumerate(range(config.temporary_blockage_change_period_steps//2, phases.total_steps, config.temporary_blockage_change_period_steps)):
+    for episode_index,appearance in enumerate(range(max(1, phases.recon_steps - config.temporary_blockage_change_period_steps//2), phases.total_steps, config.temporary_blockage_change_period_steps)):
         cell=route_cells[(episode_index*7 + rng.randrange(min(12,len(route_cells)))) % len(route_cells)]
-        episodes.append(TemporaryObstacleEpisode(f"obstacle-{episode_index:03}",(cell,),appearance,min(phases.total_steps,appearance+config.temporary_blockage_change_period_steps//2)))
+        clearance = min(phases.total_steps, phases.recon_steps + max(1, phases.attack_steps // 2))
+        episodes.append(TemporaryObstacleEpisode(f"obstacle-{episode_index:03}",(cell,),appearance,clearance))
     episodes=tuple(episodes)
     candidate_metadata=[]; use_count: dict[tuple[int,int],int]={}; selected=[]
     while step < phases.recon_steps + phases.attack_steps and enabled:
-        if not bag:
-            bag = enabled.copy(); rng.shuffle(bag)
-        feasible = [kind for kind in bag if (kind == AttackType.FAKE_OBSTACLE or (kind == AttackType.FALSE_CLEARANCE and any(e.appearance_step <= step < e.clearance_step for e in episodes)) or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes)))]
+        feasible_types = [kind for kind in enabled if kind == AttackType.FAKE_OBSTACLE or (kind == AttackType.FALSE_CLEARANCE and any(e.appearance_step <= step < e.clearance_step for e in episodes)) or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes))]
+        feasible = bool(feasible_types)
         if feasible:
-            kind = feasible[0]; bag.remove(kind)
+            kind = feasible_types[rng.randrange(len(feasible_types))]
             episode = None
             if kind == AttackType.FAKE_OBSTACLE:
                 eligible=[cell for cell in route_cells if use_count.get(cell,0) < config.attacks.max_uses_per_footprint and all(cell == old or abs(cell[0]-old[0])+abs(cell[1]-old[1]) >= config.attacks.min_center_spacing for old in selected)]
                 if not eligible: break
-                cell, claim, observation = _cell_choice(rng, eligible), ClaimType.BLOCKED, step
+                center = _cell_choice(rng, eligible)
+                footprint = [(r, c) for r in range(center[0]-3, center[0]+4) for c in range(center[1]-2, center[1]+3) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
+                cell, claim, observation = center, ClaimType.BLOCKED, step
             elif kind == AttackType.FALSE_CLEARANCE:
                 episode = _cell_choice(rng, [e for e in episodes if e.appearance_step <= step < e.clearance_step]); cell, claim, observation = episode.cells[0], ClaimType.FREE, step
             else:
                 episode = _cell_choice(rng, [e for e in episodes if e.clearance_step <= step]); cell, claim, observation = episode.cells[0], ClaimType.BLOCKED, step
-            eid=f"attack-{index:04}"; rid=f"report-{index:04}-00"
-            events.append(AttackEvent(eid, step, kind, (cell,), claim, observation, sender, benign, (rid,), episode.episode_id if episode else None)); index += 1
+            eid=f"attack-{index:04}"; attack_cells = tuple(footprint) if kind == AttackType.FAKE_OBSTACLE else (cell,)
+            report_ids = tuple(f"report-{index:04}-{n:02}" for n in range(len(attack_cells)))
+            events.append(AttackEvent(eid, step, kind, attack_cells, claim, observation, sender, benign, report_ids, episode.episode_id if episode else None)); index += 1
             use_count[cell]=use_count.get(cell,0)+1; selected.append(cell)
-            candidate_metadata.append({"candidate_id":f"candidate-{index-1:04}","center":cell,"footprint_cells":[cell],"traffic_score":None,"bottleneck_score":None,"estimated_detour_score":None,"rank":None,"selection_weight":None,"prior_use_count":use_count[cell]-1})
+            candidate_metadata.append({"candidate_id":f"candidate-{index-1:04}","center":cell,"footprint_cells":list(attack_cells),"traffic_score":None,"bottleneck_score":None,"estimated_detour_score":None,"rank":None,"selection_weight":None,"prior_use_count":use_count[cell]-1})
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
     starts={0:(2,2),1:(grid.shape[0]-3,grid.shape[1]-3),2:(2,grid.shape[1]-3)}
     targets=((grid.shape[0]-3,2),(2,grid.shape[1]-3),(grid.shape[0]-3,grid.shape[1]-3),(2,2))
-    queues={rid:tuple(DeliveryTask(f"r{rid}-task-{i}",targets[(rid+i)%4],targets[(rid+i+2)%4]) for i in range(config.deliveries_per_robot)) for rid in benign}
+    queues={rid:tuple(DeliveryTask(f"r{rid}-task-{i}",targets[(rid+i)%4],targets[(rid+i+2)%4]) for i in range(config.deliveries_per_robot)) for rid in (sender,) + benign}
     warnings=() if len(set(selected)) >= min(config.attacks.min_unique_footprints,len(selected)) else ("concentrated_attack_manifest",)
     # Script the attacker independently of defense-dependent benign routes.
     attacker_route=tuple(route_cells) or tuple(free)
@@ -103,7 +106,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     def truth(cell, step):
         return ClaimType.BLOCKED if any(cell in episode.cells and episode.appearance_step <= step < episode.clearance_step for episode in episodes) else ClaimType.FREE
     honest=tuple(ClaimReport(f"attacker-honest-{step:05}",sender,positions[step],truth(positions[step],step),step,step,step) for step in range(0,phases.total_steps,config.communication_period_steps))
-    labels=tuple(ReportAuditLabel(report_id,True,event.attack_type,event.obstacle_episode_id,ClaimType.FREE) for event in events for report_id in event.report_ids)
+    labels=tuple(ReportAuditLabel(report_id,True,event.attack_type,event.obstacle_episode_id,ClaimType.BLOCKED if event.attack_type == AttackType.FALSE_CLEARANCE else ClaimType.FREE) for event in events for report_id in event.report_ids)
     return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, {"reconnaissance_end":phases.recon_steps, "attack_end":phases.recon_steps+phases.attack_steps, "total":phases.total_steps}, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="original_legacy_cli", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings)
 
 def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
@@ -139,6 +142,10 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     attacker = log["malicious_robot_id"]
     recipients = tuple(r.robot_id for r in robots if not r.is_malicious)
     rng = named_rng(config.seed, "warehouse_manifest_scheduler")
+    enabled_types = [AttackType(x) for x in config.attacks.enabled]
+    prior = robots[0].belief_map.initial_prior
+    static = np.asarray(prior, dtype=np.uint8)
+    episodes = export_temp_episodes(static, config.seed, config.phases.total_steps)
     events = []
     metadata = []
     warnings = []
@@ -149,6 +156,32 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     )
     index = 0
     while step < config.phases.recon_steps + config.phases.attack_steps:
+        feasible_types = [kind for kind in enabled_types if kind == AttackType.FAKE_OBSTACLE or kind == AttackType.FALSE_CLEARANCE or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes))]
+        if not feasible_types:
+            break
+        selected_attack = feasible_types[rng.randrange(len(feasible_types))]
+        if selected_attack != AttackType.FAKE_OBSTACLE:
+            eligible = [e for e in episodes if (selected_attack == AttackType.FALSE_CLEARANCE and e.appearance_step <= step < e.clearance_step) or (selected_attack == AttackType.STALE_REASSERTION and e.clearance_step <= step)]
+            if not eligible and selected_attack == AttackType.FALSE_CLEARANCE:
+                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", tuple(tuple(cell) for cell in candidates[0]["report_cells"][:9]), step - 1, step + 1)
+                episodes = episodes + (episode,)
+                eligible = [episode]
+            if not eligible:
+                step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
+                continue
+            episode = eligible[0]
+            if selected_attack == AttackType.STALE_REASSERTION and any(
+                any(cell in other.cells and other.appearance_step <= step < other.clearance_step for other in episodes)
+                for cell in episode.cells
+            ):
+                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", tuple(tuple(cell) for cell in candidates[0]["report_cells"][:9]), step - 2, step - 1)
+                episodes = episodes + (episode,)
+            claim = ClaimType.FREE if selected_attack == AttackType.FALSE_CLEARANCE else ClaimType.BLOCKED
+            cells = tuple(episode.cells)
+            events.append(AttackEvent(f"attack-{index:04}", step, selected_attack, cells, claim, step, attacker, recipients, tuple(f"report-{index:04}-{i:02}" for i in range(len(cells))), episode.episode_id))
+            index += 1
+            step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
+            continue
         pool = candidates[:config.attacks.candidate_top_k]
         eligible = [
             candidate
@@ -202,7 +235,6 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     if len(set(selected_centers)) < config.attacks.min_unique_footprints:
         warnings.append("concentrated_attack_manifest: minimum unique footprint count not met")
-    prior = robots[0].belief_map.initial_prior
     layout_world = sim2.GridWorld(np.asarray(grid if grid is not None else prior, dtype=int))
     layout_specs, layout_goals, _ = sim2.build_robot_specs_and_goals(
         layout_world, prior_grid=layout_world.grid
@@ -231,8 +263,6 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         )
         for robot_id in layout_tasks
     }
-    static = np.asarray(prior, dtype=np.uint8)
-    episodes = export_temp_episodes(static, config.seed, config.phases.total_steps)
     return ScenarioManifest(
         SCHEMA_VERSION,
         config.seed,
