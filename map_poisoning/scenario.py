@@ -15,6 +15,13 @@ from .scenario_presets import preset_for_hash, preset_for_id, validate_fixed_pre
 
 SCHEMA_VERSION = 2
 
+def scenario_manifest_hash(manifest: "ScenarioManifest") -> str:
+    """Digest the complete canonical manifest, not only its static map."""
+    payload = json.dumps(
+        manifest.to_dict(), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
 @dataclass(frozen=True)
 class ScenarioManifest:
     schema_version: int
@@ -122,9 +129,16 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
     starts = dict(preset.robot_starts) if preset else {0: starts_tuple[0], 1: starts_tuple[1], 2: starts_tuple[2]}
-    # The legacy rollout requires a navigable task for every robot. The attacker
-    # gets one deterministic navigation task, not the benign delivery queue.
-    queues={sender: (DeliveryTask("r0-attacker-navigation", targets[0], targets[1]),), **build_fixed_task_queues(benign, targets, config.deliveries_per_robot)}
+    # The legacy rollout requires a navigable task for every robot. Keep the
+    # attacker physically active with the same deterministic repeating queue as
+    # the other robots; only its reporting behavior is malicious.
+    queues=build_fixed_task_queues((sender, *benign), targets, config.deliveries_per_robot)
+    if config.deliveries_per_robot < len(targets):
+        # Keep the attacker moving through the fixed checkpoint cycle even in
+        # short smoke runs where benign queues intentionally contain one task.
+        queues[sender] = build_fixed_task_queues(
+            (sender,), targets, len(targets)
+        )[sender]
     warnings=() if len(set(selected)) >= min(config.attacks.min_unique_footprints,len(selected)) else ("concentrated_attack_manifest",)
     # Script the attacker independently of defense-dependent benign routes.
     attacker_route=tuple(route_cells) or tuple(free)

@@ -2,6 +2,7 @@ import math
 import heapq
 import copy
 import argparse
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -38,6 +39,11 @@ TRUST_ACCEPT_THRESHOLD = 0.55
 TRUST_INITIAL_VALUE = 0.70
 TRUST_REWARD = 0.02
 TRUST_PENALTY = 0.06
+# Display/diagnostic thresholds. These do not participate in trust or route
+# decisions; they classify the current planner representation only.
+FAKE_INFLUENCE_MIN_COST_DELTA = 0.10
+ROUTE_IMPACT_MIN_COST_DELTA = 0.10
+ROUTE_IMPACT_EVAL_PERIOD_STEPS = 10
 TRUST_MODEL_NAME = "scalar"
 TRUST_BAYES_PRIOR_ALPHA = 7.0
 TRUST_BAYES_PRIOR_BETA = 3.0
@@ -84,6 +90,7 @@ TRAFFIC_LOOKAHEAD_CELLS = 6
 TRAFFIC_CELL_PENALTY = 4.0
 TRAFFIC_DEADLOCK_WAIT_THRESHOLD = 10
 TRAFFIC_JOINT_REPEAT_THRESHOLD = 5
+TRAFFIC_YIELD_SEARCH_RADIUS = 20
 
 START_CLEARANCE_CELLS = 1
 START_SEARCH_MAX_RADIUS = 8
@@ -1881,7 +1888,13 @@ class RobotBeliefMap:
             )
         )
 
-    def footprint_is_peer_hard_blocked(self, footprint, timestamp=None):
+    def footprint_is_peer_hard_blocked(
+        self,
+        footprint,
+        timestamp=None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ):
         """Peer hard blocks apply only where direct sensing has not verified free."""
         if self.defense_runner is None:
             return False
@@ -1890,11 +1903,21 @@ class RobotBeliefMap:
         for footprint_cell in footprint:
             if self._direct_free_observation(footprint_cell):
                 continue
-            if self.defense_runner.is_hard_blocked(footprint_cell, now):
+            if self.defense_runner.is_hard_blocked(
+                footprint_cell,
+                now,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ):
                 return True
         return False
 
-    def is_blocked_for_planning(self, cell):
+    def is_blocked_for_planning(
+        self,
+        cell,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ):
         footprint = robot_footprint_cells(cell)
 
         for footprint_cell in footprint:
@@ -1916,12 +1939,41 @@ class RobotBeliefMap:
             ) and self.source[r, c] in ("initial_map", "self_sensor"):
                 return True
 
-        if self.footprint_is_peer_hard_blocked(footprint):
+        if self.footprint_is_peer_hard_blocked(
+            footprint,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        ):
             return True
 
         return False
 
-    def traversal_cost(self, cell):
+    def traversal_cost_excluding_sender(
+        self,
+        cell,
+        sender_id,
+        *,
+        fake_blocked_only=True,
+    ):
+        """Metric-only cost with one sender's selected peer claims removed."""
+        predicate = None
+        if fake_blocked_only:
+            predicate = lambda claim: (
+                claim.is_malicious and claim.claim == int(ClaimType.BLOCKED)
+            )
+        return self._traversal_cost(
+            cell,
+            excluded_sender_id=sender_id,
+            excluded_claim_predicate=predicate,
+        )
+
+    def _traversal_cost(
+        self,
+        cell,
+        *,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ):
         """
         Cost used by A*.
 
@@ -1931,7 +1983,11 @@ class RobotBeliefMap:
         if not self.in_bounds(cell):
             return float("inf")
 
-        if self.is_blocked_for_planning(cell):
+        if self.is_blocked_for_planning(
+            cell,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        ):
             return float("inf")
 
         max_cost = 1.0
@@ -1961,6 +2017,8 @@ class RobotBeliefMap:
                     self.defense_runner.routing_cost(
                         footprint_cell,
                         self.current_timestamp,
+                        excluded_sender_id=excluded_sender_id,
+                        excluded_claim_predicate=excluded_claim_predicate,
                     ),
                 )
             if math.isinf(peer_cost):
@@ -1968,6 +2026,9 @@ class RobotBeliefMap:
             max_cost = max(max_cost, peer_cost)
 
         return max_cost
+
+    def traversal_cost(self, cell):
+        return self._traversal_cost(cell)
 
     def display_grid(self):
         """
@@ -2764,6 +2825,7 @@ class GridRobot:
         self.robot_id = int(robot_id)
         self.position_cell = tuple(start_cell)
         self.position_xy = cell_to_xy(start_cell)
+        self.position_history = deque([self.position_cell], maxlen=50)
 
         self.motion_target_cell = None
         self.motion_target_xy = None
@@ -2842,6 +2904,19 @@ class GridRobot:
         self.traffic_replan_count = 0
         self.traffic_wait_steps = []
         self.traffic_deadlock_active = False
+        self.active_deadlock_id = None
+        self.traffic_mode = "NORMAL"
+        self.traffic_blocked_by = None
+        self.active_yield_target = None
+        self.saved_original_goal = None
+        self.saved_original_path = None
+        self.saved_original_path_index = 0
+        self.yield_blocked_cell = None
+        self.yield_conflict_cells = set()
+        self.idle_relocated = False
+        self.last_traffic_signature = None
+        self.traffic_replans_suppressed = 0
+        self.intent_commit_mismatches = 0
 
         # Detailed instrumentation for separating useful route adaptation from
         # repeated planning churn.
@@ -2904,6 +2979,47 @@ class GridRobot:
             return None
 
         return self.path[self.path_index + 1]
+
+    def propose_move_intent(self):
+        """Freeze the exact target that traffic coordination is allowed to commit."""
+        target = self.motion_target_cell
+        if target is None and not self.completed:
+            target = self.current_planned_next_cell()
+        return {
+            "robot_id": self.robot_id,
+            "current_cell": tuple(self.position),
+            "target_cell": tuple(target) if target is not None else None,
+            "current_cells": set(robot_footprint_cells(self.position)),
+            "target_cells": set(robot_footprint_cells(target)) if target is not None else set(),
+            "motion_target": self.motion_target_cell is not None,
+        }
+
+    def commit_move_intent(self, intent, world, approved):
+        """Commit exactly ``intent``; never recompute a path after approval."""
+        target = intent.get("target_cell")
+        if not approved:
+            return False, "traffic_wait"
+        if target is None:
+            return False, "already_completed" if self.completed else "no_next_cell"
+        if self.motion_target_cell is not None and tuple(self.motion_target_cell) != tuple(target):
+            self.intent_commit_mismatches += 1
+            return False, "intent_commit_mismatch"
+        if not world.can_enter(target, None):
+            r, c = target
+            self.belief_map.belief[r, c] = CellState.OCCUPIED_DYNAMIC
+            self.belief_map.confidence[r, c] = 1.0
+            self.belief_map.source[r, c] = "blocked_world"
+            self.path = []
+            self.path_index = 0
+            return False, "blocked_world"
+        if self.motion_target_cell is None:
+            self.motion_target_cell = tuple(target)
+            self.motion_target_xy = cell_to_xy(target)
+        moved, event = self.advance_continuous_motion()
+        if moved:
+            self.consecutive_traffic_waits = 0
+            self.last_traffic_move_step = self.current_step
+        return moved, event
 
     def _cell_has_direct_free_observation(self, cell):
         r, c = tuple(cell)
@@ -3329,6 +3445,8 @@ class GridRobot:
         if distance <= max_step:
             self.position_xy = self.motion_target_xy.copy()
             self.position_cell = tuple(self.motion_target_cell)
+            if not self.position_history or self.position_history[-1] != self.position_cell:
+                self.position_history.append(self.position_cell)
 
             self.motion_target_cell = None
             self.motion_target_xy = None
@@ -4043,6 +4161,175 @@ def broadcast_reports(robots, reports_by_sender):
                 robot.receive_report(report)
 
 
+def _traffic_yield_target(robot, robots, world):
+    """Find a nearby deterministic passing/parking cell without teleporting."""
+    occupied = set().union(*(other.occupied_cells for other in robots if other is not robot))
+    forbidden_goals = {tuple(other.goal) for other in robots}
+    candidates = []
+    for distance, previous in enumerate(reversed(robot.position_history), start=1):
+        if tuple(previous) != tuple(robot.position):
+            candidates.append((tuple(previous), distance))
+    frontier = [(tuple(robot.position), 0)]
+    seen = {tuple(robot.position)}
+    while frontier:
+        cell, distance = frontier.pop(0)
+        if distance >= TRAFFIC_YIELD_SEARCH_RADIUS:
+            continue
+        for neighbor in AStarPlanner4.neighbors_4(cell):
+            neighbor = tuple(neighbor)
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            frontier.append((neighbor, distance + 1))
+            candidates.append((neighbor, distance + 1))
+    valid = []
+    for candidate, distance in candidates:
+        if candidate == tuple(robot.position) or candidate in occupied or candidate in forbidden_goals:
+            continue
+        if not world.can_enter(candidate, occupied):
+            continue
+        degree = sum(
+            world.can_enter(neighbor, occupied)
+            for neighbor in AStarPlanner4.neighbors_4(candidate)
+        )
+        clearance = sum(
+            world.can_enter((candidate[0] + dr, candidate[1] + dc), occupied)
+            for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+        )
+        valid.append((candidate, distance, degree, clearance))
+    if not valid:
+        return None
+    passing = [item for item in valid if item[2] >= 3]
+    pool = passing or valid
+    return max(pool, key=lambda item: (item[2], item[3], -item[1]))[0]
+
+
+def build_narrow_corridor_topology(grid):
+    """Build static one-cell corridor segments between junctions/rooms."""
+    rows, cols = np.asarray(grid).shape
+    free = {
+        (r, c)
+        for r in range(rows)
+        for c in range(cols)
+        if int(grid[r, c]) not in (
+            int(CellState.OCCUPIED_STATIC), int(CellState.OCCUPIED_DYNAMIC),
+            int(CellState.TEMPORARILY_BLOCKED),
+        )
+    }
+    neighbors = lambda cell: [
+        candidate for candidate in AStarPlanner4.neighbors_4(cell) if candidate in free
+    ]
+    degree = {cell: len(neighbors(cell)) for cell in free}
+    endpoints = {cell for cell in free if degree[cell] != 2}
+    segments = {}
+    corridor_by_cell = {}
+    visited_edges = set()
+    corridor_index = 0
+    for endpoint in endpoints:
+        for neighbor in neighbors(endpoint):
+            edge = frozenset((endpoint, neighbor))
+            if edge in visited_edges:
+                continue
+            chain = [endpoint]
+            previous, current = endpoint, neighbor
+            visited_edges.add(edge)
+            while True:
+                chain.append(current)
+                next_cells = [cell for cell in neighbors(current) if cell != previous]
+                if degree[current] != 2 or not next_cells:
+                    break
+                previous, current = current, next_cells[0]
+                visited_edges.add(frozenset((previous, current)))
+            if len(chain) < 3:
+                continue
+            corridor_id = f"C{corridor_index}"
+            corridor_index += 1
+            segments[corridor_id] = {
+                "cells": tuple(chain),
+                "endpoint_a": chain[0],
+                "endpoint_b": chain[-1],
+                "length": len(chain),
+            }
+            for cell in chain:
+                corridor_by_cell[cell] = corridor_id
+    return corridor_by_cell, segments
+
+
+def _start_robot_yield(robot, blocker_id, blocked_cell, robots, world, step):
+    target = _traffic_yield_target(robot, robots, world)
+    if target is None:
+        return None
+    robot.traffic_mode = "YIELDING"
+    robot.traffic_blocked_by = blocker_id
+    robot.active_yield_target = tuple(target)
+    robot.yield_blocked_cell = tuple(blocked_cell) if blocked_cell else None
+    robot.yield_conflict_cells = (
+        set(robot_footprint_cells(blocked_cell)) if blocked_cell is not None else set()
+    )
+    robot.saved_original_goal = tuple(robot.goal)
+    robot.saved_original_path = list(robot.path)
+    robot.saved_original_path_index = robot.path_index
+    robot.goal = tuple(target)
+    robot.path = []
+    robot.path_index = 0
+    try:
+        robot.plan_path(reason="traffic_yield_started", timestamp=step, phase=robot.current_phase)
+    except RuntimeError:
+        robot.traffic_mode = "NORMAL"
+        robot.goal = robot.saved_original_goal
+        robot.path = robot.saved_original_path or []
+        robot.path_index = robot.saved_original_path_index
+        return None
+    return {
+        "step": step, "event_type": "traffic_yield_started", "robot_id": robot.robot_id,
+        "other_robot_ids": (blocker_id,) if blocker_id is not None else (),
+        "current_cell": tuple(robot.position), "requested_cell": blocked_cell,
+        "goal": tuple(robot.saved_original_goal), "wait_age": robot.consecutive_traffic_waits,
+        "traffic_mode": robot.traffic_mode, "yield_target": tuple(target),
+        "deadlock_id": robot.active_deadlock_id,
+    }
+
+
+def _restore_robot_goal_after_yield(robot, step):
+    original_goal = robot.saved_original_goal
+    if original_goal is None:
+        return None
+    deadlock_id = robot.active_deadlock_id
+    robot.traffic_deadlock_active = False
+    robot.active_deadlock_id = None
+    robot.traffic_mode = "NORMAL"
+    robot.traffic_blocked_by = None
+    robot.active_yield_target = None
+    robot.yield_blocked_cell = None
+    robot.yield_conflict_cells = set()
+    robot.goal = tuple(original_goal)
+    robot.path = []
+    robot.path_index = 0
+    robot.consecutive_traffic_waits = 0
+    robot.last_traffic_signature = None
+    robot.plan_path(reason="traffic_deadlock_recovered", timestamp=step, phase=robot.current_phase)
+    robot.saved_original_goal = None
+    robot.saved_original_path = None
+    return {
+        "step": step, "event_type": "traffic_deadlock_recovered", "robot_id": robot.robot_id,
+        "other_robot_ids": (), "current_cell": tuple(robot.position),
+        "requested_cell": None, "goal": tuple(robot.goal), "wait_age": robot.consecutive_traffic_waits,
+        "traffic_mode": robot.traffic_mode, "yield_target": None,
+        "deadlock_id": deadlock_id,
+    }
+
+
+def _start_idle_parking(robot, blocker_id, blocked_cell, robots, world, step):
+    robot.idle_relocated = True
+    robot.completed = False
+    event = _start_robot_yield(robot, blocker_id, blocked_cell, robots, world, step)
+    if event:
+        event["event_type"] = "traffic_yield_started"
+        event["reason"] = "completed_robot_parking"
+        robot.saved_original_goal = None
+    return event
+
+
 def coordinate_robot_intents(robots, world, step, traffic_state=None):
     """Resolve one-step footprint intents before any robot moves.
 
@@ -4054,59 +4341,183 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
         traffic_state = getattr(coordinate_robot_intents, "_default_state", None)
         if traffic_state is None or step == 0:
             traffic_state = coordinate_robot_intents._default_state = {}
+    events = []
+
+    def ensure_deadlock_id(robot):
+        if robot.active_deadlock_id is None:
+            number = int(traffic_state.get("next_deadlock_id", 1))
+            robot.active_deadlock_id = f"deadlock-{number:06d}"
+            traffic_state["next_deadlock_id"] = number + 1
+        return robot.active_deadlock_id
+    corridor_by_cell = traffic_state.get("corridor_by_cell", {})
+    corridors = traffic_state.get("corridors", {})
+    robot_by_id = {robot.robot_id: robot for robot in robots}
+    for corridor_id, corridor in corridors.items():
+        owner_id = corridor.get("owner_robot_id")
+        owner = robot_by_id.get(owner_id)
+        if owner is not None:
+            owner_cells = owner.occupied_cells
+            owner_target = owner.motion_target_cell or owner.current_planned_next_cell()
+            if not (owner_cells & set(corridor["cells"])) and (
+                owner_target is None or owner_target not in corridor["cells"]
+            ):
+                corridor["owner_robot_id"] = None
+                corridor["direction"] = None
+                events.append({
+                    "step": step, "event_type": "traffic_corridor_reservation_released",
+                    "robot_id": owner_id, "corridor_id": corridor_id,
+                })
+    for idle in robots:
+        if not idle.completed or idle.traffic_mode not in ("NORMAL", "IDLE_PARKED"):
+            continue
+        for active in robots:
+            if active is idle or active.completed:
+                continue
+            requested = active.motion_target_cell or active.current_planned_next_cell()
+            if requested is None:
+                continue
+            if idle.occupied_cells & set(robot_footprint_cells(requested)):
+                parking_event = _start_idle_parking(
+                    idle, active.robot_id, requested, robots, world, step
+                )
+                if parking_event:
+                    events.append(parking_event)
+                break
+    for robot in robots:
+        if robot.idle_relocated and robot.active_yield_target is not None:
+            if tuple(robot.position) == tuple(robot.active_yield_target):
+                robot.traffic_mode = "IDLE_PARKED"
+                robot.completed = True
+                robot.path = []
+                robot.path_index = 0
+                robot.motion_target_cell = None
+                robot.motion_target_xy = None
+                events.append({
+                    "step": step, "event_type": "traffic_idle_parked",
+                    "robot_id": robot.robot_id, "other_robot_ids": (),
+                    "requested_cell": None, "wait_age": robot.consecutive_traffic_waits,
+                    "traffic_mode": robot.traffic_mode, "yield_target": robot.active_yield_target,
+                })
+                robot.active_yield_target = None
+                robot.traffic_blocked_by = None
+                robot.idle_relocated = False
+                continue
+        if robot.traffic_mode not in ("YIELDING", "YIELDING_PARKED") or robot.active_yield_target is None:
+            continue
+        if tuple(robot.position) != tuple(robot.active_yield_target):
+            continue
+        conflict_occupied = any(
+            robot.yield_conflict_cells & other.occupied_cells
+            for other in robots if other is not robot
+        )
+        conflict_reserved = any(
+            robot.yield_conflict_cells & set(robot_footprint_cells(
+                other.motion_target_cell or other.current_planned_next_cell()
+            ))
+            for other in robots
+            if other is not robot and (other.motion_target_cell or other.current_planned_next_cell()) is not None
+        )
+        if not conflict_occupied and not conflict_reserved:
+            try:
+                recovered = _restore_robot_goal_after_yield(robot, step)
+            except RuntimeError:
+                recovered = None
+            if recovered:
+                events.append(recovered)
+        else:
+            robot.traffic_mode = "YIELDING_PARKED"
     intents = {}
     for robot in robots:
-        current = set(robot_footprint_cells(robot.position))
-        if robot.completed:
-            target = None
-        elif robot.motion_target_cell is not None:
-            target = tuple(robot.motion_target_cell)
-        else:
-            target = robot.current_planned_next_cell()
+        frozen = robot.propose_move_intent()
+        current = frozen["current_cells"]
+        target = frozen["target_cell"]
         intents[robot.robot_id] = {
             "robot": robot,
+            "frozen": frozen,
             "current": current,
             "target": set(robot_footprint_cells(target)) if target is not None else set(),
             "target_anchor": target,
             "moving": robot.motion_target_cell is not None,
             "approved": False,
         }
+        robot._traffic_intent = frozen
 
     joint_positions = tuple(sorted((robot.robot_id, tuple(robot.position)) for robot in robots))
-    joint_counts = traffic_state.setdefault("joint_counts", {})
-    joint_counts[joint_positions] = joint_counts.get(joint_positions, 0) + 1
-    repeated_joint_state = joint_counts[joint_positions] >= TRAFFIC_JOINT_REPEAT_THRESHOLD
+    previous_joint = traffic_state.get("last_joint_positions")
+    if previous_joint == joint_positions:
+        traffic_state["same_joint_state_streak"] = traffic_state.get("same_joint_state_streak", 0) + 1
+    else:
+        traffic_state["same_joint_state_streak"] = 1
+    traffic_state["last_joint_positions"] = joint_positions
+    repeated_joint_state = traffic_state["same_joint_state_streak"] >= TRAFFIC_JOINT_REPEAT_THRESHOLD
 
     ordered = sorted(
         intents.values(),
         key=lambda item: (
-            0 if item["moving"] else 1,
+            0 if item["moving"] or item["robot"].traffic_mode == "YIELDING" else 1,
             -item["robot"].consecutive_traffic_waits,
             (item["robot"].robot_id - step) % max(1, len(robots)),
         ),
     )
-    events = []
     approved = {}
+    for item in ordered:
+        target = item["target_anchor"]
+        if target is None:
+            continue
+        corridor_id = corridor_by_cell.get(tuple(target))
+        if corridor_id is None:
+            continue
+        corridor = corridors[corridor_id]
+        current_inside = bool(item["current"] & set(corridor["cells"]))
+        owner_id = corridor.get("owner_robot_id")
+        if not current_inside and owner_id not in (None, item["robot"].robot_id):
+            item["corridor_denied"] = owner_id
+            corridor.setdefault("waiting_robot_ids", set()).add(item["robot"].robot_id)
+            continue
+        if not current_inside and owner_id is None:
+            corridor["owner_robot_id"] = item["robot"].robot_id
+            corridor["entered_step"] = step
+            events.append({
+                "step": step, "event_type": "traffic_corridor_reservation_started",
+                "robot_id": item["robot"].robot_id, "corridor_id": corridor_id,
+            })
+    pure_swap_pairs = set()
+    for left in intents.values():
+        for right in intents.values():
+            if left is right:
+                continue
+            if left["target"] & right["current"] and right["target"] & left["current"]:
+                pure_swap_pairs.add(frozenset((left["robot"].robot_id, right["robot"].robot_id)))
     for item in ordered:
         robot = item["robot"]
         target = item["target"]
         if not target:
             approved[robot.robot_id] = True
             item["approved"] = True
-            if robot.traffic_deadlock_active:
+            if robot.traffic_deadlock_active and robot.traffic_mode == "NORMAL":
+                deadlock_id = robot.active_deadlock_id
                 events.append({
                     "step": step, "event_type": "traffic_deadlock_recovered",
                     "robot_id": robot.robot_id, "other_robot_ids": (),
                     "requested_cell": None, "wait_age": robot.consecutive_traffic_waits,
+                    "deadlock_id": deadlock_id,
                 })
                 robot.traffic_deadlock_active = False
+                robot.active_deadlock_id = None
             continue
 
         conflict_kind = None
         conflict_with = []
+        if item.get("corridor_denied") is not None:
+            conflict_kind = "traffic_corridor_entry_denied"
+            conflict_with.append(item["corridor_denied"])
         for other in intents.values():
             if other is item:
                 continue
+            if frozenset((robot.robot_id, other["robot"].robot_id)) in pure_swap_pairs:
+                conflict_kind = "traffic_swap_conflict"
+                conflict_with.append(other["robot"].robot_id)
+                break
             if target & other["target"] and other["approved"]:
                 conflict_kind = "traffic_vertex_conflict"
                 conflict_with.append(other["robot"].robot_id)
@@ -4128,24 +4539,94 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
                 "other_robot_ids": tuple(conflict_with), "requested_cell": item["target_anchor"],
                 "wait_age": robot.consecutive_traffic_waits,
             })
+            robot.traffic_blocked_by = conflict_with[0] if conflict_with else None
             approved[robot.robot_id] = False
+            if (
+                robot.consecutive_traffic_waits >= TRAFFIC_DEADLOCK_WAIT_THRESHOLD
+                or (repeated_joint_state and not robot.traffic_deadlock_active)
+            ) and not robot.traffic_deadlock_active:
+                robot.traffic_deadlock_active = True
+                deadlock_id = ensure_deadlock_id(robot)
+                events.append({
+                    "step": step, "event_type": "traffic_deadlock_detected",
+                    "robot_id": robot.robot_id, "other_robot_ids": tuple(conflict_with),
+                    "requested_cell": item["target_anchor"],
+                    "wait_age": robot.consecutive_traffic_waits,
+                    "deadlock_id": deadlock_id,
+                })
         else:
             approved[robot.robot_id] = True
             item["approved"] = True
-            if robot.traffic_deadlock_active:
+            if robot.traffic_deadlock_active and robot.traffic_mode == "NORMAL":
+                deadlock_id = robot.active_deadlock_id
                 events.append({
                     "step": step, "event_type": "traffic_deadlock_recovered",
                     "robot_id": robot.robot_id, "other_robot_ids": (),
                     "requested_cell": item["target_anchor"],
                     "wait_age": robot.consecutive_traffic_waits,
+                    "deadlock_id": deadlock_id,
                 })
                 robot.traffic_deadlock_active = False
+                robot.active_deadlock_id = None
+
+    deadlock_candidates = [
+        robot for robot in robots
+        if robot.traffic_deadlock_active and robot.traffic_mode == "NORMAL"
+    ]
+    if deadlock_candidates and (
+        repeated_joint_state
+        or any(robot.consecutive_traffic_waits >= TRAFFIC_DEADLOCK_WAIT_THRESHOLD
+               for robot in deadlock_candidates)
+    ):
+        yielding = min(
+            deadlock_candidates,
+            key=lambda robot: (
+                robot.consecutive_traffic_waits,
+                (robot.robot_id - step) % max(1, len(robots)),
+            ),
+        )
+        yield_event = _start_robot_yield(
+            yielding,
+            yielding.traffic_blocked_by,
+            next(
+                (event.get("requested_cell") for event in reversed(events)
+                 if event.get("robot_id") == yielding.robot_id
+                 and event.get("event_type") in {
+                     "traffic_vertex_conflict", "traffic_swap_conflict", "traffic_reservation_conflict"
+                 }),
+                None,
+            ),
+            robots,
+            world,
+            step,
+        )
+        if yield_event:
+            events.append(yield_event)
 
     # Repeated waiting gets a temporary traffic-cost replan. Costs are local,
     # finite, and never copied into RobotBeliefMap.
     for item in ordered:
         robot = item["robot"]
+        if robot.traffic_mode != "NORMAL":
+            continue
         if robot.consecutive_traffic_waits < TRAFFIC_REPLAN_WAIT_THRESHOLD:
+            continue
+        blocker = next((other for other in robots if other.robot_id == robot.traffic_blocked_by), None)
+        signature = (
+            robot.robot_id,
+            item["target_anchor"],
+            robot.traffic_blocked_by,
+            tuple(blocker.position) if blocker is not None else None,
+            tuple(robot.goal),
+        )
+        if robot.last_traffic_signature == signature and robot.traffic_replan_count:
+            robot.traffic_replans_suppressed += 1
+            events.append({
+                "step": step, "event_type": "traffic_replan_suppressed",
+                "robot_id": robot.robot_id, "other_robot_ids": (robot.traffic_blocked_by,),
+                "requested_cell": item["target_anchor"], "wait_age": robot.consecutive_traffic_waits,
+                "traffic_mode": robot.traffic_mode,
+            })
             continue
         if step - getattr(robot, "last_traffic_replan_step", -10**9) < TRAFFIC_REPLAN_COOLDOWN_STEPS:
             continue
@@ -4168,22 +4649,12 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
                 hard_reservations=hard,
             )
             robot.last_traffic_replan_step = step
+            robot.last_traffic_signature = signature
             events.append({
                 "step": step, "event_type": "traffic_replan", "robot_id": robot.robot_id,
                 "other_robot_ids": (), "requested_cell": robot.current_planned_next_cell(),
                 "wait_age": robot.consecutive_traffic_waits,
             })
-            if (
-                robot.consecutive_traffic_waits >= TRAFFIC_DEADLOCK_WAIT_THRESHOLD
-                and not robot.traffic_deadlock_active
-            ) or (repeated_joint_state and not robot.traffic_deadlock_active):
-                robot.traffic_deadlock_active = True
-                events.append({
-                    "step": step, "event_type": "traffic_deadlock_detected",
-                    "robot_id": robot.robot_id, "other_robot_ids": tuple(conflict_with),
-                    "requested_cell": item["target_anchor"],
-                    "wait_age": robot.consecutive_traffic_waits,
-                })
         except RuntimeError:
             pass
     return approved, events
@@ -4375,11 +4846,21 @@ def run_simulation(
                 "current_goal": [],
                 "lidar_rays": [],
                 "malicious_claim_cells_on_route": [],
+                "attacker_trust": [],
+                "attacker_is_trusted": [],
+                "active_fake_claim_count": [],
+                "influential_fake_claim_count": [],
+                "attacker_route_cost_delta": [],
+                "route_affected_by_attacker": [],
+                "attacker_attributable_cost_on_route": [],
+                "preferred_route_affected_by_attacker": [],
+                "max_attacker_cell_cost_delta": [],
             }
             for robot in robots
         },
         "reports": [],
         "trust_events": [],
+        "attacker_trust_events": [],
         "traffic_events": [],
         "malicious_robot_id": malicious_robot_id,
         "goal": goal,
@@ -4402,7 +4883,22 @@ def run_simulation(
             pass
 
     traffic_heatmap = np.zeros_like(world.grid, dtype=int)
-    traffic_state = {}
+    corridor_by_cell, corridor_segments = build_narrow_corridor_topology(prior_grid)
+    traffic_state = {
+        "next_deadlock_id": 1,
+        "corridor_by_cell": corridor_by_cell,
+        "corridors": {
+            corridor_id: {
+                "owner_robot_id": None,
+                "direction": None,
+                "entered_step": None,
+                "waiting_robot_ids": set(),
+                "blocked": False,
+                "cells": segment["cells"],
+            }
+            for corridor_id, segment in corridor_segments.items()
+        },
+    }
 
     recon_goal_visit_counts = {
         tuple(goal): 0
@@ -4657,19 +5153,25 @@ def run_simulation(
                     f"old_len={len(old_path)} new_len={len(robot.path)}"
                 )
 
-        # 5. Propose and resolve all physical movement intents before moving.
+        # 5. Prepare task transitions and freeze intents before moving.
+        for robot in robots:
+            robot.update_delivery_state()
+            if not robot.completed and robot.should_replan_for_path_state(step):
+                try:
+                    robot.plan_path(reason="pre_intent_path_update", timestamp=step, phase=current_phase)
+                except RuntimeError:
+                    pass
+
+        # Resolve all physical movement intents before moving.
         approvals, traffic_events = coordinate_robot_intents(robots, world, step, traffic_state)
         log["traffic_events"].extend(traffic_events)
-        traffic_by_robot = {event["robot_id"]: event for event in traffic_events}
         for robot in robots:
-            if not approvals.get(robot.robot_id, True):
-                event = "traffic_wait"
-            else:
-                moved, event = robot.move_one_cell(
-                    world,
-                    set(),
-                    ignore_robot_collisions=True,
-                )
+            intent = getattr(robot, "_traffic_intent", robot.propose_move_intent())
+            moved, event = robot.commit_move_intent(
+                intent,
+                world,
+                approvals.get(robot.robot_id, True),
+            )
 
             if event == "blocked_world":
                 try:
@@ -4682,6 +5184,19 @@ def run_simulation(
                     pass
 
             log["robots"][robot.robot_id]["events"].append(event)
+
+        actual_occupancy = {}
+        for robot in robots:
+            for cell in robot_footprint_cells(robot.position):
+                previous = actual_occupancy.setdefault(tuple(cell), robot.robot_id)
+                if previous != robot.robot_id:
+                    overlap = {
+                        "step": step, "event_type": "traffic_overlap_violation",
+                        "robot_id": robot.robot_id, "other_robot_ids": (previous,),
+                        "current_cell": tuple(robot.position),
+                    }
+                    log["traffic_events"].append(overlap)
+                    raise RuntimeError(f"robot overlap at step {step}: robots {previous} and {robot.robot_id}")
 
         # Record benign traffic after movement so the heatmap matches the logged animation state.
         if in_recon_phase:
@@ -4784,14 +5299,234 @@ def run_simulation(
             rlog["completed_tasks"].append(robot.completed_tasks)
             rlog["current_goal"].append(robot.goal)        
             rlog["lidar_rays"].append(copy.deepcopy(lidar_rays_by_robot.get(rid, [])))
+            attacker_trust = (
+                None if robot.is_malicious else float(robot.trust_for(malicious_robot_id))
+            )
+            fake_cells = active_fake_claim_cells(
+                log,
+                malicious_robot_id,
+                step,
+                max_claim_age=log["defense_config"].get("max_claim_age", 500),
+            )
+            influential_count = (
+                0 if robot.is_malicious else count_influential_fake_claim_cells(
+                    robot, fake_cells, attacker_id=malicious_robot_id
+                )
+            )
+            if (
+                not robot.is_malicious
+                and (step % ROUTE_IMPACT_EVAL_PERIOD_STEPS == 0 or not rlog["attacker_route_cost_delta"])
+            ):
+                route_delta, route_affected = route_impact_from_fake_claims(
+                    robot, attacker_id=malicious_robot_id
+                )
+            elif robot.is_malicious:
+                route_delta, route_affected = 0.0, False
+            else:
+                route_delta = rlog["attacker_route_cost_delta"][-1]
+                route_affected = rlog["route_affected_by_attacker"][-1]
+
+            was_trusted = None
+            if rlog["attacker_is_trusted"]:
+                was_trusted = rlog["attacker_is_trusted"][-1]
+            is_trusted = (
+                None if attacker_trust is None
+                else attacker_trust >= TRUST_ACCEPT_THRESHOLD
+            )
+            if (
+                attacker_trust is not None
+                and was_trusted is not None
+                and is_trusted != was_trusted
+            ):
+                event_type = "attacker_retrusted" if is_trusted else "attacker_distrusted"
+                log["attacker_trust_events"].append({
+                    "step": step,
+                    "event_type": event_type,
+                    "robot_id": rid,
+                    "attacker_id": malicious_robot_id,
+                    "previous_trust": float(rlog["attacker_trust"][-1]),
+                    "current_trust": attacker_trust,
+                    "threshold": TRUST_ACCEPT_THRESHOLD,
+                    "influential_fake_claim_count": influential_count,
+                    "phase": current_phase,
+                })
+
             rlog["malicious_claim_cells_on_route"].append(
                 count_active_malicious_claim_cells_on_route(robot, step)
+            )
+            rlog["attacker_trust"].append(attacker_trust)
+            rlog["attacker_is_trusted"].append(is_trusted)
+            rlog["active_fake_claim_count"].append(
+                0 if robot.is_malicious else len(fake_cells)
+            )
+            rlog["influential_fake_claim_count"].append(influential_count)
+            rlog["attacker_route_cost_delta"].append(float(route_delta))
+            rlog["route_affected_by_attacker"].append(bool(route_affected))
+            rlog["attacker_attributable_cost_on_route"].append(float(route_delta))
+            rlog["preferred_route_affected_by_attacker"].append(bool(route_affected))
+            rlog["max_attacker_cell_cost_delta"].append(
+                max(
+                    (
+                        attacker_cell_cost_delta(robot, cell, malicious_robot_id)
+                        for cell in fake_cells
+                    ),
+                    default=0.0,
+                )
+                if not robot.is_malicious
+                else 0.0
             )
 
         if all(robot.completed for robot in robots):
             break
 
     return world, robots, log
+
+
+def active_fake_claim_cells(log, attacker_id, timestamp, max_claim_age=None):
+    """Return latest, unexpired attacker claims that are fake BLOCKED claims."""
+    max_age = int(max_claim_age if max_claim_age is not None else 10**9)
+    latest = {}
+    for report in log.get("reports", ()):
+        if (
+            int(report.get("step", -1)) <= int(timestamp)
+            and int(report.get("sender_id", -1)) == int(attacker_id)
+        ):
+            cell = tuple(report["target_cell"])
+            previous = latest.get(cell)
+            if previous is None or int(report.get("step", -1)) >= int(previous["step"]):
+                latest[cell] = report
+    return {
+        cell
+        for cell, report in latest.items()
+        if bool(report.get("is_malicious"))
+        and int(report.get("claim", -1)) == int(ClaimType.BLOCKED)
+        and int(timestamp) - int(report.get("step", timestamp)) <= max_age
+    }
+
+
+def attacker_cell_cost_delta(robot, cell, attacker_id):
+    """Return cost attributable specifically to malicious BLOCKED claims."""
+    with_attacker = robot.belief_map.traversal_cost(tuple(cell))
+    without_attacker = robot.belief_map.traversal_cost_excluding_sender(
+        tuple(cell), attacker_id, fake_blocked_only=True
+    )
+    if math.isinf(with_attacker):
+        return float("inf") if not math.isinf(without_attacker) else 0.0
+    if math.isinf(without_attacker):
+        return 0.0
+    return max(0.0, float(with_attacker) - float(without_attacker))
+
+
+def count_influential_fake_claim_cells(
+    robot,
+    fake_cells,
+    *,
+    attacker_id=0,
+    threshold=FAKE_INFLUENCE_MIN_COST_DELTA,
+):
+    """Count fake cells with meaningful attacker-attributable cost delta."""
+    count = 0
+    for cell in fake_cells:
+        delta = attacker_cell_cost_delta(robot, cell, attacker_id)
+        if math.isinf(delta) or delta >= float(threshold):
+            count += 1
+    return count
+
+
+def _route_cost(robot, path, belief_map=None):
+    belief = belief_map or robot.belief_map
+    total = 0.0
+    for cell in path:
+        cost = belief.traversal_cost(tuple(cell))
+        if math.isinf(cost):
+            return float("inf")
+        total += float(cost)
+    return total
+
+
+def _counterfactual_belief_without_attacker(robot, attacker_id):
+    counterfactual_map = copy.deepcopy(robot.belief_map)
+    runner = counterfactual_map.defense_runner
+    if runner is None:
+        return counterfactual_map
+    for cell in list(runner.claims_by_cell):
+        retained = [
+            claim for claim in runner.claims_by_cell[cell]
+            if not (
+                claim.sender_id == int(attacker_id)
+                and claim.is_malicious
+                and claim.claim == int(ClaimType.BLOCKED)
+            )
+        ]
+        if retained:
+            runner.claims_by_cell[cell] = retained
+        else:
+            del runner.claims_by_cell[cell]
+    runner.active_claims = {
+        key: claim for key, claim in runner.active_claims.items()
+        if not (
+            claim.sender_id == int(attacker_id)
+            and claim.is_malicious
+            and claim.claim == int(ClaimType.BLOCKED)
+        )
+    }
+    return counterfactual_map
+
+
+def _route_cost_with_attacker_attribution(robot, path, attacker_id, belief_map=None):
+    total = 0.0
+    for cell in path:
+        cost = (
+            belief_map.traversal_cost(tuple(cell))
+            if belief_map is not None
+            else robot.belief_map.traversal_cost(tuple(cell))
+        )
+        if math.isinf(cost):
+            return float("inf")
+        total += float(cost)
+    return total
+
+
+def route_impact_from_fake_claims(
+    robot,
+    *,
+    attacker_id=0,
+    threshold=ROUTE_IMPACT_MIN_COST_DELTA,
+):
+    """Measure current attacker route cost and preferred-route change separately."""
+    if not robot.path:
+        return 0.0, False
+
+    counterfactual_map = _counterfactual_belief_without_attacker(robot, attacker_id)
+    current_cost = _route_cost_with_attacker_attribution(robot, robot.path, attacker_id)
+    counterfactual_stored_cost = _route_cost_with_attacker_attribution(
+        robot, robot.path, attacker_id, counterfactual_map
+    )
+    if math.isinf(current_cost) and math.isinf(counterfactual_stored_cost):
+        stored_delta = 0.0
+    elif math.isinf(current_cost):
+        stored_delta = float("inf")
+    elif math.isinf(counterfactual_stored_cost):
+        stored_delta = 0.0
+    else:
+        stored_delta = max(0.0, current_cost - counterfactual_stored_cost)
+
+    try:
+        current_preferred_path, _ = robot.planner.plan(
+            robot.belief_map,
+            robot.position,
+            robot.goal,
+        )
+        counterfactual_path, _ = robot.planner.plan(
+            counterfactual_map,
+            robot.position,
+            robot.goal,
+        )
+    except RuntimeError:
+        return stored_delta, False
+
+    preferred_affected = list(current_preferred_path) != list(counterfactual_path)
+    return stored_delta, preferred_affected
 
 
 def count_active_malicious_claim_cells_on_route(robot, timestamp):
@@ -4847,6 +5582,10 @@ def compute_experiment_metrics(robots, log):
 
     blocked_world = {rid: events.count("blocked_world") for rid, events in events_by_robot.items()}
     traffic_waits = {rid: events.count("traffic_wait") for rid, events in events_by_robot.items()}
+    idle_steps = {
+        rid: sum(event not in ("moved_cell", "moved_continuous") for event in events)
+        for rid, events in events_by_robot.items()
+    }
     no_path_counts = {rid: events.count("no_path") for rid, events in events_by_robot.items()}
     movement_steps = {
         rid: sum(event in ("moved_cell", "moved_continuous") for event in events)
@@ -4963,12 +5702,19 @@ def compute_experiment_metrics(robots, log):
     route_exposure_steps = {}
     route_exposure_cell_steps = {}
     peak_malicious_claim_cells_on_route = {}
+    peak_influential_fake_claims = {}
+    route_impact_steps = {}
     for robot in robots:
         rid = robot.robot_id
         series = log["robots"][rid].get("malicious_claim_cells_on_route", [])
         route_exposure_steps[rid] = sum(value > 0 for value in series)
         route_exposure_cell_steps[rid] = sum(series)
         peak_malicious_claim_cells_on_route[rid] = max(series, default=0)
+        influence_series = log["robots"][rid].get("influential_fake_claim_count", [])
+        peak_influential_fake_claims[rid] = max(influence_series, default=0)
+        route_impact_steps[rid] = sum(
+            bool(value) for value in log["robots"][rid].get("route_affected_by_attacker", [])
+        )
 
     defense_snapshots = {
         robot.robot_id: robot.defense_runner.snapshot(len(log.get("truth_grid", [])))
@@ -5010,6 +5756,14 @@ def compute_experiment_metrics(robots, log):
         "head_on_swap_conflicts_detected": traffic_event_counts.get("traffic_swap_conflict", 0),
         "reservation_conflicts_detected": traffic_event_counts.get("traffic_reservation_conflict", 0),
         "traffic_replans": traffic_event_counts.get("traffic_replan", 0),
+        "intent_commit_mismatches": sum(robot.intent_commit_mismatches for robot in robots),
+        "corridor_entry_denied": traffic_event_counts.get("traffic_corridor_entry_denied", 0),
+        "corridor_reservations_started": traffic_event_counts.get("traffic_corridor_reservation_started", 0),
+        "corridor_reservations_released": traffic_event_counts.get("traffic_corridor_reservation_released", 0),
+        "traffic_replans_suppressed": traffic_event_counts.get("traffic_replan_suppressed", 0),
+        "traffic_yield_events": traffic_event_counts.get("traffic_yield_started", 0),
+        "idle_parking_events": traffic_event_counts.get("traffic_idle_parked", 0),
+        "per_robot_idle_steps": idle_steps,
         "deadlocks_detected": traffic_event_counts.get("traffic_deadlock_detected", 0),
         "deadlocks_recovered": traffic_event_counts.get("traffic_deadlock_recovered", 0),
         "robot_overlap_violations": sum(
@@ -5063,6 +5817,10 @@ def compute_experiment_metrics(robots, log):
         "malicious_route_exposure_steps_per_robot": route_exposure_steps,
         "malicious_route_exposure_cell_steps_per_robot": route_exposure_cell_steps,
         "peak_malicious_claim_cells_on_route_per_robot": peak_malicious_claim_cells_on_route,
+        "peak_influential_fake_claims_per_robot": peak_influential_fake_claims,
+        "route_affected_steps_per_robot": route_impact_steps,
+        "attacker_trust_threshold": TRUST_ACCEPT_THRESHOLD,
+        "attacker_trust_threshold_events": len(log.get("attacker_trust_events", [])),
         "benign_deliveries_after_attack": sum(deliveries_after_attack.values()),
         "benign_deliveries_after_distrust": sum(deliveries_after_distrust.values()),
         "benign_identical_path_replans": sum(identical_replans[rid] for rid in benign_ids),
@@ -5364,14 +6122,21 @@ def animate(world, robots, log):
 
     num_panels = 1 + len(robots)
 
-    fig, axes = plt.subplots(
-        1,
+    # Reserve a complete row for the live trust display.  Keeping the panel in
+    # its own axes prevents a long text bbox from covering any map pixels when
+    # the window is resized.
+    fig = plt.figure(figsize=(7 * num_panels, 8.6))
+    grid_spec = fig.add_gridspec(
+        2,
         num_panels,
-        figsize=(7 * num_panels, 7),
-        squeeze=False,
+        height_ratios=(0.20, 1.0),
+        hspace=0.12,
+        wspace=0.10,
     )
-
-    axes = axes[0]
+    trust_ax = fig.add_subplot(grid_spec[0, :])
+    trust_ax.set_axis_off()
+    trust_ax.set_facecolor("#f7f7f7")
+    axes = [fig.add_subplot(grid_spec[1, index]) for index in range(num_panels)]
 
     truth_ax = axes[0]
     belief_axes = {
@@ -5472,6 +6237,17 @@ def animate(world, robots, log):
         0.02,
         "",
         fontsize=10,
+    )
+    trust_panel = trust_ax.text(
+        0.01,
+        0.92,
+        "",
+        fontsize=10,
+        family="monospace",
+        va="top",
+        ha="left",
+        transform=trust_ax.transAxes,
+        bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "#777777", "pad": 5},
     )
 
     max_frames = len(log["truth_grid"])
@@ -5604,6 +6380,11 @@ def animate(world, robots, log):
         grace_active = frame < SPAWN_COLLISION_GRACE_STEPS
 
         phase = log.get("phase", ["UNKNOWN"] * max_frames)[frame]
+        phase_display = {
+            "RECONNAISSANCE": "RECON",
+            "ATTACK": "ATTACK",
+            "RECOVERY": "RECOVERY",
+        }.get(phase, phase)
 
         attack_start = log.get("attack_phase_start_step")
         attack_start_text = attack_start if attack_start is not None else "not yet"
@@ -5618,6 +6399,26 @@ def animate(world, robots, log):
             f"Fake objects: {len(log.get('malicious_fake_objects', [[]])[frame])}",
             f"Malicious robot: R{malicious_robot_id}",
         ]
+
+        trust_lines = [f"ATTACKER R{malicious_robot_id} TRUST"]
+        for robot in robots:
+            if robot.is_malicious:
+                continue
+            rid = robot.robot_id
+            rlog = log["robots"][rid]
+            trust = rlog["attacker_trust"][frame]
+            trusted = rlog["attacker_is_trusted"][frame]
+            state = "TRUSTED" if trusted else "DISTRUSTED"
+            trust_lines.append(
+                f"R{rid} -> R{malicious_robot_id}: {trust:.3f} {state} | "
+                f"active={rlog['active_fake_claim_count'][frame]} | "
+                f"influential={rlog['influential_fake_claim_count'][frame]} | "
+                f"route_cost={rlog['attacker_attributable_cost_on_route'][frame]:.3f} | "
+                f"route={'YES' if rlog['preferred_route_affected_by_attacker'][frame] else 'NO'}"
+            )
+        trust_lines.append(f"threshold={TRUST_ACCEPT_THRESHOLD:.2f} | phase={phase_display}")
+        trust_panel.set_text("\n".join(trust_lines))
+        artists.append(trust_panel)
 
         for robot in robots:
             rid = robot.robot_id
@@ -5647,7 +6448,7 @@ def animate(world, robots, log):
         repeat=False,
     )
 
-    plt.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.subplots_adjust(left=0.03, right=0.99, top=0.98, bottom=0.10)
     plt.show()
 
     return anim

@@ -6,7 +6,7 @@ import subprocess
 import sys
 from .config import SimulationConfig
 from .metrics import CsvMetrics
-from .scenario import author_manifest, author_warehouse_manifest, load_manifest, save_manifest
+from .scenario import author_manifest, author_warehouse_manifest, load_manifest, save_manifest, scenario_manifest_hash
 from .simulation import replay
 from .map_io import default_warehouse_map, load_movingai, load_npy
 from .audit import audit_manifest
@@ -30,7 +30,16 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
         dirty=bool(subprocess.check_output(["git","status","--porcelain"],text=True).strip())
     except (OSError, subprocess.CalledProcessError):
         commit=None; dirty=None
-    CsvMetrics.config(root/"run_metadata.json",{"python_version":sys.version,"platform":platform.platform(),"engine":"modular","settings_source":"modular_cli","scenario_id":manifest.scenario_id,"manifest_hash":manifest.map_hash,"git_commit":commit,"git_dirty":dirty})
+    CsvMetrics.config(root/"run_metadata.json",{"python_version":sys.version,"platform":platform.platform(),"engine":"modular","settings_source":"modular_cli","scenario_id":manifest.scenario_id,"manifest_hash":manifest.map_hash,"map_hash":manifest.map_hash,"scenario_manifest_hash":scenario_manifest_hash(manifest),"git_commit":commit,"git_dirty":dirty})
     if manifest_only: return manifest
     methods=config.comparison_methods if comparison else (config.fusion.method,)
-    return [replay(config,manifest,method,root/method if comparison else root) for method in methods]
+    results = [replay(config,manifest,method,root/method if comparison else root) for method in methods]
+    if comparison and config.logging.generate_plots:
+        try:
+            from .reporting import generate_comparison_report
+            generate_comparison_report(root, formats=(config.logging.plot_format,))
+        except Exception as exc:
+            warning = f"Warning: comparison plot generation failed for {root}: {exc}"
+            print(warning)
+            (root / "plot_generation_error.txt").write_text(warning + "\n", encoding="utf-8")
+    return results

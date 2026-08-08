@@ -58,7 +58,11 @@ behavioral components: they provide the validated continuous-motion, warehouse-l
 LiDAR, and fusion implementations used by the modular manifest adapter.  They are not
 separate selectable engines.
 
-To compare all five supported methods on one fixed seed-10 manifest:
+The primary comparison methods are `full_trust`, `majority_vote`, `trust_fused`,
+and `source_linked`. Optional additional methods are `hard_threshold`,
+`soft_probability`, and `time_decay`; they are only run when explicitly selected.
+
+To compare the primary methods on one fixed seed-10 manifest:
 
 ```powershell
 python .\main.py --headless --manifest-only --seed 10 --no-animation --output-directory outputs\seed10_manifest
@@ -67,6 +71,54 @@ python .\main.py --headless --compare --manifest outputs\seed10_manifest\scenari
 
 The old path under `C:\Users\ashut\...` is not needed; all paths here are
 relative to this project.
+
+## Results and plots
+
+Completed runs write the authoritative `run_summary.csv`, `events.csv`, and
+`robot_timeseries.csv` files. By default they also generate a `plots/` folder,
+`report_summary.txt`, and `plot_manifest.json`. Comparison runs generate those
+individual reports for each method plus `comparison_plots/`,
+`comparison_summary.csv`, and `comparison_report.txt` at the comparison root.
+
+Disable report generation with `--no-plots`:
+
+```powershell
+python .\main.py --headless --no-animation --no-plots --max-steps 10
+```
+
+Regenerate reports from existing CSV output without rerunning a simulation:
+
+```powershell
+python -m map_poisoning.reporting outputs\source_linked
+python -m map_poisoning.reporting --compare outputs\comparison
+```
+
+Multi-seed experiments author one scenario manifest per seed and replay every
+requested method against that seed's manifest:
+
+```powershell
+python .\main.py --headless --no-animation --seeds 1-3 --compare `
+  --map-npy .\converted_maps\maps_005_map\static_grid.npy `
+  --scenario-preset warehouse_005 --output-directory outputs\map005_multiseed
+python .\main.py --headless --no-animation --seeds 1-30 --methods source_linked `
+  --map-npy .\converted_maps\maps_005_map\static_grid.npy `
+  --scenario-preset warehouse_005 --output-directory outputs\map005_source_linked_multiseed
+```
+
+Use `--resume` to skip only completed cells with matching seed, method,
+scenario-manifest, and experiment-configuration hashes. Add `--per-run-plots`
+to generate individual reports; otherwise multi-seed mode writes CSVs and only
+the aggregate plots. `--no-plots` still writes all aggregate CSVs.
+
+Regenerate an aggregate report without rerunning simulations:
+
+```powershell
+python -m map_poisoning.reporting --multiseed outputs\map005_multiseed
+```
+
+Aggregate results are stored below `aggregate\`, including
+`multiseed_runs.csv`, `multiseed_summary.csv`, `paired_method_differences.csv`,
+`batch_validation.json`, and the ten aggregate plots.
 
 ## Rebuild converted maps
 

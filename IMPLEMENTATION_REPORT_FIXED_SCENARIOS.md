@@ -17,14 +17,20 @@ point order) are:
 - `warehouse_005`: robot 0 `[32,28,25,21]`; robot 1 `[29,29,66,20]`; robot 2 `[29,65,36,44]`.
 - `warehouse_005_rotated`: robot 0 `[33,46,21,45]`; robot 1 `[32,19,44,26]`; robot 2 `[39,20,19,19]`.
 
-Validation and task generation are seed-independent. The attacker receives one
-deterministic navigation task because the existing legacy rollout requires a
-task for every robot; it does not receive a benign delivery queue.
+Validation and task generation are seed-independent. The attacker receives the
+same deterministic fixed checkpoint queue as the benign robots. In short runs
+with fewer deliveries than checkpoints, its queue is extended to one complete
+checkpoint cycle so it cannot finish early and park on a shared delivery point.
+Completed robots are moved to deterministic safe parking cells when they would
+block an active task.
 
 Verification:
 
-- `python -m pytest -q`: **23 passed**.
+- `python -m pytest -q`: **37 passed**.
 - All three requested 100-step smoke commands completed successfully.
+- Map 005 seed 15 bounded 400-step regression completed with zero robot overlap
+  violations, idle parking events, and continued task progress.
+- A bounded 30-seed Map 005 batch completed without exceptions.
 - Manifest-only authoring completed for `warehouse_005`.
 - Four-method fairness replay completed with `--max-steps 100`; shared manifest
   fields and method configurations were asserted equal.

@@ -264,18 +264,49 @@ class DefenseMethodRunner:
 
         raise RuntimeError(f"Unhandled defense method: {method}")
 
-    def evidence(self, cell: Cell, timestamp: Optional[int] = None) -> float:
+    @staticmethod
+    def _claim_included(claim, excluded_sender_id=None, excluded_claim_predicate=None):
+        if excluded_sender_id is not None and claim.sender_id == int(excluded_sender_id):
+            if excluded_claim_predicate is None:
+                return False
+            if excluded_claim_predicate(claim):
+                return False
+        if (
+            excluded_sender_id is None
+            and excluded_claim_predicate is not None
+            and excluded_claim_predicate(claim)
+        ):
+            return False
+        return True
+
+    def evidence(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
         if self.method == "majority_vote":
             votes = 0
             for claim in self.claims_by_cell.get(tuple(cell), ()):
-                if now - claim.timestamp <= self.config.max_claim_age:
+                if (
+                    now - claim.timestamp <= self.config.max_claim_age
+                    and self._claim_included(
+                        claim, excluded_sender_id, excluded_claim_predicate
+                    )
+                ):
                     votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
             return float(votes)
         total = 0.0
 
         for claim in self.claims_by_cell.get(tuple(cell), ()):
-            if now - claim.timestamp > self.config.max_claim_age:
+            if (
+                now - claim.timestamp > self.config.max_claim_age
+                or not self._claim_included(
+                    claim, excluded_sender_id, excluded_claim_predicate
+                )
+            ):
                 continue
             total += self._method_weight(claim, now) * self._claim_impact(claim.claim)
 
@@ -323,6 +354,8 @@ class DefenseMethodRunner:
         self,
         cell: Cell,
         timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
     ) -> float:
         """Return occupancy probability, with no claims treated as zero risk.
 
@@ -330,41 +363,93 @@ class DefenseMethodRunner:
         would charge every unreported cell a cost.  Here, an empty claim set is
         explicitly treated as no peer-derived occupancy risk.
         """
-        claims = self.claims_by_cell.get(tuple(cell), ())
+        claims = tuple(
+            claim for claim in self.claims_by_cell.get(tuple(cell), ())
+            if self._claim_included(claim, excluded_sender_id, excluded_claim_predicate)
+        )
         if not claims:
             return 0.0
 
-        value = self.evidence(cell, timestamp)
+        value = self.evidence(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return 1.0 / (1.0 + math.exp(-value))
 
     def normalized_occupied_risk(
         self,
         cell: Cell,
         timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
     ) -> float:
         """Map neutral probability 0.5 to risk 0 and occupied certainty to 1."""
-        probability = self.occupancy_probability(cell, timestamp)
+        probability = self.occupancy_probability(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return min(1.0, max(0.0, 2.0 * (probability - 0.5)))
 
-    def routing_cost(self, cell: Cell, timestamp: Optional[int] = None) -> float:
+    def routing_cost(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> float:
         """Return peer-derived traversal cost for a cell."""
         if self.method == "hard_threshold":
-            return math.inf if self.is_hard_blocked(cell, timestamp) else 1.0
+            return math.inf if self.is_hard_blocked(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) else 1.0
         if self.method == "majority_vote":
             # Majority is a discrete baseline, not a soft evidence method.
             # Positive votes block; free majorities, ties, and no votes add no
             # peer traversal penalty.
-            return math.inf if self.evidence(cell, timestamp) > 0.0 else 1.0
+            return math.inf if self.evidence(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) > 0.0 else 1.0
 
-        risk = self.normalized_occupied_risk(cell, timestamp)
+        risk = self.normalized_occupied_risk(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
-    def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None) -> bool:
+    def is_hard_blocked(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> bool:
         if self.method == "majority_vote":
-            return self.evidence(cell, timestamp) > 0.0
+            return self.evidence(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) > 0.0
         if self.method != "hard_threshold":
             return False
-        probability = self.occupancy_probability(cell, timestamp)
+        probability = self.occupancy_probability(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return probability > self.config.blocked_probability_threshold
 
     def footprint_cost(

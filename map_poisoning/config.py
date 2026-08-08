@@ -61,11 +61,16 @@ class FusionConfig:
 class LoggingConfig:
     output_directory: str = "outputs"
     timeseries_period_steps: int = 5
+    generate_plots: bool = True
+    plot_format: str = "png"
 
 
 @dataclass(frozen=True)
 class VisualizationConfig:
     animation: bool = True
+    fake_influence_min_cost_delta: float = 0.10
+    route_impact_min_cost_delta: float = 0.10
+    route_impact_eval_period_steps: int = 10
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,10 @@ class SimulationConfig:
             if self.scenario_preset not in PRESETS: raise ValueError(f"unknown scenario preset: {self.scenario_preset}")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
+        if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:
+            raise ValueError("visualization metric thresholds must be non-negative")
+        if self.visualization.route_impact_eval_period_steps < 1:
+            raise ValueError("route impact evaluation period must be positive")
 
     @property
     def total_steps(self) -> int: return min(self.phases.total_steps, self.max_steps) if self.max_steps else self.phases.total_steps

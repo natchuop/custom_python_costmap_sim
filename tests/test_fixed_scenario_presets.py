@@ -86,3 +86,17 @@ def test_gui_rejects_known_map_without_matching_preset():
     with pytest.raises(ValueError, match="select that preset"):
         validate_gui_map_preset(str(MAPS["warehouse_005"]), None)
     validate_gui_map_preset(str(MAPS["warehouse_005"]), "warehouse_005")
+
+
+def test_attacker_receives_repeating_fixed_queue_in_short_runs():
+    path = MAPS["warehouse_005"]
+    manifest = author_manifest(
+        SimulationConfig(
+            scenario_preset="warehouse_005",
+            map_npy=str(path),
+            deliveries_per_robot=1,
+        ),
+        load_npy(path),
+    )
+    assert len(manifest.task_queues[0]) > 1
+    assert all(task.pickup != task.dropoff for task in manifest.task_queues[0])

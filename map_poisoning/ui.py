@@ -85,6 +85,8 @@ def launch(args) -> None:
         "interval_min": tk.StringVar(value=str(args.attack_interval_min)),
         "interval_max": tk.StringVar(value=str(args.attack_interval_max)),
         "compare": tk.BooleanVar(value=args.compare),
+        "multi_seed": tk.BooleanVar(value=bool(getattr(args, "seeds", None))),
+        "seeds": tk.StringVar(value=getattr(args, "seeds", None) or "1-3"),
         "animation": tk.BooleanVar(value=not args.no_animation),
     }
     selected_attacks = set() if args.attacks == "none" else set(args.attacks.split(","))
@@ -120,10 +122,13 @@ def launch(args) -> None:
     ttk.Checkbutton(form, text="Compare all primary defenses", variable=values["compare"]).grid(
         row=9, column=0, columnspan=3, sticky="w", pady=(7, 2)
     )
+    ttk.Checkbutton(form, text="Multi-seed experiment", variable=values["multi_seed"]).grid(row=10, column=0, sticky="w", pady=2)
+    ttk.Entry(form, textvariable=values["seeds"], width=18).grid(row=10, column=1, sticky="w", pady=2)
+    seed_preview = ttk.Label(form); seed_preview.grid(row=10, column=2, sticky="w", pady=2)
     ttk.Checkbutton(
         form, text="Show reconnaissance heatmap and simulation animation",
         variable=values["animation"],
-    ).grid(row=10, column=0, columnspan=3, sticky="w", pady=2)
+    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=2)
 
     ttk.Separator(form).grid(row=11, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
@@ -169,6 +174,7 @@ def launch(args) -> None:
             args.output_directory = values["output"].get()
             args.manifest_path = values["manifest"].get().strip() or None
             args.compare = values["compare"].get()
+            args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
             args.no_animation = not values["animation"].get()
             args.recon_steps = int(values["recon"].get())
             args.attack_steps = int(values["attack"].get())
@@ -182,7 +188,13 @@ def launch(args) -> None:
             args.admission_policy = values["admission_policy"].get()
             enabled = [name for name, variable in attack_enabled.items() if variable.get()]
             args.attacks = ",".join(enabled) if enabled else "none"
-            run(config_from_args(args), comparison=args.compare)
+            config = config_from_args(args)
+            if args.seeds:
+                from .batch import parse_seed_spec, run_multiseed
+                methods = config.comparison_methods if args.compare else (config.fusion.method,)
+                run_multiseed(config, parse_seed_spec(args.seeds), methods=methods, comparison=args.compare, generate_per_run_plots=False)
+            else:
+                run(config, comparison=args.compare)
             messagebox.showinfo("Completed", f"Created results in {args.output_directory}")
         except Exception as exc:
             messagebox.showerror("Unable to run", str(exc))
@@ -192,5 +204,17 @@ def launch(args) -> None:
     ttk.Label(footer, text="Close each Matplotlib window to continue to the next one.").pack(side="left")
     ttk.Button(footer, text="Run", command=execute).pack(side="right")
     values["map"].trace_add("write", select_map)
+    def update_preview(*_):
+        try:
+            from .batch import parse_seed_spec
+            count = len(parse_seed_spec(values["seeds"].get()))
+            methods = 4 if values["compare"].get() else 1
+            seed_preview.configure(text=f"{count} seeds x {methods} methods = {count * methods} simulations" if values["multi_seed"].get() else "")
+        except Exception:
+            seed_preview.configure(text="")
+    values["seeds"].trace_add("write", update_preview)
+    values["multi_seed"].trace_add("write", update_preview)
+    values["compare"].trace_add("write", update_preview)
     select_map()
+    update_preview()
     root.mainloop()
