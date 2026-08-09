@@ -103,6 +103,7 @@ def run_manifest_rollout(
             manifest_robot_starts=manifest.robot_starts,
             manifest_task_queues=_manifest_task_queues(manifest),
             manifest_malicious_robot_id=manifest.malicious_robot_id,
+            map_view=config.visualization.map_view,
         )
     finally:
         _restore_legacy_globals(old_phase, old_trust)
@@ -205,7 +206,7 @@ def replay_manifest(
     world, robots, log = run_manifest_rollout(config, manifest, method)
     if show_animation:
         sim2.show_recon_heatmap(world, log)
-        sim2.animate(world, robots, log)
+        sim2.animate(world, robots, log, map_view=config.visualization.map_view)
     summary, collector = collect_rollout_metrics(
         config, manifest, method, world, robots, log
     )

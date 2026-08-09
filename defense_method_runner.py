@@ -47,6 +47,14 @@ class StoredClaim:
     trust_at_report: float
     is_malicious: bool = False
 
+@dataclass(frozen=True)
+class EffectivePeerCell:
+    claim: int | None
+    has_active_evidence: bool
+    hard_blocked: bool
+    routing_cost: float
+    evidence: float
+
 
 @dataclass
 class DefenseConfig:
@@ -387,6 +395,24 @@ class DefenseMethodRunner:
         timestamp: Optional[int] = None,
     ) -> bool:
         return any(self.is_hard_blocked(cell, timestamp) for cell in cells)
+
+    def effective_cells(self, timestamp: Optional[int] = None) -> Dict[Cell, EffectivePeerCell]:
+        """Read-only, method-aware peer state used by combined visualization."""
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        result = {}
+        for cell, claims in self.claims_by_cell.items():
+            active = [claim for claim in claims if now - claim.timestamp <= self.config.max_claim_age]
+            if not active:
+                continue
+            evidence = self.evidence(cell, now)
+            result[cell] = EffectivePeerCell(
+                claim=max(active, key=lambda item: item.timestamp).claim,
+                has_active_evidence=bool(evidence),
+                hard_blocked=self.is_hard_blocked(cell, now),
+                routing_cost=self.routing_cost(cell, now),
+                evidence=evidence,
+            )
+        return result
 
     def snapshot(self, timestamp: Optional[int] = None) -> Dict[str, object]:
         now = self.current_timestamp if timestamp is None else int(timestamp)

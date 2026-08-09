@@ -10,11 +10,16 @@ def export_temp_episodes(
     static_grid: np.ndarray,
     seed: int,
     total_steps: int,
+    change_period: int | None = None,
 ) -> tuple[TemporaryObstacleEpisode, ...]:
     """Mirror ``TemporaryBlockageManager`` reshuffles for manifest replay parity."""
     import sim2
 
-    manager = sim2.TemporaryBlockageManager(np.asarray(static_grid, dtype=int), seed=seed)
+    manager = sim2.TemporaryBlockageManager(
+        np.asarray(static_grid, dtype=int),
+        change_period=change_period or sim2.TEMP_BLOCKAGE_CHANGE_PERIOD_STEPS,
+        seed=seed,
+    )
     period = manager.change_period
     boundaries = [0] + [step for step in range(period, total_steps, period)] + [total_steps]
     episodes: list[TemporaryObstacleEpisode] = []

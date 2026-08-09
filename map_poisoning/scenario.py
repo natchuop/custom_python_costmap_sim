@@ -41,6 +41,20 @@ class ScenarioManifest:
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
 def _cell_choice(rng, cells): return cells[rng.randrange(min(len(cells), 12))]
 
+def _temporary_footprint(grid, rng, preferred):
+    """Choose one valid 1..5 rectangle with at least four physical cells."""
+    rows, cols = grid.shape
+    for _ in range(100):
+        height, width = sim2.sample_rectangle_dimensions(rng)
+        top = (max(1, min(rows - height - 1, preferred[0] - height // 2)),
+               max(1, min(cols - width - 1, preferred[1] - width // 2)))
+        cells = tuple((r, c) for r in range(top[0], top[0] + height)
+                      for c in range(top[1], top[1] + width))
+        if len(cells) >= 4 and all(not grid[cell] for cell in cells):
+            return cells
+    return ((preferred[0], preferred[1]), (preferred[0] + 1, preferred[1]),
+            (preferred[0], preferred[1] + 1), (preferred[0] + 1, preferred[1] + 1))
+
 def _nominal_route_cells(grid) -> list[tuple[int, int]]:
     """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
     rows, cols=grid.shape
@@ -69,7 +83,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     for episode_index,appearance in enumerate(range(max(1, phases.recon_steps - config.temporary_blockage_change_period_steps//2), phases.total_steps, config.temporary_blockage_change_period_steps)):
         cell=route_cells[(episode_index*7 + rng.randrange(min(12,len(route_cells)))) % len(route_cells)]
         clearance = min(phases.total_steps, phases.recon_steps + max(1, phases.attack_steps // 2))
-        episodes.append(TemporaryObstacleEpisode(f"obstacle-{episode_index:03}",(cell,),appearance,clearance))
+        episodes.append(TemporaryObstacleEpisode(f"obstacle-{episode_index:03}",_temporary_footprint(grid, rng, cell),appearance,clearance))
     episodes=tuple(episodes)
     candidate_metadata=[]; use_count: dict[tuple[int,int],int]={}; selected=[]
     while step < phases.recon_steps + phases.attack_steps and enabled:
@@ -78,11 +92,29 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         if feasible:
             kind = feasible_types[rng.randrange(len(feasible_types))]
             episode = None
+            footprint_height = footprint_width = None
             if kind == AttackType.FAKE_OBSTACLE:
-                eligible=[cell for cell in route_cells if use_count.get(cell,0) < config.attacks.max_uses_per_footprint and all(cell == old or abs(cell[0]-old[0])+abs(cell[1]-old[1]) >= config.attacks.min_center_spacing for old in selected)]
+                eligible=[cell for cell in route_cells if use_count.get(cell,0) < config.attacks.max_uses_per_footprint and all(abs(cell[0]-old[0])+abs(cell[1]-old[1]) >= config.attacks.min_center_spacing for old in selected)]
                 if not eligible: break
                 center = _cell_choice(rng, eligible)
-                footprint = [(r, c) for r in range(center[0]-3, center[0]+4) for c in range(center[1]-2, center[1]+3) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
+                height, width = sim2.sample_rectangle_dimensions(rng)
+                footprint_height, footprint_width = height, width
+                # Keep the first legacy-manifest fake large enough for older
+                # consumers while subsequent events exercise the full 1..5
+                # rectangular sampler.
+                if index == 0:
+                    while height * width < 15:
+                        height, width = sim2.sample_rectangle_dimensions(rng)
+                footprint = [(r, c) for r in range(center[0] - height // 2, center[0] - height // 2 + height) for c in range(center[1] - width // 2, center[1] - width // 2 + width) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
+                for _ in range(20):
+                    if len(footprint) >= (15 if index == 0 else 4):
+                        break
+                    height, width = sim2.sample_rectangle_dimensions(rng)
+                    footprint_height, footprint_width = height, width
+                    footprint = [(r, c) for r in range(center[0] - height // 2, center[0] - height // 2 + height) for c in range(center[1] - width // 2, center[1] - width // 2 + width) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
+                if len(footprint) < 4:
+                    step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
+                    continue
                 cell, claim, observation = center, ClaimType.BLOCKED, step
             elif kind == AttackType.FALSE_CLEARANCE:
                 episode = _cell_choice(rng, [e for e in episodes if e.appearance_step <= step < e.clearance_step]); cell, claim, observation = episode.cells[0], ClaimType.FREE, step
@@ -92,7 +124,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
             report_ids = tuple(f"report-{index:04}-{n:02}" for n in range(len(attack_cells)))
             events.append(AttackEvent(eid, step, kind, attack_cells, claim, observation, sender, benign, report_ids, episode.episode_id if episode else None)); index += 1
             use_count[cell]=use_count.get(cell,0)+1; selected.append(cell)
-            candidate_metadata.append({"candidate_id":f"candidate-{index-1:04}","center":cell,"footprint_cells":list(attack_cells),"traffic_score":None,"bottleneck_score":None,"estimated_detour_score":None,"rank":None,"selection_weight":None,"prior_use_count":use_count[cell]-1})
+            candidate_metadata.append({"candidate_id":f"candidate-{index-1:04}","center":cell,"footprint_cells":list(attack_cells),"footprint_height":footprint_height,"footprint_width":footprint_width,"traffic_score":None,"bottleneck_score":None,"estimated_detour_score":None,"rank":None,"selection_weight":None,"prior_use_count":use_count[cell]-1})
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
@@ -119,7 +151,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             grid=grid,
             prior_grid=grid,
             tasks_per_robot=config.deliveries_per_robot,
-            max_steps=config.phases.recon_steps + 1,
+            max_steps=config.phases.total_steps,
             random_seed=config.seed,
             experiment_mode="clean",
         )
@@ -139,13 +171,38 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = old_overlap
     if not candidates:
         raise RuntimeError("clean warehouse rollout produced no manifest attack candidates")
+
+    def candidates_at_step(step):
+        """Score attack candidates against clean traffic/routes at this step."""
+        frame = min(max(0, int(step)), len(log["traffic_heatmap"]) - 1)
+        for robot in robots:
+            rid = robot.robot_id
+            robot.path = list(log["robots"][rid]["path"][frame])
+            robot.path_index = 0
+            robot.position_cell = tuple(log["robots"][rid]["position"][frame])
+        old_overlap = sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP
+        sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = True
+        try:
+            return sim2.recon_heatmap_attack_candidates(
+                world,
+                log["goals"],
+                robots,
+                log["traffic_heatmap"][frame],
+            )
+        finally:
+            sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = old_overlap
     attacker = log["malicious_robot_id"]
     recipients = tuple(r.robot_id for r in robots if not r.is_malicious)
     rng = named_rng(config.seed, "warehouse_manifest_scheduler")
     enabled_types = [AttackType(x) for x in config.attacks.enabled]
     prior = robots[0].belief_map.initial_prior
     static = np.asarray(prior, dtype=np.uint8)
-    episodes = export_temp_episodes(static, config.seed, config.phases.total_steps)
+    episodes = export_temp_episodes(
+        static,
+        config.seed,
+        config.phases.total_steps,
+        config.temporary_blockage_change_period_steps,
+    )
     events = []
     metadata = []
     warnings = []
@@ -156,14 +213,15 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     )
     index = 0
     while step < config.phases.recon_steps + config.phases.attack_steps:
-        feasible_types = [kind for kind in enabled_types if kind == AttackType.FAKE_OBSTACLE or kind == AttackType.FALSE_CLEARANCE or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes))]
+        feasible_types = [kind for kind in enabled_types if kind == AttackType.FAKE_OBSTACLE or (kind == AttackType.FALSE_CLEARANCE and any(e.appearance_step <= step < e.clearance_step for e in episodes)) or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes))]
         if not feasible_types:
             break
         selected_attack = feasible_types[rng.randrange(len(feasible_types))]
         if selected_attack != AttackType.FAKE_OBSTACLE:
             eligible = [e for e in episodes if (selected_attack == AttackType.FALSE_CLEARANCE and e.appearance_step <= step < e.clearance_step) or (selected_attack == AttackType.STALE_REASSERTION and e.clearance_step <= step)]
             if not eligible and selected_attack == AttackType.FALSE_CLEARANCE:
-                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", tuple(tuple(cell) for cell in candidates[0]["report_cells"][:9]), step - 1, step + 1)
+                fallback_cells = tuple(tuple(cell) for cell in candidates[0]["report_cells"][: max(4, min(25, len(candidates[0]["report_cells"])) )])
+                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", fallback_cells, max(0, step - 1), step + 1)
                 episodes = episodes + (episode,)
                 eligible = [episode]
             if not eligible:
@@ -174,7 +232,8 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 any(cell in other.cells and other.appearance_step <= step < other.clearance_step for other in episodes)
                 for cell in episode.cells
             ):
-                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", tuple(tuple(cell) for cell in candidates[0]["report_cells"][:9]), step - 2, step - 1)
+                fallback_cells = tuple(tuple(cell) for cell in candidates[0]["report_cells"][: max(4, min(25, len(candidates[0]["report_cells"])) )])
+                episode = TemporaryObstacleEpisode(f"attack-obstacle-{index:04}", fallback_cells, max(0, step - 2), max(1, step - 1))
                 episodes = episodes + (episode,)
             claim = ClaimType.FREE if selected_attack == AttackType.FALSE_CLEARANCE else ClaimType.BLOCKED
             cells = tuple(episode.cells)
@@ -182,14 +241,14 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             index += 1
             step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
             continue
-        pool = candidates[:config.attacks.candidate_top_k]
+        step_candidates = candidates_at_step(step)
+        pool = (step_candidates or candidates)[:config.attacks.candidate_top_k]
         eligible = [
             candidate
             for candidate in pool
             if uses.get(tuple(candidate["center_cell"]), 0) < config.attacks.max_uses_per_footprint
             and all(
-                tuple(candidate["center_cell"]) == old
-                or abs(candidate["center_cell"][0] - old[0])
+                abs(candidate["center_cell"][0] - old[0])
                 + abs(candidate["center_cell"][1] - old[1])
                 >= config.attacks.min_center_spacing
                 for old in selected_centers
@@ -220,11 +279,16 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 "candidate_id": f"warehouse-{index:04}",
                 "center": center,
                 "footprint_cells": cells,
+                "footprint_height": candidate.get("footprint_height"),
+                "footprint_width": candidate.get("footprint_width"),
                 "route_overlap": candidate["path_overlap"],
                 "traffic_score": candidate["traffic_score"],
                 "bottleneck_score": candidate["bottleneck_score"],
                 "estimated_detour_score": candidate["path_proximity_score"],
-                "rank": candidates.index(candidate) + 1,
+                "rank": (step_candidates.index(candidate) + 1
+                         if candidate in step_candidates
+                         else candidates.index(candidate) + 1
+                         if candidate in candidates else None),
                 "selection_weight": 1 / len(eligible),
                 "prior_use_count": uses.get(center, 0),
             }

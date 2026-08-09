@@ -1,4 +1,6 @@
 from dataclasses import replace
+import contextlib
+import io
 from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, VisualizationConfig
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.models import ClaimReport, ClaimType, DeliveryTask, VerificationOutcome
@@ -42,17 +44,17 @@ def test_lidar_detects_temporary_obstacle_in_view():
     assert observations[(5, 4)] == ClaimType.BLOCKED
 
 
-def test_temporary_objects_shift_without_teleporting():
+def test_temporary_objects_use_seeded_movement_modes():
     manager = TemporaryBlockageManager(demo_grid(24, 30), active_count=1, change_period=10, seed=3)
     before_index = next(iter(manager.active_indices))
     before = manager.current_footprints[before_index][0]
     manager.refresh_active_blockages()
     after_index = next(iter(manager.active_indices))
     after = manager.current_footprints[after_index][0]
-    before_center = tuple(round(value, 1) for value in sim2.footprint_center(before))
-    after_center = tuple(round(value, 1) for value in sim2.footprint_center(after))
     assert after_index == before_index
-    assert abs(after_center[0] - before_center[0]) + abs(after_center[1] - before_center[1]) <= 2
+    assert manager.movement_decisions[after_index] in {"shift", "teleport", "unchanged"}
+    assert len(before) == len(after)
+    assert manager.current_footprints[after_index][1] == manager.pool[after_index][1]
 
 
 def test_each_attack_type_reaches_benign_replanning():
@@ -119,3 +121,30 @@ def test_recipients_keep_independent_belief_and_trust_state():
     assert (3,3) not in second.fusion.claims
     first.trust.update(0, VerificationOutcome.CONTRADICTED_FRESH)
     assert first.trust.score(0) < second.trust.score(0)
+
+
+def test_benign_shared_blocked_observations_reach_combined_map():
+    for method in ("source_linked", "soft_probability"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            _, robots, log = sim2.run_simulation(
+                tasks_per_robot=100,
+                max_steps=300,
+                random_seed=15,
+                experiment_mode="clean",
+                defense_method=method,
+                map_view="combined",
+            )
+
+        for receiver, sender in ((1, 2), (2, 1)):
+            accepted_blocked = {
+                claim.target_cell
+                for claims in robots[receiver].defense_runner.claims_by_cell.values()
+                for claim in claims
+                if claim.sender_id == sender and claim.claim == sim2.ClaimType.BLOCKED
+            }
+            displayed_orange = {
+                tuple(cell)
+                for frame in log["robots"][receiver]["combined_belief"]
+                for cell in np.argwhere(frame == sim2.DISPLAY_PEER_BELIEF)
+            }
+            assert accepted_blocked & displayed_orange

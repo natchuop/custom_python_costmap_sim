@@ -33,8 +33,10 @@ def launch(args) -> None:
         "max_steps": tk.StringVar(value="" if args.max_steps is None else str(args.max_steps)),
         "interval_min": tk.StringVar(value=str(args.attack_interval_min)),
         "interval_max": tk.StringVar(value=str(args.attack_interval_max)),
+        "temp_interval": tk.StringVar(value=str(getattr(args, "temp_obstacle_interval", 150))),
         "compare": tk.BooleanVar(value=args.compare),
         "animation": tk.BooleanVar(value=not args.no_animation),
+        "map_view": tk.StringVar(value=getattr(args, "map_view", "combined")),
     }
     selected_attacks = set() if args.attacks == "none" else set(args.attacks.split(","))
     attack_enabled = {
@@ -69,24 +71,26 @@ def launch(args) -> None:
         text="Show reconnaissance heatmap and simulation animation",
         variable=values["animation"],
     ).grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
+    dropdown("Belief map view", "map_view", ("combined", "local"), 7)
 
-    ttk.Separator(form).grid(row=7, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Separator(form).grid(row=8, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
-        row=8, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        row=9, column=0, columnspan=3, sticky="w", pady=(0, 4)
     )
-    entry("Reconnaissance steps", "recon", 9)
-    entry("Poisoning steps", "attack", 10)
-    entry("Recovery steps", "recovery", 11)
-    entry("Deliveries per robot", "deliveries", 12)
-    entry("Maximum steps (optional)", "max_steps", 13)
-    entry("Attack interval: minimum steps", "interval_min", 14)
-    entry("Attack interval: maximum steps", "interval_max", 15)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 16)
+    entry("Reconnaissance steps", "recon", 10)
+    entry("Poisoning steps", "attack", 11)
+    entry("Recovery steps", "recovery", 12)
+    entry("Deliveries per robot", "deliveries", 13)
+    entry("Maximum steps (optional)", "max_steps", 14)
+    entry("Attack interval: minimum steps", "interval_min", 15)
+    entry("Attack interval: maximum steps", "interval_max", 16)
+    entry("Temporary obstacle movement interval", "temp_interval", 17)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 18)
     dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 17
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 19
     )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame,
@@ -104,6 +108,7 @@ def launch(args) -> None:
             args.manifest_path = values["manifest"].get().strip() or None
             args.compare = values["compare"].get()
             args.no_animation = not values["animation"].get()
+            args.map_view = values["map_view"].get()
             args.recon_steps = int(values["recon"].get())
             args.attack_steps = int(values["attack"].get())
             args.recovery_steps = int(values["recovery"].get())
@@ -112,6 +117,7 @@ def launch(args) -> None:
             args.max_steps = int(max_steps) if max_steps else None
             args.attack_interval_min = int(values["interval_min"].get())
             args.attack_interval_max = int(values["interval_max"].get())
+            args.temp_obstacle_interval = int(values["temp_interval"].get())
             args.trust_model = values["trust_model"].get()
             args.admission_policy = values["admission_policy"].get()
             enabled = [name for name, variable in attack_enabled.items() if variable.get()]
