@@ -69,4 +69,9 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
                 heat_log,
                 output_path=root / "traffic_heatmap.png",
             )
+        from .reporting import generate_comparison_report
+        generate_comparison_report(
+            root,
+            formats=(config.logging.plot_format,) if config.logging.generate_plots else (),
+        )
     return results

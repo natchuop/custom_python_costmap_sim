@@ -58,6 +58,8 @@ def launch(args) -> None:
         "map": tk.StringVar(value=(next((label for label, (path, _) in MAP_OPTIONS.items() if path and args.map_npy and Path(path).resolve() == Path(args.map_npy).resolve()), "Custom NPY" if args.map_npy else "Default Warehouse"))),
         "map_path": tk.StringVar(value=args.map_npy or ""),
         "scenario_preset": tk.StringVar(value=args.scenario_preset or _preset_for_map_path(args.map_npy) or ""),
+        "multi_seed": tk.BooleanVar(value=bool(args.seeds)),
+        "seeds": tk.StringVar(value=args.seeds or "1-3"),
         "seed": tk.StringVar(value=str(args.seed)),
         "trust_model": tk.StringVar(value=args.trust_model),
         "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.55))),
@@ -162,6 +164,12 @@ def launch(args) -> None:
             variable=attack_enabled[attack.value],
         ).grid(row=0, column=column, sticky="w", padx=(0, 12))
 
+    batch_frame = ttk.LabelFrame(form, text="Multi-seed experiment", padding=7)
+    batch_frame.grid(row=29, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    ttk.Checkbutton(batch_frame, text="Run seed specification", variable=values["multi_seed"]).grid(row=0, column=0, sticky="w")
+    ttk.Label(batch_frame, text="Seeds").grid(row=0, column=1, sticky="e", padx=(18, 4))
+    ttk.Entry(batch_frame, textvariable=values["seeds"], width=18).grid(row=0, column=2, sticky="w")
+
     form.columnconfigure(1, weight=1)
 
     def select_map(*_):
@@ -178,6 +186,8 @@ def launch(args) -> None:
             args.map_movingai = None
             args.scenario_preset = values["scenario_preset"].get().strip() or None
             validate_gui_map_preset(args.map_npy, args.scenario_preset)
+            args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
+            args.per_run_plots = False
             args.seed = int(values["seed"].get())
             selected_methods = tuple(
                 method for method in ALL_METHODS if method_enabled[method].get()
@@ -217,7 +227,7 @@ def launch(args) -> None:
             messagebox.showerror("Unable to run", str(exc))
 
     footer = ttk.Frame(form)
-    footer.grid(row=28, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+    footer.grid(row=30, column=0, columnspan=3, sticky="ew", pady=(16, 0))
     ttk.Label(footer, text="Close each Matplotlib window to continue to the next one.").pack(side="left")
     ttk.Button(footer, text="Run", command=execute).pack(side="right")
     root.mainloop()
