@@ -72,7 +72,10 @@ TEMP_BLOCKAGE_CHANGE_PERIOD_STEPS = 150
 ENABLE_AUTO_TEMP_OBJECTS_FOR_LOADED_MAPS = True
 
 SHOW_ANIMATION = True
-ANIMATION_INTERVAL_MS = 1
+# A 1 ms timer overwhelms Matplotlib's event loop because each playback frame
+# redraws four maps and their sensor rays. A normal display cadence gives the
+# GUI time to process input while the animation reuses its line artists.
+ANIMATION_INTERVAL_MS = 20
 
 CELL_SIZE = 1.0
 ROBOT_SPEED_CELLS_PER_STEP = 1.0
@@ -139,6 +142,7 @@ ATTACK_TRAFFIC_HIGH_PERCENTILE = 95
 # will receive malicious BLOCKED reports.
 MALICIOUS_FAKE_OBJECT_ROWS = 5
 MALICIOUS_FAKE_OBJECT_COLS = 5
+MALICIOUS_FAKE_OBJECT_MAX_SIDE = 7
 
 # Prefer fake objects that block several usable cells, not one sad pixel of deception.
 MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS = 4
@@ -441,6 +445,14 @@ def sample_rectangle_dimensions(rng, min_side=1, max_side=RECTANGLE_MAX_SIDE,
         if height * width >= min_area:
             return height, width
     return min_side, max(min_side, (min_area + min_side - 1) // min_side)
+
+
+def sample_fake_obstacle_dimensions(rng):
+    """Sample a malicious fake-object rectangle with sides up to seven cells."""
+    return sample_rectangle_dimensions(
+        rng,
+        max_side=MALICIOUS_FAKE_OBJECT_MAX_SIDE,
+    )
 
 
 def can_place_temporary_footprint(grid, cells, forbidden_cells=None):
@@ -2652,7 +2664,7 @@ def recon_heatmap_attack_candidates(
             ):
                 continue
 
-            height, width = sample_rectangle_dimensions(rng)
+            height, width = sample_fake_obstacle_dimensions(rng)
             report_cells = fake_object_report_cells(cell, world, goals, robots, height, width)
             if len(report_cells) < MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS:
                 continue
@@ -4959,7 +4971,8 @@ def run_simulation(
                 for cell in event.cells:
                     active_attack_overlays[(event.attack_type.value, tuple(cell))] = (step, event.attack_type.value)
                 if (
-                    getattr(event.attack_type, "value", event.attack_type) == "fake_obstacle"
+                    getattr(event.attack_type, "value", event.attack_type)
+                    in {"fake_obstacle", "stale_reassertion"}
                     and int(event.sender_id) == 0
                     and int(event.claim) == int(ClaimType.BLOCKED)
                 ):
@@ -5235,29 +5248,50 @@ def run_simulation(
                         and 0 <= r < effective.shape[0]
                         and 0 <= c < effective.shape[1]
                         and not is_blocking_state(robot.belief_map.initial_prior[r, c])):
-                    # Own direct sensing remains authoritative in the display.
-                    if robot.belief_map.source[r, c] != "self_sensor":
-                        source_id = state.dominant_source
+                    source_id = state.dominant_source
+                    direct_state = CellState(int(robot.belief_map.belief[r, c]))
+                    direct_blocked = (
+                        robot.belief_map.source[r, c] == "self_sensor"
+                        and direct_state in (
+                            CellState.OCCUPIED_DYNAMIC,
+                            CellState.TEMPORARILY_BLOCKED,
+                        )
+                    )
+                    # Combined maps expose effective peer claims even when a
+                    # robot has directly sensed the cell FREE. This makes a
+                    # peer/local disagreement visible without changing the
+                    # direct-sensor precedence used by navigation. Preserve a
+                    # robot's own color for a directly sensed physical block.
+                    if not direct_blocked:
                         effective[r, c] = ROBOT_BELIEF_DISPLAY.get(
                             source_id, DISPLAY_PEER_BELIEF
                         )
-                        peer_cells.append((r, c, state.claim, state.routing_cost, state.evidence))
-                        peer_provenance.append({
-                            "cell": (r, c),
-                            "senders": sorted({
-                                claim.sender_id
-                                for claim in robot.defense_runner.claims_for(cell)
-                                if step - claim.timestamp <= robot.defense_runner.config.max_claim_age
-                            }),
-                            "claim": state.claim,
-                            "evidence": state.evidence,
-                            "dominant_source": source_id,
-                            "supporting_sources": list(state.supporting_sources),
-                            "dominant_trust": (
-                                robot.trust_for(source_id)
-                                if source_id is not None else None
-                            ),
-                        })
+                    peer_cells.append((r, c, state.claim, state.routing_cost, state.evidence))
+                    peer_provenance.append({
+                        "cell": (r, c),
+                        "senders": sorted({
+                            claim.sender_id
+                            for claim in robot.defense_runner.claims_for(cell)
+                            if step - claim.timestamp <= robot.defense_runner.config.max_claim_age
+                        }),
+                        "claim": state.claim,
+                        "evidence": state.evidence,
+                        "dominant_source": source_id,
+                        "supporting_sources": list(state.supporting_sources),
+                        "direct_sensor_conflict": bool(
+                            robot.belief_map.source[r, c] == "self_sensor"
+                            and direct_state in (
+                                CellState.FREE,
+                                CellState.PICKUP,
+                                CellState.DROPOFF,
+                                CellState.CHARGING,
+                            )
+                        ),
+                        "dominant_trust": (
+                            robot.trust_for(source_id)
+                            if source_id is not None else None
+                        ),
+                    })
             rlog["combined_belief"].append(effective)
             rlog["effective_peer_cells"].append(peer_cells)
             rlog.setdefault("peer_provenance", []).append(peer_provenance)
@@ -5735,6 +5769,26 @@ def fake_obstacle_history_cells(history, victim_id, step):
             cells.update(tuple(cell) for cell in record.get("cells", ()))
     return sorted(cells)
 
+
+def recent_malicious_blocked_claim_cells(history, victim_id, step):
+    """Return recent R0 fake/stale blocked-claim cells for a victim map.
+
+    ``attack_overlays`` are drawn on the ground-truth panel for every attack
+    type, but the victim-map outline is intentionally limited to malicious
+    BLOCKED claims.  False-clearance claims are FREE claims and therefore do
+    not represent an alleged obstacle to outline.
+    """
+    cells = set()
+    blocked_attack_types = {"fake_obstacle", "stale_reassertion"}
+    for record in history.get(int(victim_id), ()):
+        if int(record.get("attacker_id", -1)) != 0:
+            continue
+        if record.get("attack_type") not in blocked_attack_types:
+            continue
+        if int(step) < int(record.get("expires_step", -1)):
+            cells.update(tuple(cell) for cell in record.get("cells", ()))
+    return sorted(cells)
+
 def make_display_array(
     grid,
     robot_positions=None,
@@ -5932,6 +5986,34 @@ def draw_lidar_rays(ax, lidar_rays, color="cyan", linewidth=0.45, alpha=0.18):
 
     return lines
 
+
+def update_lidar_rays(lines, lidar_rays):
+    """Update existing ray artists without removing/recreating them."""
+    for line, ray in zip(lines, lidar_rays or ()):
+        if len(ray) < 2:
+            line.set_visible(False)
+            continue
+        xs = [(point[0] / CELL_SIZE) - 0.5 for point in ray]
+        ys = [(point[1] / CELL_SIZE) - 0.5 for point in ray]
+        line.set_data(xs, ys)
+        line.set_visible(True)
+
+    for line in lines[len(lidar_rays or ()):]:
+        line.set_visible(False)
+
+
+def update_path_line(line, path):
+    """Update one reusable path artist for the current playback frame."""
+    if path:
+        line.set_data(
+            [cell[1] for cell in path],
+            [cell[0] for cell in path],
+        )
+        line.set_visible(True)
+    else:
+        line.set_data([], [])
+        line.set_visible(False)
+
 def draw_robot_footprint(ax, anchor_cell, **kwargs):
     """
     Draws the robot footprint as a rectangle.
@@ -6050,9 +6132,9 @@ def animate(world, robots, log, map_view=None):
         origin="upper",
     )
 
-    truth_path_lines = []
+    truth_path_lines = {}
     truth_robot_patches = {}
-    truth_lidar_lines = []
+    truth_lidar_lines = {}
 
     for robot in robots:
         rid = robot.robot_id
@@ -6136,6 +6218,13 @@ def animate(world, robots, log, map_view=None):
             )
             ax.add_patch(lidar_range)
             belief_lidar_range_patches[rid] = lidar_range
+            belief_lidar_lines[rid] = draw_lidar_rays(
+                ax,
+                log["robots"][rid]["lidar_rays"][0],
+                color=ROBOT_COLORS.get(rid, "#00bcd4"),
+                linewidth=0.45,
+                alpha=0.28,
+            )
 
         patch = draw_robot_footprint(
             ax,
@@ -6147,10 +6236,35 @@ def animate(world, robots, log, map_view=None):
         belief_robot_patches[rid] = patch
         belief_attack_outline_patches[rid] = []
 
-        belief_path_lines[rid] = []
+        belief_path_lines[rid] = ax.plot(
+            [],
+            [],
+            color=ROBOT_COLORS.get(rid, "#555555"),
+            linewidth=1.2,
+            alpha=0.45,
+        )[0]
         ax.set_xlim(-0.5, first_belief.shape[1] - 0.5)
         ax.set_ylim(first_belief.shape[0] - 0.5, -0.5)
         ax.set_autoscale_on(False)
+
+    for robot in robots:
+        rid = robot.robot_id
+        truth_path_lines[rid] = truth_ax.plot(
+            [],
+            [],
+            color=ROBOT_COLORS.get(rid, "#555555"),
+            linewidth=1.2,
+            alpha=0.45,
+        )[0]
+        truth_lidar_lines[rid] = []
+        if SHOW_LIDAR_RAYS:
+            truth_lidar_lines[rid] = draw_lidar_rays(
+                truth_ax,
+                log["robots"][rid]["lidar_rays"][0],
+                color="cyan" if not robot.is_malicious else "magenta",
+                linewidth=0.35,
+                alpha=0.16,
+            )
 
     # The lower-row titles use three lines. Keep the upper-row x tick labels
     # out of that title area; the bottom row still carries the shared col axes.
@@ -6194,18 +6308,18 @@ def animate(world, robots, log, map_view=None):
         transform=trust_ax.transAxes,
     )
     trust_pairs = [
-        (sender.robot_id, observer.robot_id)
-        for sender in robots
+        (observer.robot_id, sender.robot_id)
         for observer in robots
+        for sender in robots
         if sender.robot_id != observer.robot_id
     ]
     trust_table = trust_ax.table(
         cellText=[
-            [f"R{sender_id} -> R{observer_id}", f"{TRUST_ACCEPT_THRESHOLD:.2f}", "TRUSTED"]
-            for sender_id, observer_id in trust_pairs
+            [f"R{observer_id}", f"R{sender_id}", f"{TRUST_ACCEPT_THRESHOLD:.2f}", "TRUSTED"]
+            for observer_id, sender_id in trust_pairs
         ],
-        colLabels=("Sender -> Observer", "Score", "State"),
-        colWidths=(0.47, 0.18, 0.27),
+        colLabels=("Observer", "Sender", "Score", "State"),
+        colWidths=(0.20, 0.20, 0.18, 0.27),
         cellLoc="left",
         colLoc="left",
         bbox=(0.04, 0.12, 0.92, 0.68),
@@ -6219,10 +6333,10 @@ def animate(world, robots, log, map_view=None):
         cell.get_text().set_fontfamily("DejaVu Sans")
         if row == 0:
             cell.get_text().set_fontweight("bold")
-        if column == 1:
+        if column == 2:
             cell.get_text().set_ha("center")
     for row in range(1, len(trust_pairs) + 1):
-        trust_table[(row, 1)].get_text().set_ha("center")
+        trust_table[(row, 2)].get_text().set_ha("center")
 
     latest_attack_text = latest_attack_ax.text(
         0.05,
@@ -6290,9 +6404,9 @@ def animate(world, robots, log, map_view=None):
             Patch(facecolor=ROBOT_COLORS[1], label="Robot 1 source (orange)"),
             Patch(facecolor=ROBOT_COLORS[2], label="Robot 2 source (blue)"),
             Patch(facecolor="#ffeb3b", label="Goal/checkpoint"),
-            Patch(facecolor="#e53935", label="Attack overlay"),
+            Patch(facecolor="#e53935", label="Attack claim overlay (not physical)"),
             Patch(facecolor="#ef9a9a", label="False clearance"),
-            Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 fake obstacle"),
+            Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 blocked claim"),
         ],
         loc="upper left",
         ncol=4,
@@ -6301,7 +6415,7 @@ def animate(world, robots, log, map_view=None):
     )
 
     def update(frame):
-        nonlocal truth_path_lines, truth_lidar_lines, display_index, first_tick
+        nonlocal display_index, first_tick
         if first_tick:
             first_tick = False
         elif not paused:
@@ -6330,47 +6444,20 @@ def animate(world, robots, log, map_view=None):
 
             artists.append(truth_robot_patches[rid])
 
-        for line in truth_path_lines:
-            line.remove()
-        truth_path_lines = []
-
-        for line in truth_lidar_lines:
-            line.remove()
-        truth_lidar_lines = []
-
         if SHOW_LIDAR_RAYS:
             for robot in robots:
                 rid = robot.robot_id
                 lidar_rays = log["robots"][rid]["lidar_rays"][frame]
-
-                ray_color = "cyan" if not robot.is_malicious else "magenta"
-
-                new_lidar_lines = draw_lidar_rays(
-                    truth_ax,
-                    lidar_rays,
-                    color=ray_color,
-                    linewidth=0.35,
-                    alpha=0.16,
-                )
-
-                truth_lidar_lines.extend(new_lidar_lines)
-                artists.extend(new_lidar_lines)
+                update_lidar_rays(truth_lidar_lines[rid], lidar_rays)
+                artists.extend(truth_lidar_lines[rid])
 
         for robot in robots:
             rid = robot.robot_id
-            path = log["robots"][rid]["path"][frame]
-
-            if path:
-                color = ROBOT_COLORS.get(rid, "#555555")
-                line = draw_path(
-                    truth_ax,
-                    path,
-                    color=color,
-                    linewidth=1.2,
-                    alpha=0.45,
-                )
-                truth_path_lines.append(line)
-                artists.append(line)
+            update_path_line(
+                truth_path_lines[rid],
+                log["robots"][rid]["path"][frame],
+            )
+            artists.append(truth_path_lines[rid])
 
         for robot in robots:
             rid = robot.robot_id
@@ -6403,15 +6490,9 @@ def animate(world, robots, log, map_view=None):
                 lidar_range = belief_lidar_range_patches[rid]
                 lidar_range.center = (c, r)
                 artists.append(lidar_range)
-
-                for line in belief_lidar_lines[rid]:
-                    line.remove()
-                belief_lidar_lines[rid] = draw_lidar_rays(
-                    belief_axes[rid],
+                update_lidar_rays(
+                    belief_lidar_lines[rid],
                     log["robots"][rid]["lidar_rays"][frame],
-                    color=ROBOT_COLORS.get(rid, "#00bcd4"),
-                    linewidth=0.45,
-                    alpha=0.28,
                 )
                 artists.extend(belief_lidar_lines[rid])
 
@@ -6426,29 +6507,21 @@ def animate(world, robots, log, map_view=None):
             if selected_view == "combined" and not robot.is_malicious:
                 history_frames = log.get("fake_obstacle_history", [])
                 history_at_frame = history_frames[frame] if frame < len(history_frames) else {}
-                malicious_cells = fake_obstacle_history_cells(history_at_frame, rid, frame)
+                malicious_cells = recent_malicious_blocked_claim_cells(
+                    history_at_frame,
+                    rid,
+                    frame,
+                )
                 belief_attack_outline_patches[rid] = draw_attack_outlines(
                     belief_axes[rid], malicious_cells
                 )
                 artists.extend(belief_attack_outline_patches[rid])
 
-            for line in belief_path_lines[rid]:
-                line.remove()
-            belief_path_lines[rid] = []
-
-            path = log["robots"][rid]["path"][frame]
-
-            if path:
-                color = ROBOT_COLORS.get(rid, "#555555")
-                line = draw_path(
-                    belief_axes[rid],
-                    path,
-                    color=color,
-                    linewidth=1.2,
-                    alpha=0.45,
-                )
-                belief_path_lines[rid].append(line)
-                artists.append(line)
+            update_path_line(
+                belief_path_lines[rid],
+                log["robots"][rid]["path"][frame],
+            )
+            artists.append(belief_path_lines[rid])
 
         malicious_robot_id = log["malicious_robot_id"]
 
@@ -6518,7 +6591,7 @@ def animate(world, robots, log, map_view=None):
                 f"Reports sent: {len(matching_reports)}",
             ]
 
-        for row, (sender_id, observer_id) in enumerate(trust_pairs, start=1):
+        for row, (observer_id, sender_id) in enumerate(trust_pairs, start=1):
             trust_frame = log["robots"][observer_id].get("trust", [])
             snapshot = trust_frame[frame] if frame < len(trust_frame) else {}
             value = (
@@ -6535,10 +6608,11 @@ def animate(world, robots, log, map_view=None):
                 else value
             )
             state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
-            trust_table[(row, 0)].get_text().set_text(f"R{sender_id} -> R{observer_id}")
-            trust_table[(row, 1)].get_text().set_text(f"{trust:.2f}")
-            trust_table[(row, 2)].get_text().set_text(state)
-            trust_table[(row, 2)].get_text().set_color(
+            trust_table[(row, 0)].get_text().set_text(f"R{observer_id}")
+            trust_table[(row, 1)].get_text().set_text(f"R{sender_id}")
+            trust_table[(row, 2)].get_text().set_text(f"{trust:.2f}")
+            trust_table[(row, 3)].get_text().set_text(state)
+            trust_table[(row, 3)].get_text().set_color(
                 "#2e7d32" if state == "TRUSTED" else "#c62828"
             )
 

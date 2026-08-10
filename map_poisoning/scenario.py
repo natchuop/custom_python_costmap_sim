@@ -105,19 +105,19 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
                 eligible=[cell for cell in route_cells if use_count.get(cell,0) < config.attacks.max_uses_per_footprint and all(abs(cell[0]-old[0])+abs(cell[1]-old[1]) >= config.attacks.min_center_spacing for old in selected)]
                 if not eligible: break
                 center = _cell_choice(rng, eligible)
-                height, width = sim2.sample_rectangle_dimensions(rng)
+                height, width = sim2.sample_fake_obstacle_dimensions(rng)
                 footprint_height, footprint_width = height, width
                 # Keep the first legacy-manifest fake large enough for older
-                # consumers while subsequent events exercise the full 1..5
+                # consumers while subsequent events exercise the full 1..7
                 # rectangular sampler.
                 if index == 0:
                     while height * width < 15:
-                        height, width = sim2.sample_rectangle_dimensions(rng)
+                        height, width = sim2.sample_fake_obstacle_dimensions(rng)
                 footprint = [(r, c) for r in range(center[0] - height // 2, center[0] - height // 2 + height) for c in range(center[1] - width // 2, center[1] - width // 2 + width) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
                 for _ in range(20):
                     if len(footprint) >= (15 if index == 0 else 4):
                         break
-                    height, width = sim2.sample_rectangle_dimensions(rng)
+                    height, width = sim2.sample_fake_obstacle_dimensions(rng)
                     footprint_height, footprint_width = height, width
                     footprint = [(r, c) for r in range(center[0] - height // 2, center[0] - height // 2 + height) for c in range(center[1] - width // 2, center[1] - width // 2 + width) if 0 <= r < grid.shape[0] and 0 <= c < grid.shape[1] and not grid[r, c]]
                 if len(footprint) < 4:

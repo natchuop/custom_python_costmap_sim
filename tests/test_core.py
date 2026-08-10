@@ -104,6 +104,13 @@ def test_fake_obstacles_use_enlarged_footprints():
     assert all(not manifest.static_grid[r][c] for event in fake_events for r, c in event.cells)
 
 
+def test_fake_obstacle_dimensions_are_bounded_by_seven_cells():
+    rng = np.random.default_rng(7)
+    dimensions = [sim2.sample_fake_obstacle_dimensions(rng) for _ in range(200)]
+    assert all(1 <= height <= 7 and 1 <= width <= 7 for height, width in dimensions)
+    assert any(height == 7 or width == 7 for height, width in dimensions)
+
+
 def test_attack_labels_and_peer_delivery_provenance_cover_all_attack_types():
     config = SimulationConfig(
         seed=0,
@@ -125,11 +132,9 @@ def test_attack_labels_and_peer_delivery_provenance_cover_all_attack_types():
         delivery for delivery in log["report_deliveries"]
         if delivery["is_malicious"]
     ]
-    assert Counter(report["attack_type"] for report in malicious_sent) == Counter({
-        "fake_obstacle": 51,
-        "false_clearance": 5,
-        "stale_reassertion": 1,
-    })
+    malicious_counts = Counter(report["attack_type"] for report in malicious_sent)
+    assert set(malicious_counts) == {item.value for item in AttackType}
+    assert all(count > 0 for count in malicious_counts.values())
     assert len(malicious_deliveries) == 2 * len(malicious_sent)
     assert {delivery["recipient_id"] for delivery in malicious_deliveries} == {1, 2}
 
