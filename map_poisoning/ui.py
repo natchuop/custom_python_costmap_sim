@@ -46,13 +46,39 @@ def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None
 
 
 def launch(args) -> None:
-    """Show the interactive run configuration window in one compact view."""
+    """Show the interactive run configuration window."""
     root = tk.Tk()
     root.title("Modular Map-Poisoning Simulator")
-    root.geometry("760x900")
-    root.minsize(680, 820)
-    form = ttk.Frame(root, padding=14)
-    form.pack(fill="both", expand=True)
+    root.geometry("820x900")
+    root.minsize(700, 620)
+
+    shell = ttk.Frame(root, padding=8)
+    shell.pack(fill="both", expand=True)
+
+    body = ttk.Frame(shell)
+    body.pack(fill="both", expand=True)
+    canvas = tk.Canvas(body, highlightthickness=0, borderwidth=0)
+    scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    form = ttk.Frame(canvas, padding=14)
+    form_window = canvas.create_window((0, 0), window=form, anchor="nw")
+
+    def update_scroll_region(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def resize_form(event):
+        canvas.itemconfigure(form_window, width=event.width)
+
+    form.bind("<Configure>", update_scroll_region)
+    canvas.bind("<Configure>", resize_form)
+
+    def scroll_with_mouse(event):
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    canvas.bind_all("<MouseWheel>", scroll_with_mouse)
 
     values = {
         "map": tk.StringVar(value=(next((label for label, (path, _) in MAP_OPTIONS.items() if path and args.map_npy and Path(path).resolve() == Path(args.map_npy).resolve()), "Custom NPY" if args.map_npy else "Default Warehouse"))),
@@ -226,8 +252,11 @@ def launch(args) -> None:
         except Exception as exc:
             messagebox.showerror("Unable to run", str(exc))
 
-    footer = ttk.Frame(form)
-    footer.grid(row=30, column=0, columnspan=3, sticky="ew", pady=(16, 0))
-    ttk.Label(footer, text="Close each Matplotlib window to continue to the next one.").pack(side="left")
+    footer = ttk.Frame(shell, padding=(6, 8, 6, 0))
+    footer.pack(side="bottom", fill="x")
+    ttk.Label(
+        footer,
+        text="Close each Matplotlib window to continue to the next one.",
+    ).pack(side="left")
     ttk.Button(footer, text="Run", command=execute).pack(side="right")
     root.mainloop()
