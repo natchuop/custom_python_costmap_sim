@@ -65,11 +65,19 @@ def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
             for axis in figure.axes
             if axis.get_title(loc="left") == "Robot trust level | trust_threshold"
         )
-        trust_text = "\n".join(item.get_text() for item in trust_axis.texts)
-        for observer_id, sender_id in (
+        trust_table = next(iter(trust_axis.tables))
+        trust_text = "\n".join(
+            cell.get_text().get_text() for cell in trust_table.get_celld().values()
+        )
+        assert "Sender -> Observer" in trust_text
+        for sender_id, observer_id in (
             (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)
         ):
-            assert f"R{observer_id} -> R{sender_id}" in trust_text
+            assert f"R{sender_id} -> R{observer_id}" in trust_text
+        speed_axis = next(
+            axis for axis in figure.axes if axis.get_title(loc="left") == "Speed"
+        )
+        assert "20x" in {label.get_text() for label in speed_axis.texts}
         for robot_id in (0, 1, 2):
             map_axis = next(
                 axis

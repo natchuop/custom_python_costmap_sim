@@ -2,6 +2,7 @@ import math
 import heapq
 import copy
 import argparse
+import textwrap
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
@@ -6178,22 +6179,51 @@ def animate(world, robots, log, map_view=None):
         0.03,
         0.94,
         "",
-        fontsize=7.6,
+        fontsize=7.2,
         va="top",
-        linespacing=1.1,
+        linespacing=1.0,
         family="DejaVu Sans Mono",
         transform=status_ax.transAxes,
     )
-    trust_text = trust_ax.text(
-        0.03,
-        0.90,
-        "",
-        fontsize=10,
+    trust_threshold_text = trust_ax.text(
+        0.05,
+        0.91,
+        f"Threshold: {TRUST_ACCEPT_THRESHOLD:.2f}",
+        fontsize=9.5,
         va="top",
-        linespacing=1.5,
-        family="DejaVu Sans Mono",
         transform=trust_ax.transAxes,
     )
+    trust_pairs = [
+        (sender.robot_id, observer.robot_id)
+        for sender in robots
+        for observer in robots
+        if sender.robot_id != observer.robot_id
+    ]
+    trust_table = trust_ax.table(
+        cellText=[
+            [f"R{sender_id} -> R{observer_id}", f"{TRUST_ACCEPT_THRESHOLD:.2f}", "TRUSTED"]
+            for sender_id, observer_id in trust_pairs
+        ],
+        colLabels=("Sender -> Observer", "Score", "State"),
+        colWidths=(0.47, 0.18, 0.27),
+        cellLoc="left",
+        colLoc="left",
+        bbox=(0.04, 0.12, 0.92, 0.68),
+    )
+    trust_table.auto_set_font_size(False)
+    trust_table.set_fontsize(8.5)
+    for (row, column), cell in trust_table.get_celld().items():
+        cell.set_edgecolor("#c7c7c7")
+        cell.set_linewidth(0.7)
+        cell.set_facecolor("#ffffff" if row else "#e4e4e4")
+        cell.get_text().set_fontfamily("DejaVu Sans")
+        if row == 0:
+            cell.get_text().set_fontweight("bold")
+        if column == 1:
+            cell.get_text().set_ha("center")
+    for row in range(1, len(trust_pairs) + 1):
+        trust_table[(row, 1)].get_text().set_ha("center")
+
     latest_attack_text = latest_attack_ax.text(
         0.05,
         0.90,
@@ -6225,9 +6255,9 @@ def animate(world, robots, log, map_view=None):
         controls_position.height * 0.30,
     ))
     speed_ax.set_title("Speed", fontsize=8, loc="left", pad=1)
-    speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
+    speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x", "20x"), active=1)
     for label in speed.labels:
-        label.set_fontsize(8)
+        label.set_fontsize(7.8)
     pause_ax = fig.add_axes((
         controls_position.x0 + controls_position.width * 0.56,
         controls_position.y0 + controls_position.height * 0.10,
@@ -6488,36 +6518,29 @@ def animate(world, robots, log, map_view=None):
                 f"Reports sent: {len(matching_reports)}",
             ]
 
-        trust_lines = [
-            f"Threshold: {TRUST_ACCEPT_THRESHOLD:.2f}",
-            "",
-            "Observer -> Sender   Score   State",
-        ]
-
-        for observer in robots:
-            trust_frame = log["robots"][observer.robot_id].get("trust", [])
+        for row, (sender_id, observer_id) in enumerate(trust_pairs, start=1):
+            trust_frame = log["robots"][observer_id].get("trust", [])
             snapshot = trust_frame[frame] if frame < len(trust_frame) else {}
-            for sender in robots:
-                if sender.robot_id == observer.robot_id:
-                    continue
-                value = (
-                    snapshot.get(
-                        sender.robot_id,
-                        snapshot.get(str(sender.robot_id), TRUST_ACCEPT_THRESHOLD),
-                    )
-                    if isinstance(snapshot, dict)
-                    else TRUST_ACCEPT_THRESHOLD
+            value = (
+                snapshot.get(
+                    sender_id,
+                    snapshot.get(str(sender_id), TRUST_ACCEPT_THRESHOLD),
                 )
-                trust = float(
-                    value.get("score", TRUST_ACCEPT_THRESHOLD)
-                    if isinstance(value, dict)
-                    else value
-                )
-                state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
-                trust_lines.append(
-                    f"R{observer.robot_id} -> R{sender.robot_id}:  "
-                    f"{trust:.2f}  {state}"
-                )
+                if isinstance(snapshot, dict)
+                else TRUST_ACCEPT_THRESHOLD
+            )
+            trust = float(
+                value.get("score", TRUST_ACCEPT_THRESHOLD)
+                if isinstance(value, dict)
+                else value
+            )
+            state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
+            trust_table[(row, 0)].get_text().set_text(f"R{sender_id} -> R{observer_id}")
+            trust_table[(row, 1)].get_text().set_text(f"{trust:.2f}")
+            trust_table[(row, 2)].get_text().set_text(state)
+            trust_table[(row, 2)].get_text().set_color(
+                "#2e7d32" if state == "TRUSTED" else "#c62828"
+            )
 
         for robot in robots:
             rid = robot.robot_id
@@ -6531,14 +6554,27 @@ def animate(world, robots, log, map_view=None):
 
             status_lines.append(
                 f"R{rid}: tasks={completed_tasks} carry={'Y' if carrying else 'N'} "
-                f"accepted={accepted} rejected={rejected} "
+                f"acc={accepted} rej={rejected} "
                 f"replans={replans} done={'Y' if completed else 'N'}"
             )
 
-        status_text.set_text("\n".join(status_lines))
-        trust_text.set_text("\n".join(trust_lines))
-        latest_attack_text.set_text("\n".join(latest_attack_lines))
-        artists.extend((status_text, trust_text, latest_attack_text))
+        def wrap_panel_lines(lines, width):
+            wrapped = []
+            for line in lines:
+                wrapped.extend(
+                    textwrap.wrap(
+                        str(line),
+                        width=width,
+                        break_long_words=False,
+                        break_on_hyphens=False,
+                    )
+                    or [""]
+                )
+            return wrapped
+
+        status_text.set_text("\n".join(wrap_panel_lines(status_lines, 58)))
+        latest_attack_text.set_text("\n".join(wrap_panel_lines(latest_attack_lines, 36)))
+        artists.extend((status_text, trust_threshold_text, trust_table, latest_attack_text))
 
         return artists
 
