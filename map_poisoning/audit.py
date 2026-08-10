@@ -11,6 +11,30 @@ def audit_manifest(manifest) -> dict:
     if manifest.malicious_robot_id != 0 or tuple(manifest.benign_robot_ids) != (1, 2):
         errors.append("team must be attacker 0 and benign robots 1, 2")
     seen: set[str] = set()
+    expected_labels = {
+        report_id: event
+        for event in manifest.attack_events
+        for report_id in event.report_ids
+    }
+    labels_by_id = {label.report_id: label for label in manifest.report_audit_labels}
+    if expected_labels and set(labels_by_id) != set(expected_labels):
+        errors.append("attack report audit labels do not match the authored attack stream")
+    for report_id, event in expected_labels.items():
+        label = labels_by_id.get(report_id)
+        if label is None:
+            continue
+        expected_state = (
+            ClaimType.BLOCKED
+            if event.attack_type == AttackType.FALSE_CLEARANCE
+            else ClaimType.FREE
+        )
+        if (
+            not label.is_malicious
+            or label.attack_type != event.attack_type
+            or label.obstacle_episode_id != event.obstacle_episode_id
+            or label.actual_state_at_observation != expected_state
+        ):
+            errors.append(f"invalid audit label {report_id}")
     rows, cols = manifest.map_shape
     for event in manifest.attack_events:
         if event.sender_id != 0 or tuple(event.recipients) != (1, 2): errors.append(f"invalid attacker stream on {event.event_id}")

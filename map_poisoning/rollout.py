@@ -8,7 +8,7 @@ import sim2
 
 from .config import SimulationConfig
 from .metrics import CsvMetrics
-from .scenario import ScenarioManifest
+from .scenario import ScenarioManifest, scenario_manifest_hash
 
 
 def _defense_config_dict(config: SimulationConfig) -> dict:
@@ -135,6 +135,21 @@ def collect_rollout_metrics(
             method=method,
             **{key: value for key, value in report.items() if key != "step"},
         )
+    for delivery in log.get("report_deliveries", []):
+        collector.event(
+            delivery.get("sent_step", 0),
+            "report_received",
+            method=method,
+            **{key: value for key, value in delivery.items()
+               if key not in {"step", "sent_step"}},
+        )
+    for processed in log.get("report_processing", []):
+        collector.event(
+            processed.get("step", 0),
+            "report_processed",
+            method=method,
+            **{key: value for key, value in processed.items() if key != "step"},
+        )
     for event in log.get("trust_events", []):
         collector.event(
             event["step"],
@@ -142,6 +157,8 @@ def collect_rollout_metrics(
             method=method,
             **{key: value for key, value in event.items() if key != "step"},
         )
+    for event in log.get("traffic_events", []):
+        collector.event(event.get("step", 0), "traffic", method=method, **{key: value for key, value in event.items() if key != "step"})
 
     for robot in robots:
         rid = robot.robot_id
@@ -160,6 +177,10 @@ def collect_rollout_metrics(
                 new_path_length=replan["new_path_length"],
             )
         for step in range(0, len(rlog["position"]), config.logging.timeseries_period_steps):
+            trust_snapshot = rlog["trust"][step]
+            trust_value = trust_snapshot.get(malicious) if isinstance(trust_snapshot, dict) else None
+            if isinstance(trust_value, dict):
+                trust_value = trust_value.get("score")
             collector.sample(
                 step=step,
                 phase=log["phase"][step],
@@ -174,8 +195,15 @@ def collect_rollout_metrics(
                 ),
                 benign_total_distance=sim2.compute_path_distance(rlog["position"][: step + 1]),
                 benign_total_replans=rlog["replan_count"][step],
-                attacker_trust=rlog["trust"][step].get(malicious),
+                attacker_trust=trust_value,
+                attacker_is_trusted=(trust_value is not None and float(trust_value) >= config.trust.threshold),
+                trust_threshold=config.trust.threshold,
                 malicious_claim_cells_on_route=rlog["malicious_claim_cells_on_route"][step],
+                traffic_waits=rlog.get("traffic_waits", [0])[step],
+                traffic_deadlock_active=rlog.get("traffic_deadlock_active", [False])[step],
+                active_deadlock_id=rlog.get("active_deadlock_id", [None])[step],
+                traffic_mode=rlog.get("traffic_mode", ["NORMAL"])[step],
+                traffic_replans=rlog.get("traffic_replans", [0])[step],
             )
 
     contradicted = sum(
@@ -190,6 +218,9 @@ def collect_rollout_metrics(
         "seed": config.seed,
         "steps_completed": len(log["truth_grid"]),
         "attack_actions": sum(bool(report.get("is_malicious")) for report in log["reports"]),
+        "configured_tasks_per_robot": config.deliveries_per_robot,
+        "all_robot_total_deliveries_completed": calculated["total_completed"],
+        "all_robot_delivery_success_rate": calculated["all_robot_delivery_success_rate"],
         "benign_total_deliveries_completed": calculated["benign_total_completed_deliveries"],
         "benign_success_rate": calculated["benign_delivery_success_rate"],
         "benign_deliveries_after_attack": calculated["benign_deliveries_after_attack"],
@@ -217,6 +248,27 @@ def collect_rollout_metrics(
             sum(robot.trust_for(malicious) for robot in benign) / len(benign) if benign else 0.0
         ),
         "manifest_hash": manifest.map_hash,
+        "scenario_manifest_hash": scenario_manifest_hash(manifest),
+        "benign_traffic_wait_steps": calculated.get("benign_traffic_wait_steps", 0),
+        "traffic_replans": calculated.get("traffic_replans", 0),
+        "vertex_conflicts_detected": calculated.get("vertex_conflicts_detected", 0),
+        "head_on_swap_conflicts_detected": calculated.get("head_on_swap_conflicts_detected", 0),
+        "reservation_conflicts_detected": calculated.get("reservation_conflicts_detected", 0),
+        "traffic_yield_events": calculated.get("traffic_yield_events", 0),
+        "deadlocks_detected": calculated.get("deadlocks_detected", 0),
+        "deadlocks_recovered": calculated.get("deadlocks_recovered", 0),
+        "robot_overlap_violations": calculated.get("robot_overlap_violations", 0),
+        "recovery_start_step": calculated.get("recovery_start_step"),
+        "recovery_metrics_per_robot": calculated.get("recovery_metrics_per_robot", {}),
+        "recovery_trust_gain_r1": calculated.get("recovery_metrics_per_robot", {}).get(1, {}).get("recovery_trust_gain"),
+        "recovery_trust_gain_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("recovery_trust_gain"),
+        "retrust_latency_r1": calculated.get("recovery_metrics_per_robot", {}).get(1, {}).get("retrust_latency_steps"),
+        "retrust_latency_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("retrust_latency_steps"),
+        "attack_event_counts": calculated.get("attack_event_counts", {}),
+        "attack_report_counts": calculated.get("attack_report_counts", {}),
+        "attack_delivery_counts": calculated.get("attack_delivery_counts", {}),
+        "attack_processed_counts": calculated.get("attack_processed_counts", {}),
+        "attack_verified_false_counts": calculated.get("attack_verified_false_counts", {}),
     }
     return summary, collector
 
@@ -238,6 +290,8 @@ def replay_manifest(
     )
     output_directory.mkdir(parents=True, exist_ok=True)
     collector.write(output_directory, summary)
+    from .reporting import generate_run_report
+    generate_run_report(output_directory, formats=(config.logging.plot_format,) if config.logging.generate_plots else ())
     effective = config.to_dict() | {
         "effective_method": method,
         "defense_config": _defense_config_dict(config),

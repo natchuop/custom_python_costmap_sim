@@ -25,6 +25,81 @@ python .\install_dependencies.py --install --include-dev --skip-gui
 The installer checks Python, NumPy, Matplotlib, Pillow, PyYAML, Tkinter, basic
 file access, project files, and small package smoke tests.
 
+## Code overview
+
+The project has two cooperating layers:
+
+- `sim2.py` contains the validated simulation engine. It owns the grid world,
+  robot motion, LiDAR observations, temporary obstacles, attack behavior,
+  belief maps, route planning, trust state, collision coordination, logging,
+  and optional playback.
+- `map_poisoning/` provides the modular experiment layer. It converts command
+  line or GUI settings into a configuration, authors or loads a scenario
+  manifest, replays the manifest with different defense methods, and writes
+  metrics and reports. Its rollout adapter uses the simulator engine for the
+  actual robot run.
+
+The main files are:
+
+| File or folder | Purpose |
+| --- | --- |
+| `main.py` | Entry point for GUI, single headless, comparison, and multi-seed runs. |
+| `map_poisoning/cli.py` and `config.py` | Define command-line options and typed experiment settings. |
+| `map_poisoning/scenario.py` | Creates, validates, saves, and loads deterministic manifests. |
+| `map_poisoning/application.py`, `simulation.py`, and `rollout.py` | Load maps, replay methods, collect results, and coordinate output folders. |
+| `map_poisoning/map_io.py`, `world.py`, `temp_obstacles.py`, and `scenario_presets.py` | Load supported map formats and define reusable warehouse and obstacle setup. |
+| `map_poisoning/models.py` | Shared data types for claims, attacks, observations, tasks, and events. |
+| `map_poisoning/robot.py` | Modular robot state, sensing, report handling, verification, and replanning. |
+| `map_poisoning/sensing.py`, `planning.py`, `belief.py`, `fusion.py`, and `trust.py` | Implement LiDAR conversion, A* planning, local beliefs, peer evidence, and trust updates. |
+| `defense_method_runner.py` | Applies the selected defense policy to stored peer claims and produces route influence. |
+| `map_poisoning/reporting.py`, `metrics.py`, and `batch.py` | Write CSV/JSON results, plots, comparisons, and multi-seed summaries. |
+| `map_poisoning/ui.py` | Provides the configuration form used by the non-headless entry point. |
+| `tests/` | Unit and integration tests for sensing, attacks, trust, fusion, manifests, reports, and batch runs. |
+
+## How the simulation works internally
+
+Each run keeps separate versions of the world state:
+
+- The static grid is the warehouse layout and prior known to the robots.
+- The truth grid adds temporary obstacles and the actual current state used by
+  the simulator and sensors.
+- Each robot has its own belief map. A robot plans from that belief, not from
+  the full truth grid.
+- Peer claims are stored separately from direct observations, so a claim can
+  later be verified and its sender's trust can change.
+
+The normal data flow is:
+
+1. `main.py` builds a `SimulationConfig` and selects the map and defense
+   method.
+2. A scenario manifest fixes the map, robot roles, starts, delivery queues,
+   temporary-obstacle episodes, attack events, and random seeds.
+3. The rollout restores the manifest and calls `sim2.run_simulation` with the
+   selected defense configuration.
+4. On each step, temporary obstacles and scheduled attacks update the truth
+   state. Robots use ray-cast LiDAR to make direct free/blocked observations.
+5. Robots queue observations for communication. Broadcast reports are placed
+   in peer inboxes and are processed through the admission policy and the
+   selected defense method.
+6. The fusion layer converts accepted peer evidence into hard blocks or route
+   costs, depending on the defense method. A* then plans around the resulting
+   belief and robots replan when their route becomes invalid or affected by a
+   new claim.
+7. Robots move, coordinate around shared traffic, complete pickup/dropoff
+   tasks, and log actions, reports, trust, replans, and deliveries.
+8. When a robot later senses a reported cell, the report is verified. Confirmed
+   reports reward the sender and contradicted reports lower trust; methods such
+   as `source_linked` can then update the influence of older reports and trigger
+   another route replan.
+9. The completed log is converted into summaries, time series, event files,
+   and optional plots.
+
+Robot 0 is the malicious robot in the standard scenario, while Robots 1 and 2
+are benign. The attack layer supports fake obstacles, false clearance, and
+stale reassertion. Attack events include provenance and audit information so
+that fake evidence, peer delivery, trust changes, and route effects can be
+checked after the run.
+
 ## Running the simulator
 
 
@@ -129,9 +204,8 @@ Manifests are especially useful for fair comparisons. To compare defense methods
 
 When animation is enabled, the reconnaissance heatmap opens first, followed by the live playback window. The playback shows the ground-truth map and one map per robot. Robot source colors are purple for robot 0, orange for robot 1, and blue for robot 2. On combined maps, an occupied shared cell uses the source robot’s color; if several trusted robots support it, the highest-trust source color is shown. Yellow marks goals/checkpoints, red marks attack overlays, and light red marks false-clearance overlays.
 
-Playback includes `0.5x`, `1x`, `2x`, and `5x` speed controls plus a compact
-pause/resume button. Playback uses the completed log, so changing speed or
-pausing does not change the simulation results.
+Playback uses the completed log, so changing speed or pausing does not change
+the simulation results.
 
 ## Defense methods
 

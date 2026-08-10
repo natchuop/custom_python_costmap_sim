@@ -61,6 +61,8 @@ class FusionConfig:
 class LoggingConfig:
     output_directory: str = "outputs/simulation_results"
     timeseries_period_steps: int = 5
+    generate_plots: bool = True
+    plot_format: str = "png"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,7 @@ class SimulationConfig:
     temporary_blockage_change_period_steps: int = 150
     map_npy: str | None = None
     map_movingai: str | None = None
+    scenario_preset: str | None = None
     manifest_path: str | None = None
     deliveries_per_robot: int = 100
     max_steps: int | None = None
@@ -101,6 +104,9 @@ class SimulationConfig:
         if self.fusion.admission_policy not in {"auto_soft", "accept_all", "hard_reject"}: raise ValueError("unknown admission policy")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai: raise ValueError("use one map source")
+        if self.scenario_preset is not None:
+            from .scenario_presets import PRESETS
+            if self.scenario_preset not in PRESETS: raise ValueError(f"unknown scenario preset: {self.scenario_preset}")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
         if self.visualization.map_view not in MAP_VIEWS: raise ValueError("map_view must be combined or local")
