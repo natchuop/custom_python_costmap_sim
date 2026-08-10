@@ -8,7 +8,7 @@ import sim2
 
 from .config import SimulationConfig
 from .metrics import CsvMetrics
-from .scenario import ScenarioManifest
+from .scenario import ScenarioManifest, scenario_manifest_hash
 
 
 def _defense_config_dict(config: SimulationConfig) -> dict:
@@ -142,6 +142,8 @@ def collect_rollout_metrics(
             method=method,
             **{key: value for key, value in event.items() if key != "step"},
         )
+    for event in log.get("traffic_events", []):
+        collector.event(event.get("step", 0), "traffic", method=method, **{key: value for key, value in event.items() if key != "step"})
 
     for robot in robots:
         rid = robot.robot_id
@@ -176,6 +178,11 @@ def collect_rollout_metrics(
                 benign_total_replans=rlog["replan_count"][step],
                 attacker_trust=rlog["trust"][step].get(malicious),
                 malicious_claim_cells_on_route=rlog["malicious_claim_cells_on_route"][step],
+                traffic_waits=rlog.get("traffic_waits", [0])[step],
+                traffic_deadlock_active=rlog.get("traffic_deadlock_active", [False])[step],
+                active_deadlock_id=rlog.get("active_deadlock_id", [None])[step],
+                traffic_mode=rlog.get("traffic_mode", ["NORMAL"])[step],
+                traffic_replans=rlog.get("traffic_replans", [0])[step],
             )
 
     contradicted = sum(
@@ -217,6 +224,16 @@ def collect_rollout_metrics(
             sum(robot.trust_for(malicious) for robot in benign) / len(benign) if benign else 0.0
         ),
         "manifest_hash": manifest.map_hash,
+        "scenario_manifest_hash": scenario_manifest_hash(manifest),
+        "benign_traffic_wait_steps": calculated.get("benign_traffic_wait_steps", 0),
+        "traffic_replans": calculated.get("traffic_replans", 0),
+        "vertex_conflicts_detected": calculated.get("vertex_conflicts_detected", 0),
+        "head_on_swap_conflicts_detected": calculated.get("head_on_swap_conflicts_detected", 0),
+        "reservation_conflicts_detected": calculated.get("reservation_conflicts_detected", 0),
+        "traffic_yield_events": calculated.get("traffic_yield_events", 0),
+        "deadlocks_detected": calculated.get("deadlocks_detected", 0),
+        "deadlocks_recovered": calculated.get("deadlocks_recovered", 0),
+        "robot_overlap_violations": calculated.get("robot_overlap_violations", 0),
     }
     return summary, collector
 
@@ -238,6 +255,8 @@ def replay_manifest(
     )
     output_directory.mkdir(parents=True, exist_ok=True)
     collector.write(output_directory, summary)
+    from .reporting import generate_run_report
+    generate_run_report(output_directory, formats=(config.logging.plot_format,) if config.logging.generate_plots else ())
     effective = config.to_dict() | {
         "effective_method": method,
         "defense_config": _defense_config_dict(config),

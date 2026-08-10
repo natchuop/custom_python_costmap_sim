@@ -7,6 +7,11 @@ def parser():
     p=argparse.ArgumentParser(description="Modular multi-robot map-poisoning simulator")
     p.add_argument("--headless",action="store_true",help="Run without importing Tkinter")
     p.add_argument("--compare",action="store_true",help="Replay one manifest across --comparison-methods")
+    p.add_argument("--seeds", help="multi-seed specification such as 1-3,7")
+    p.add_argument("--methods", help="comma-separated multi-seed defense methods")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--fail-fast", action="store_true")
+    p.add_argument("--per-run-plots", action="store_true")
     p.add_argument("--manifest-only",action="store_true",help="Author and save a manifest without replaying it")
     p.add_argument("--manifest",dest="manifest_path")
     p.add_argument("--map-npy"); p.add_argument("--map-movingai"); p.add_argument("--scenario-preset", choices=("warehouse_002", "warehouse_005", "warehouse_005_rotated"))
@@ -20,9 +25,9 @@ def parser():
     p.add_argument("--attack-interval-min",type=int,default=30); p.add_argument("--attack-interval-max",type=int,default=30)
     p.add_argument("--map-view", choices=MAP_VIEWS, default="combined", help="belief visualization: combined peer/local or local observations")
     p.add_argument("--temp-obstacle-interval", type=int, default=150, help="steps between temporary-obstacle movements")
-    p.add_argument("--no-animation",action="store_true"); return p
+    p.add_argument("--no-animation",action="store_true"); p.add_argument("--no-plots",action="store_true"); return p
 
 def config_from_args(args):
     enabled=() if args.attacks == "none" else tuple(x for x in args.attacks.split(",") if x)
     comparison_methods = tuple(item.strip() for item in args.comparison_methods.split(",") if item.strip())
-    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model, threshold=args.trust_threshold),fusion=FusionConfig(method=args.defense_method),logging=LoggingConfig(args.output_directory),visualization=VisualizationConfig(not args.no_animation, args.map_view),comparison_methods=comparison_methods,manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,scenario_preset=args.scenario_preset,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot,temporary_blockage_change_period_steps=args.temp_obstacle_interval)
+    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model, threshold=args.trust_threshold),fusion=FusionConfig(method=args.defense_method),logging=LoggingConfig(args.output_directory, generate_plots=not args.no_plots),visualization=VisualizationConfig(not args.no_animation, args.map_view),comparison_methods=comparison_methods,manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,scenario_preset=args.scenario_preset,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot,temporary_blockage_change_period_steps=args.temp_obstacle_interval)

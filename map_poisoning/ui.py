@@ -2,12 +2,47 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
 
 from .application import run
 from .cli import config_from_args
 from .config import ALL_METHODS
 from .models import AttackType
+from .map_io import load_npy
+from .scenario_presets import PRESETS, preset_for_hash, preset_for_id, validate_fixed_preset
+
+
+MAP_OPTIONS = {
+    "Default Warehouse": (None, None),
+    "Converted Map 002": ("converted_maps/maps_002_map/static_grid.npy", "warehouse_002"),
+    "Converted Map 005": ("converted_maps/maps_005_map/static_grid.npy", "warehouse_005"),
+    "Rotated Map 005": ("converted_maps/maps_005_map_rotated/static_grid.npy", "warehouse_005_rotated"),
+}
+
+
+def _preset_for_map_path(map_path: str | None):
+    if not map_path:
+        return None
+    requested = Path(map_path).resolve()
+    for path, preset in MAP_OPTIONS.values():
+        if path and Path(path).resolve() == requested:
+            return preset_for_id(preset)
+    try:
+        return preset_for_hash(__import__("hashlib").sha256(load_npy(map_path).tobytes()).hexdigest())
+    except (OSError, ValueError):
+        return None
+
+
+def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None:
+    """Validate GUI map/preset choices before starting a simulation."""
+    known = _preset_for_map_path(map_path)
+    if known is not None and not preset_id:
+        raise ValueError(f"known experimental map detected; select that preset ({known.preset_id})")
+    if preset_id:
+        if not map_path:
+            raise ValueError("an explicit scenario preset requires a matching NPY map")
+        validate_fixed_preset(load_npy(map_path), preset_for_id(preset_id))
 
 
 def launch(args) -> None:
@@ -20,6 +55,9 @@ def launch(args) -> None:
     form.pack(fill="both", expand=True)
 
     values = {
+        "map": tk.StringVar(value=(next((label for label, (path, _) in MAP_OPTIONS.items() if path and args.map_npy and Path(path).resolve() == Path(args.map_npy).resolve()), "Custom NPY" if args.map_npy else "Default Warehouse"))),
+        "map_path": tk.StringVar(value=args.map_npy or ""),
+        "scenario_preset": tk.StringVar(value=args.scenario_preset or _preset_for_map_path(args.map_npy) or ""),
         "seed": tk.StringVar(value=str(args.seed)),
         "trust_model": tk.StringVar(value=args.trust_model),
         "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.55))),
@@ -65,9 +103,12 @@ def launch(args) -> None:
     ttk.Label(form, text="Run configuration", font=("TkDefaultFont", 12, "bold")).grid(
         row=0, column=0, columnspan=3, sticky="w", pady=(0, 7)
     )
-    entry("Seed", "seed", 1)
+    dropdown("Map", "map", tuple(MAP_OPTIONS) + ("Custom NPY",), 1)
+    entry("Map NPY path", "map_path", 2)
+    dropdown("Scenario preset", "scenario_preset", ("",) + tuple(PRESETS), 3)
+    entry("Seed", "seed", 4)
     methods_frame = ttk.LabelFrame(form, text="Defense methods to run", padding=7)
-    methods_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 4))
+    methods_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 4))
     ttk.Label(
         methods_frame,
         text=(
@@ -82,8 +123,8 @@ def launch(args) -> None:
             text=method,
             variable=method_enabled[method],
         ).grid(row=1 + index // 2, column=index % 2, sticky="w", padx=(0, 24), pady=1)
-    entry("Output parent directory", "output", 7)
-    entry("Fixed manifest (optional)", "manifest", 8)
+    entry("Output parent directory", "output", 10)
+    entry("Fixed manifest (optional)", "manifest", 11)
     ttk.Label(
         form,
         text=(
@@ -95,25 +136,25 @@ def launch(args) -> None:
         ),
         wraplength=650,
         justify="left",
-    ).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
-    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 10)
+    ).grid(row=12, column=0, columnspan=3, sticky="w", pady=3)
+    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 13)
 
-    ttk.Separator(form).grid(row=11, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Separator(form).grid(row=14, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
-        row=12, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        row=15, column=0, columnspan=3, sticky="w", pady=(0, 4)
     )
-    entry("Reconnaissance steps", "recon", 13)
-    entry("Poisoning steps", "attack", 14)
-    entry("Recovery steps", "recovery", 15)
-    entry("Deliveries per robot", "deliveries", 16)
-    entry("Maximum steps (optional)", "max_steps", 17)
-    entry("Attack interval: minimum steps", "interval_min", 18)
-    entry("Attack interval: maximum steps", "interval_max", 19)
-    entry("Temporary obstacle movement interval", "temp_interval", 20)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 21)
-    entry("Trust threshold", "trust_threshold", 22)
+    entry("Reconnaissance steps", "recon", 16)
+    entry("Poisoning steps", "attack", 17)
+    entry("Recovery steps", "recovery", 18)
+    entry("Deliveries per robot", "deliveries", 19)
+    entry("Maximum steps (optional)", "max_steps", 20)
+    entry("Attack interval: minimum steps", "interval_min", 21)
+    entry("Attack interval: maximum steps", "interval_max", 22)
+    entry("Temporary obstacle movement interval", "temp_interval", 23)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 24)
+    entry("Trust threshold", "trust_threshold", 25)
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=24, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=27, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame,
@@ -123,8 +164,20 @@ def launch(args) -> None:
 
     form.columnconfigure(1, weight=1)
 
+    def select_map(*_):
+        path, preset = MAP_OPTIONS.get(values["map"].get(), (None, None))
+        if values["map"].get() != "Custom NPY":
+            values["map_path"].set(path or "")
+            values["scenario_preset"].set(preset or "")
+
+    values["map"].trace_add("write", select_map)
+
     def execute() -> None:
         try:
+            args.map_npy = values["map_path"].get().strip() or None
+            args.map_movingai = None
+            args.scenario_preset = values["scenario_preset"].get().strip() or None
+            validate_gui_map_preset(args.map_npy, args.scenario_preset)
             args.seed = int(values["seed"].get())
             selected_methods = tuple(
                 method for method in ALL_METHODS if method_enabled[method].get()
@@ -164,7 +217,7 @@ def launch(args) -> None:
             messagebox.showerror("Unable to run", str(exc))
 
     footer = ttk.Frame(form)
-    footer.grid(row=25, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+    footer.grid(row=28, column=0, columnspan=3, sticky="ew", pady=(16, 0))
     ttk.Label(footer, text="Close each Matplotlib window to continue to the next one.").pack(side="left")
     ttk.Button(footer, text="Run", command=execute).pack(side="right")
     root.mainloop()

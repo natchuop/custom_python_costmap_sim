@@ -163,6 +163,7 @@ ATTACK_MAX_DISTANCE_FROM_VICTIM = 45
 
 # Keep red fake-object display visible briefly, but do not accumulate forever.
 MALICIOUS_FAKE_OBJECT_DISPLAY_TTL = 50
+MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS = 50
 
 # Topology-aware diagnostics help place legitimate temporary objects in useful
 # warehouse regions. Attack candidate ranking remains route/traffic driven.
@@ -4671,6 +4672,7 @@ def run_simulation(
         "truth_grid": [],
         "truth_dynamic": [],
         "malicious_fake_objects": [],
+        "fake_obstacle_history": [],
         "attack_overlays": [],
         "temporary_movement": [],
         "attack_events": [
@@ -4751,6 +4753,7 @@ def run_simulation(
 
     active_malicious_fake_objects = {}
     active_attack_overlays = {}
+    fake_obstacle_history = {robot.robot_id: [] for robot in robots if not robot.is_malicious}
 
     placed_malicious_fake_object_centers = []
     last_malicious_fake_object_step = None
@@ -4917,6 +4920,18 @@ def run_simulation(
                     last_malicious_fake_object_step = step
                     for report in fake_reports:
                         active_attack_overlays[("fake_obstacle", tuple(report.target_cell))] = (step, "fake_obstacle")
+                    fake_cells = tuple(sorted({tuple(report.target_cell) for report in fake_reports}))
+                    for victim_id in fake_obstacle_history:
+                        fake_obstacle_history[victim_id].append({
+                            "attack_event_id": f"dynamic-fake-{step:06d}",
+                            "attacker_id": attacker.robot_id,
+                            "victim_id": victim_id,
+                            "attack_type": "fake_obstacle",
+                            "cells": fake_cells,
+                            "received_step": step,
+                            "last_refresh_step": step,
+                            "expires_step": step + MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS,
+                        })
 
         fixed_attack_injected = False
         if attack_events is not None:
@@ -4926,6 +4941,22 @@ def run_simulation(
                 fixed_attack_injected = True
                 for cell in event.cells:
                     active_attack_overlays[(event.attack_type.value, tuple(cell))] = (step, event.attack_type.value)
+                if (
+                    getattr(event.attack_type, "value", event.attack_type) == "fake_obstacle"
+                    and int(event.sender_id) == 0
+                    and int(event.claim) == int(ClaimType.BLOCKED)
+                ):
+                    for victim_id in fake_obstacle_history:
+                        fake_obstacle_history[victim_id].append({
+                            "attack_event_id": event.event_id,
+                            "attacker_id": int(event.sender_id),
+                            "victim_id": int(victim_id),
+                            "attack_type": "fake_obstacle",
+                            "cells": tuple(tuple(cell) for cell in event.cells),
+                            "received_step": step,
+                            "last_refresh_step": step,
+                            "expires_step": step + MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS,
+                        })
                 for cell in event.cells:
                     reports_by_sender[event.sender_id].append(
                         PeerReport(
@@ -5104,6 +5135,12 @@ def run_simulation(
         log["malicious_fake_objects"].append(
             sorted(active_malicious_fake_objects.keys())
         )
+        for victim_id in fake_obstacle_history:
+            fake_obstacle_history[victim_id] = [
+                record for record in fake_obstacle_history[victim_id]
+                if step < int(record["expires_step"])
+            ]
+        log["fake_obstacle_history"].append(copy.deepcopy(fake_obstacle_history))
         # Show only the newest attack footprint. Older events remain in the
         # log for audit/playback data, but stacking their TTLs makes the debug
         # map look as if the whole warehouse is under attack.
@@ -5392,6 +5429,17 @@ def compute_experiment_metrics(robots, log):
         robot.robot_id: robot.defense_runner.snapshot(len(log.get("truth_grid", [])))
         for robot in robots
     }
+    traffic_events = log.get("traffic_events", [])
+    traffic_counts = {}
+    for event in traffic_events:
+        kind = event.get("event_type")
+        traffic_counts[kind] = traffic_counts.get(kind, 0) + 1
+    benign_traffic_wait_steps = sum(
+        int(log["robots"][robot.robot_id].get("traffic_waits", [0])[-1])
+        for robot in benign_robots
+        if log["robots"][robot.robot_id].get("traffic_waits")
+    )
+    traffic_replans = sum(robot.traffic_replan_count for robot in benign_robots)
 
     return {
         "defense_method": log.get("defense_method"),
@@ -5461,6 +5509,15 @@ def compute_experiment_metrics(robots, log):
         "benign_next_five_changed_replans": sum(next_five_changed_replans[rid] for rid in benign_ids),
         "benign_planner_expanded_nodes_total": sum(expanded_nodes_total[rid] for rid in benign_ids),
         "defense_runner_snapshots": defense_snapshots,
+        "benign_traffic_wait_steps": benign_traffic_wait_steps,
+        "traffic_replans": traffic_replans,
+        "vertex_conflicts_detected": traffic_counts.get("traffic_vertex_conflict", 0),
+        "head_on_swap_conflicts_detected": traffic_counts.get("traffic_swap_conflict", 0),
+        "reservation_conflicts_detected": traffic_counts.get("traffic_reservation_conflict", 0),
+        "traffic_yield_events": traffic_counts.get("traffic_yield_started", 0),
+        "deadlocks_detected": traffic_counts.get("traffic_deadlock_detected", 0),
+        "deadlocks_recovered": traffic_counts.get("traffic_deadlock_recovered", 0),
+        "robot_overlap_violations": int(log.get("robot_overlap_violations", 0)),
     }
 
 def print_summary(world, robots, log):
@@ -5559,6 +5616,19 @@ def expand_fake_object_cells(fake_cells):
             expanded.add(tuple(footprint_cell))
 
     return sorted(expanded)
+
+
+def fake_obstacle_history_cells(history, victim_id, step):
+    """Return only unexpired cells from explicit R0 fake-obstacle history."""
+    cells = set()
+    for record in history.get(int(victim_id), ()):
+        if int(record.get("attacker_id", -1)) != 0:
+            continue
+        if record.get("attack_type") != "fake_obstacle":
+            continue
+        if int(step) < int(record.get("expires_step", -1)):
+            cells.update(tuple(cell) for cell in record.get("cells", ()))
+    return sorted(cells)
 
 def make_display_array(
     grid,
@@ -5692,7 +5762,7 @@ def make_belief_display_array(
 
 
 def draw_attack_outlines(ax, cells, color="#d32f2f"):
-    """Outline maliciously sourced cells that reached a victim's map."""
+    """Draw explicit recent R0 fake-obstacle history, never generic provenance."""
     patches = []
     for r, c in cells:
         patch = plt.Rectangle(
@@ -5701,7 +5771,8 @@ def draw_attack_outlines(ax, cells, color="#d32f2f"):
             1,
             fill=False,
             edgecolor=color,
-            linewidth=2.4,
+            linewidth=1.8,
+            linestyle=":",
             zorder=12,
         )
         ax.add_patch(patch)
@@ -5806,22 +5877,16 @@ def animate(world, robots, log, map_view=None):
     bounds = np.arange(-0.5, len(colors) + 0.5, 1)
     norm = BoundaryNorm(bounds, cmap.N)
 
-    num_panels = 1 + len(robots)
-
-    fig, axes = plt.subplots(
-        1,
-        num_panels,
-        figsize=(7 * num_panels, 8.6),
-        squeeze=False,
-    )
-
-    axes = axes[0]
-
-    truth_ax = axes[0]
-    belief_axes = {
-        robot.robot_id: axes[idx + 1]
-        for idx, robot in enumerate(robots)
-    }
+    fig = plt.figure(figsize=(15, 10), constrained_layout=False)
+    layout = fig.add_gridspec(3, 3, width_ratios=(1.0, 1.0, 0.62), height_ratios=(1.0, 1.0, 0.24), hspace=0.22, wspace=0.16)
+    map_axes = [fig.add_subplot(layout[0, 0]), fig.add_subplot(layout[0, 1]), fig.add_subplot(layout[1, 0]), fig.add_subplot(layout[1, 1])]
+    truth_ax = map_axes[0]
+    robot_axes = {0: map_axes[1], 1: map_axes[2], 2: map_axes[3]}
+    belief_axes = {robot.robot_id: robot_axes.get(robot.robot_id, map_axes[1]) for robot in robots}
+    status_ax = fig.add_subplot(layout[0:2, 2])
+    legend_ax = fig.add_subplot(layout[2, 0:2])
+    status_ax.set_axis_off()
+    legend_ax.set_axis_off()
 
     truth_ax.set_title("Ground Truth Map", fontsize=13, pad=6)
     truth_ax.set_xlabel("col", fontsize=11)
@@ -5925,30 +5990,31 @@ def animate(world, robots, log, map_view=None):
 
     # Reserve a dedicated lower band for status, sharing guidance, controls,
     # and the legend so wide multi-panel figures do not overlap or clip them.
-    status_text = fig.text(0.02, 0.285, "", fontsize=10, va="top", family="DejaVu Sans Mono")
-    sharing_text = fig.text(
-        0.02,
-        0.14,
+    status_text = status_ax.text(0.02, 0.98, "", fontsize=9, va="top", family="DejaVu Sans Mono", transform=status_ax.transAxes)
+    sharing_text = legend_ax.text(
+        0.01,
+        0.82,
         "Peer sharing: occupied cells use the source robot's color. "
         "When multiple trusted robots support a cell, the highest-trust "
         "source color is displayed.",
-        fontsize=10,
+        fontsize=9,
         va="top",
+        transform=legend_ax.transAxes,
     )
 
     max_frames = len(log["truth_grid"])
     display_index = 0
     first_tick = True
-    controls_ax = fig.add_axes((0.02, 0.035, 0.30, 0.12))
+    controls_ax = fig.add_axes((0.70, 0.05, 0.25, 0.08))
     controls_ax.set_title("Playback controls", fontsize=10, loc="left", pad=3)
     controls_ax.set_xticks([])
     controls_ax.set_yticks([])
-    speed_ax = fig.add_axes((0.035, 0.055, 0.14, 0.075))
+    speed_ax = fig.add_axes((0.71, 0.055, 0.10, 0.055))
     speed_ax.set_title("Speed", fontsize=10, loc="left", pad=2)
     speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
     for label in speed.labels:
         label.set_fontsize(10)
-    pause_ax = fig.add_axes((0.20, 0.070, 0.085, 0.045))
+    pause_ax = fig.add_axes((0.84, 0.060, 0.09, 0.04))
     pause_button = Button(pause_ax, "Pause", color="#eeeeee", hovercolor="#d0d0d0")
     pause_button.label.set_fontsize(10)
     paused = False
@@ -5968,7 +6034,7 @@ def animate(world, robots, log, map_view=None):
         except (TypeError, ValueError):
             return 1
 
-    fig.legend(
+    legend_ax.legend(
         handles=[
             Patch(facecolor="#222222", label="Static obstacle"),
             Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),
@@ -5977,12 +6043,11 @@ def animate(world, robots, log, map_view=None):
             Patch(facecolor="#ffeb3b", label="Goal/checkpoint"),
             Patch(facecolor="#e53935", label="Attack overlay"),
             Patch(facecolor="#ef9a9a", label="False clearance"),
-            Patch(facecolor="none", edgecolor="#d32f2f", label="Malicious claim in victim map"),
+            Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 fake obstacle"),
         ],
-        loc="lower center",
-        bbox_to_anchor=(0.72, 0.145),
+        loc="lower left",
         ncol=2,
-        fontsize=10,
+        fontsize=8,
         frameon=False,
     )
 
@@ -6094,17 +6159,9 @@ def animate(world, robots, log, map_view=None):
             belief_attack_outline_patches[rid] = []
 
             if selected_view == "combined" and not robot.is_malicious:
-                provenance_frames = log["robots"][rid].get("peer_provenance", [])
-                provenance_at_frame = (
-                    provenance_frames[frame]
-                    if frame < len(provenance_frames)
-                    else ()
-                )
-                malicious_cells = [
-                    tuple(provenance["cell"])
-                    for provenance in provenance_at_frame
-                    if 0 in provenance.get("senders", ())
-                ]
+                history_frames = log.get("fake_obstacle_history", [])
+                history_at_frame = history_frames[frame] if frame < len(history_frames) else {}
+                malicious_cells = fake_obstacle_history_cells(history_at_frame, rid, frame)
                 belief_attack_outline_patches[rid] = draw_attack_outlines(
                     belief_axes[rid], malicious_cells
                 )
@@ -6171,6 +6228,16 @@ def animate(world, robots, log, map_view=None):
             ]),
         ]
 
+        for victim in robots:
+            if victim.is_malicious:
+                continue
+            trust_frame = log["robots"][victim.robot_id].get("trust", [])
+            snapshot = trust_frame[frame] if frame < len(trust_frame) else {}
+            value = snapshot.get(malicious_robot_id, snapshot.get(str(malicious_robot_id), TRUST_ACCEPT_THRESHOLD)) if isinstance(snapshot, dict) else TRUST_ACCEPT_THRESHOLD
+            trust = float(value.get("score", TRUST_ACCEPT_THRESHOLD) if isinstance(value, dict) else value)
+            state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
+            status_lines.append(f"R{victim.robot_id} -> R{malicious_robot_id}: trust={trust:.2f} {state}")
+
         for robot in robots:
             rid = robot.robot_id
             accepted = log["robots"][rid]["accepted_reports"][frame]
@@ -6203,7 +6270,6 @@ def animate(world, robots, log, map_view=None):
         repeat=False,
     )
 
-    fig.subplots_adjust(left=0.02, right=0.99, bottom=0.32, top=0.88, wspace=0.12)
     plt.show()
 
     return anim

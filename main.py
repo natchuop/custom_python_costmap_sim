@@ -8,6 +8,13 @@ def main() -> int:
     if not args.headless:
         from map_poisoning.ui import launch
         launch(args); return 0
+    if args.seeds:
+        from map_poisoning.batch import parse_seed_spec, run_multiseed
+        seeds = parse_seed_spec(args.seeds)
+        methods = tuple(item.strip() for item in (args.methods or "trust_threshold,full_trust,majority_vote,trust_fused,source_linked").split(",") if item.strip())
+        result = run_multiseed(config, seeds, methods=methods, comparison=True, resume=args.resume, generate_per_run_plots=args.per_run_plots, fail_fast=args.fail_fast)
+        print(f"multi-seed results: {result.root} ({len(result.records)} jobs)")
+        return 0
     results=run(config,comparison=args.compare,manifest_only=args.manifest_only)
     if args.manifest_only: print(f"Manifest written to {resolve_output_directory(config)}/scenario_manifest.json")
     else:

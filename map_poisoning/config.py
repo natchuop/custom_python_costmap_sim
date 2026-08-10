@@ -61,6 +61,8 @@ class FusionConfig:
 class LoggingConfig:
     output_directory: str = "outputs/simulation_results"
     timeseries_period_steps: int = 5
+    generate_plots: bool = True
+    plot_format: str = "png"
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ from map_poisoning.config import AttackConfig, PhaseConfig, SimulationConfig
 from map_poisoning.map_io import load_npy
 from map_poisoning.scenario import author_manifest, scenario_manifest_hash
 from map_poisoning.scenario_presets import PRESETS, validate_fixed_preset
+from map_poisoning.ui import validate_gui_map_preset
 
 
 ROOT = Path(__file__).parents[1]
@@ -49,3 +50,12 @@ def test_fixed_manifest_geometry_is_seed_and_method_independent():
     assert first.robot_starts == second.robot_starts
     assert first.task_queues == second.task_queues
     assert scenario_manifest_hash(first) != scenario_manifest_hash(second)
+
+
+def test_gui_known_map_requires_matching_preset():
+    path = MAPS["warehouse_005"]
+    if not path.exists():
+        pytest.skip("converted experimental maps are not present")
+    with pytest.raises(ValueError, match="select that preset"):
+        validate_gui_map_preset(str(path), None)
+    validate_gui_map_preset(str(path), "warehouse_005")
