@@ -5981,16 +5981,53 @@ def animate(world, robots, log, map_view=None):
     bounds = np.arange(-0.5, len(colors) + 0.5, 1)
     norm = BoundaryNorm(bounds, cmap.N)
 
-    fig = plt.figure(figsize=(15, 10), constrained_layout=False)
-    layout = fig.add_gridspec(3, 3, width_ratios=(1.0, 1.0, 0.62), height_ratios=(1.0, 1.0, 0.24), hspace=0.22, wspace=0.16)
-    map_axes = [fig.add_subplot(layout[0, 0]), fig.add_subplot(layout[0, 1]), fig.add_subplot(layout[1, 0]), fig.add_subplot(layout[1, 1])]
+    fig = plt.figure(figsize=(16, 11), constrained_layout=False)
+    layout = fig.add_gridspec(
+        4,
+        3,
+        width_ratios=(1.0, 1.0, 0.82),
+        height_ratios=(1.0, 1.0, 0.28, 0.18),
+        left=0.045,
+        right=0.98,
+        top=0.91,
+        bottom=0.055,
+        hspace=0.36,
+        wspace=0.28,
+    )
+    map_axes = [
+        fig.add_subplot(layout[0, 0]),
+        fig.add_subplot(layout[0, 1]),
+        fig.add_subplot(layout[1, 0]),
+        fig.add_subplot(layout[1, 1]),
+    ]
     truth_ax = map_axes[0]
     robot_axes = {0: map_axes[1], 1: map_axes[2], 2: map_axes[3]}
     belief_axes = {robot.robot_id: robot_axes.get(robot.robot_id, map_axes[1]) for robot in robots}
-    status_ax = fig.add_subplot(layout[0:2, 2])
+    status_ax = fig.add_subplot(layout[0, 2])
+    trust_ax = fig.add_subplot(layout[1, 2])
     legend_ax = fig.add_subplot(layout[2, 0:2])
-    status_ax.set_axis_off()
-    legend_ax.set_axis_off()
+    sharing_ax = fig.add_subplot(layout[3, 0:2])
+    controls_ax = fig.add_subplot(layout[2:4, 2])
+    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, controls_ax):
+        panel.set_axis_off()
+        panel.set_frame_on(True)
+        panel.patch.set_visible(True)
+        panel.patch.set_facecolor("#f5f5f5")
+        panel.patch.set_edgecolor("#808080")
+        panel.patch.set_linewidth(1.2)
+        panel.add_patch(
+            plt.Rectangle(
+                (0, 0),
+                1,
+                1,
+                transform=panel.transAxes,
+                facecolor="#f5f5f5",
+                edgecolor="#808080",
+                linewidth=1.2,
+                zorder=0,
+                clip_on=False,
+            )
+        )
 
     truth_ax.set_title("Ground Truth Map", fontsize=13, pad=6)
     truth_ax.set_xlabel("col", fontsize=11)
@@ -6092,33 +6129,75 @@ def animate(world, robots, log, map_view=None):
 
         belief_path_lines[rid] = []
 
-    # Reserve a dedicated lower band for status, sharing guidance, controls,
-    # and the legend so wide multi-panel figures do not overlap or clip them.
-    status_text = status_ax.text(0.02, 0.98, "", fontsize=9, va="top", family="DejaVu Sans Mono", transform=status_ax.transAxes)
-    sharing_text = legend_ax.text(
-        0.01,
-        0.82,
-        "Peer sharing: occupied cells use the source robot's color. "
-        "When multiple trusted robots support a cell, the highest-trust "
-        "source color is displayed.",
-        fontsize=9,
+    # The lower-row titles use three lines. Keep the upper-row x tick labels
+    # out of that title area; the bottom row still carries the shared col axes.
+    for ax in map_axes[:2]:
+        ax.set_xlabel("")
+        ax.tick_params(labelbottom=False)
+
+    # Keep status, trust, legend, sharing guidance, and controls in separate
+    # panels so long text cannot collide with map titles or other widgets.
+    status_ax.set_title("Simulation status", fontsize=10, loc="left", pad=3)
+    trust_ax.set_title("Robot trust level", fontsize=10, loc="left", pad=3)
+    legend_ax.set_title("Map legend", fontsize=10, loc="left", pad=2)
+    sharing_ax.set_title("Peer observations", fontsize=10, loc="left", pad=1)
+    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, controls_ax):
+        for spine in panel.spines.values():
+            spine.set_visible(False)
+
+    status_text = status_ax.text(
+        0.03,
+        0.94,
+        "",
+        fontsize=8.3,
         va="top",
-        transform=legend_ax.transAxes,
+        linespacing=1.25,
+        family="DejaVu Sans Mono",
+        transform=status_ax.transAxes,
+    )
+    trust_text = trust_ax.text(
+        0.03,
+        0.90,
+        "",
+        fontsize=10,
+        va="top",
+        linespacing=1.5,
+        family="DejaVu Sans Mono",
+        transform=trust_ax.transAxes,
+    )
+    sharing_ax.text(
+        0.01,
+        0.50,
+        "Occupied peer cells use the source robot's color. "
+        "Multiple trusted sources use the highest-trust color.",
+        fontsize=8.5,
+        va="center",
+        transform=sharing_ax.transAxes,
     )
 
     max_frames = len(log["truth_grid"])
     display_index = 0
     first_tick = True
-    controls_ax = fig.add_axes((0.70, 0.05, 0.25, 0.08))
     controls_ax.set_title("Playback controls", fontsize=10, loc="left", pad=3)
     controls_ax.set_xticks([])
     controls_ax.set_yticks([])
-    speed_ax = fig.add_axes((0.71, 0.055, 0.10, 0.055))
+    controls_position = controls_ax.get_position()
+    speed_ax = fig.add_axes((
+        controls_position.x0 + controls_position.width * 0.06,
+        controls_position.y0 + controls_position.height * 0.18,
+        controls_position.width * 0.40,
+        controls_position.height * 0.62,
+    ))
     speed_ax.set_title("Speed", fontsize=10, loc="left", pad=2)
     speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
     for label in speed.labels:
         label.set_fontsize(10)
-    pause_ax = fig.add_axes((0.84, 0.060, 0.09, 0.04))
+    pause_ax = fig.add_axes((
+        controls_position.x0 + controls_position.width * 0.56,
+        controls_position.y0 + controls_position.height * 0.31,
+        controls_position.width * 0.36,
+        controls_position.height * 0.38,
+    ))
     pause_button = Button(pause_ax, "Pause", color="#eeeeee", hovercolor="#d0d0d0")
     pause_button.label.set_fontsize(10)
     paused = False
@@ -6149,9 +6228,9 @@ def animate(world, robots, log, map_view=None):
             Patch(facecolor="#ef9a9a", label="False clearance"),
             Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 fake obstacle"),
         ],
-        loc="lower left",
-        ncol=2,
-        fontsize=8,
+        loc="upper left",
+        ncol=4,
+        fontsize=7.5,
         frameon=False,
     )
 
@@ -6317,20 +6396,18 @@ def animate(world, robots, log, map_view=None):
             for item in log.get("attack_overlays", [[]])[frame]
         )
         status_lines = [
-            " | ".join([
-                f"Step: {actual_step}",
-                f"Phase: {phase}",
-                f"Attack starts: {attack_start_text}",
-                f"Spawn grace: {grace_active}",
-            ]),
-            " | ".join([
-                f"Reports: {report_count}",
-                f"Malicious reports: {malicious_report_count}",
-                f"Attack overlays: {overlay_count}",
-                f"Malicious robot: R{malicious_robot_id}",
-                f"Latest attack: {latest_text}",
-            ]),
+            f"Step: {actual_step}",
+            f"Phase: {phase}",
+            f"Attack starts: {attack_start_text}",
+            f"Spawn grace: {grace_active}",
+            f"Reports: {report_count}",
+            f"Malicious reports: {malicious_report_count}",
+            f"Attack overlays: {overlay_count}",
+            f"Malicious robot: R{malicious_robot_id}",
+            f"Latest attack: {latest_text}",
         ]
+
+        trust_lines = [f"Threshold: {TRUST_ACCEPT_THRESHOLD:.2f}"]
 
         for victim in robots:
             if victim.is_malicious:
@@ -6340,7 +6417,10 @@ def animate(world, robots, log, map_view=None):
             value = snapshot.get(malicious_robot_id, snapshot.get(str(malicious_robot_id), TRUST_ACCEPT_THRESHOLD)) if isinstance(snapshot, dict) else TRUST_ACCEPT_THRESHOLD
             trust = float(value.get("score", TRUST_ACCEPT_THRESHOLD) if isinstance(value, dict) else value)
             state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
-            status_lines.append(f"R{victim.robot_id} -> R{malicious_robot_id}: trust={trust:.2f} {state}")
+            trust_lines.append(
+                f"R{victim.robot_id} -> R{malicious_robot_id}:\n"
+                f"  {trust:.2f}  {state}"
+            )
 
         for robot in robots:
             rid = robot.robot_id
@@ -6353,13 +6433,16 @@ def animate(world, robots, log, map_view=None):
             completed_tasks = log["robots"][rid]["completed_tasks"][frame]    
 
             status_lines.append(
-                f"R{rid}: tasks={completed_tasks}, carrying={carrying}, "
-                f"accepted={accepted}, rejected={rejected}, "
+                f"R{rid}: tasks={completed_tasks}, carrying={carrying}"
+            )
+            status_lines.append(
+                f"  accepted={accepted}, rejected={rejected}, "
                 f"replans={replans}, done={completed}"
             )
 
         status_text.set_text("\n".join(status_lines))
-        artists.extend((status_text, sharing_text))
+        trust_text.set_text("\n".join(trust_lines))
+        artists.extend((status_text, trust_text))
 
         return artists
 
