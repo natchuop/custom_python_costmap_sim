@@ -2,6 +2,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pytest
 
 import sim2
 
@@ -34,12 +35,14 @@ def test_fake_outline_is_dotted_red():
         plt.close(fig)
 
 
+@pytest.mark.filterwarnings("ignore:Animation was deleted without rendering anything")
 def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
     monkeypatch.setattr(plt, "show", lambda: None)
     _, robots, log = sim2.run_simulation(max_steps=1, tasks_per_robot=1, random_seed=15, experiment_mode="clean")
     animation = sim2.animate(sim2.GridWorld(log["truth_grid"][0]), robots, log)
     figure = animation._fig
     try:
+        animation._func(0)
         titles = [axis.get_title() for axis in figure.axes]
         assert sum("Ground Truth Map" in title for title in titles) == 1
         assert sum("Robot 0" in title for title in titles) == 1
@@ -47,4 +50,5 @@ def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
         assert sum("Robot 2" in title for title in titles) == 1
         assert len(figure.axes) >= 8
     finally:
+        animation.event_source.stop()
         plt.close(figure)

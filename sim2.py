@@ -5440,6 +5440,30 @@ def compute_experiment_metrics(robots, log):
         if log["robots"][robot.robot_id].get("traffic_waits")
     )
     traffic_replans = sum(robot.traffic_replan_count for robot in benign_robots)
+    recovery_start = next((step for step, phase in enumerate(log.get("phase", ())) if phase == "RECOVERY"), None)
+    recovery_metrics = {}
+    for robot in benign_robots:
+        rid = robot.robot_id
+        snapshots = log["robots"][rid].get("trust", [])
+        values = []
+        for snapshot in snapshots:
+            value = snapshot.get(malicious_robot_id, snapshot.get(str(malicious_robot_id))) if isinstance(snapshot, dict) else None
+            values.append(float(value.get("score")) if isinstance(value, dict) and value.get("score") is not None else (float(value) if value is not None else None))
+        start_value = values[recovery_start] if recovery_start is not None and recovery_start < len(values) else None
+        final_value = next((value for value in reversed(values) if value is not None), None)
+        was_distrusted = any(value is not None and value < TRUST_ACCEPT_THRESHOLD for value in values[:recovery_start]) if recovery_start is not None else False
+        first_retrust = None
+        if recovery_start is not None and was_distrusted:
+            first_retrust = next((step for step in range(recovery_start, len(values)) if values[step] is not None and values[step] >= TRUST_ACCEPT_THRESHOLD), None)
+        recovery_metrics[rid] = {
+            "trust_at_recovery_start": start_value if was_distrusted else None,
+            "final_trust": final_value if was_distrusted else None,
+            "recovery_trust_gain": (final_value - start_value) if was_distrusted and final_value is not None and start_value is not None else None,
+            "first_retrust_step": first_retrust,
+            "retrust_latency_steps": first_retrust - recovery_start if first_retrust is not None and recovery_start is not None else None,
+            "operationally_reenabled": first_retrust is not None,
+            "route_influence_reactivated": None,
+        }
 
     return {
         "defense_method": log.get("defense_method"),
@@ -5518,6 +5542,8 @@ def compute_experiment_metrics(robots, log):
         "deadlocks_detected": traffic_counts.get("traffic_deadlock_detected", 0),
         "deadlocks_recovered": traffic_counts.get("traffic_deadlock_recovered", 0),
         "robot_overlap_violations": int(log.get("robot_overlap_violations", 0)),
+        "recovery_start_step": recovery_start,
+        "recovery_metrics_per_robot": recovery_metrics,
     }
 
 def print_summary(world, robots, log):

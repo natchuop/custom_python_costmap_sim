@@ -162,6 +162,10 @@ def collect_rollout_metrics(
                 new_path_length=replan["new_path_length"],
             )
         for step in range(0, len(rlog["position"]), config.logging.timeseries_period_steps):
+            trust_snapshot = rlog["trust"][step]
+            trust_value = trust_snapshot.get(malicious) if isinstance(trust_snapshot, dict) else None
+            if isinstance(trust_value, dict):
+                trust_value = trust_value.get("score")
             collector.sample(
                 step=step,
                 phase=log["phase"][step],
@@ -176,7 +180,9 @@ def collect_rollout_metrics(
                 ),
                 benign_total_distance=sim2.compute_path_distance(rlog["position"][: step + 1]),
                 benign_total_replans=rlog["replan_count"][step],
-                attacker_trust=rlog["trust"][step].get(malicious),
+                attacker_trust=trust_value,
+                attacker_is_trusted=(trust_value is not None and float(trust_value) >= config.trust.threshold),
+                trust_threshold=config.trust.threshold,
                 malicious_claim_cells_on_route=rlog["malicious_claim_cells_on_route"][step],
                 traffic_waits=rlog.get("traffic_waits", [0])[step],
                 traffic_deadlock_active=rlog.get("traffic_deadlock_active", [False])[step],
@@ -234,6 +240,12 @@ def collect_rollout_metrics(
         "deadlocks_detected": calculated.get("deadlocks_detected", 0),
         "deadlocks_recovered": calculated.get("deadlocks_recovered", 0),
         "robot_overlap_violations": calculated.get("robot_overlap_violations", 0),
+        "recovery_start_step": calculated.get("recovery_start_step"),
+        "recovery_metrics_per_robot": calculated.get("recovery_metrics_per_robot", {}),
+        "recovery_trust_gain_r1": calculated.get("recovery_metrics_per_robot", {}).get(1, {}).get("recovery_trust_gain"),
+        "recovery_trust_gain_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("recovery_trust_gain"),
+        "retrust_latency_r1": calculated.get("recovery_metrics_per_robot", {}).get(1, {}).get("retrust_latency_steps"),
+        "retrust_latency_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("retrust_latency_steps"),
     }
     return summary, collector
 
