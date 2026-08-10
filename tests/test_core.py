@@ -78,6 +78,17 @@ def test_each_attack_type_reaches_benign_replanning():
         )
 
 
+def test_simulation_roles_are_fixed_to_robot_zero_attacker():
+    _, robots, log = sim2.run_simulation(
+        max_steps=5,
+        random_seed=12,
+        experiment_mode="clean",
+    )
+    assert log["malicious_robot_id"] == 0
+    assert [robot.robot_id for robot in robots if robot.is_malicious] == [0]
+    assert [robot.robot_id for robot in robots if not robot.is_malicious] == [1, 2]
+
+
 def test_fake_obstacles_use_enlarged_footprints():
     config = SimulationConfig(
         seed=0,

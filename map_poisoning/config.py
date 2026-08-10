@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 from .models import AttackType
 
 PRIMARY_METHODS = ("full_trust", "majority_vote", "trust_fused", "source_linked")
-ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay")
+ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay", "trust_threshold")
 ALL_METHODS = PRIMARY_METHODS + ADDITIONAL_METHODS
 MAP_VIEWS = ("combined", "local")
 
@@ -47,7 +46,7 @@ class TrustConfig:
 
 @dataclass(frozen=True)
 class FusionConfig:
-    method: str = "source_linked"
+    method: str = "trust_threshold"
     admission_policy: str = "accept_all"
     decay_rate: float = 0.006
     cost_scale: float = 14.0
@@ -60,7 +59,7 @@ class FusionConfig:
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    output_directory: str = "outputs"
+    output_directory: str = "outputs/simulation_results"
     timeseries_period_steps: int = 5
 
 
@@ -72,14 +71,14 @@ class VisualizationConfig:
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    seed: int = 10
+    seed: int = 12
     phases: PhaseConfig = field(default_factory=PhaseConfig)
     attacks: AttackConfig = field(default_factory=AttackConfig)
     trust: TrustConfig = field(default_factory=TrustConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
-    comparison_methods: tuple[str, ...] = PRIMARY_METHODS
+    comparison_methods: tuple[str, ...] = ("trust_fused",)
     communication_period_steps: int = 4
     temporary_blockage_change_period_steps: int = 150
     map_npy: str | None = None
@@ -98,6 +97,7 @@ class SimulationConfig:
         if self.trust.prior_alpha <= 0 or self.trust.prior_beta <= 0: raise ValueError("Bayesian priors must be positive")
         if not 0 <= self.trust.threshold <= 1: raise ValueError("trust threshold must be in [0, 1]")
         if self.fusion.method not in ALL_METHODS: raise ValueError(f"unknown defense method: {self.fusion.method}")
+        if not self.comparison_methods or any(item not in ALL_METHODS for item in self.comparison_methods): raise ValueError("comparison_methods must contain at least one valid defense method")
         if self.fusion.admission_policy not in {"auto_soft", "accept_all", "hard_reject"}: raise ValueError("unknown admission policy")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai: raise ValueError("use one map source")

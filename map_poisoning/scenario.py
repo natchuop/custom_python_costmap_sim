@@ -36,6 +36,7 @@ class ScenarioManifest:
     report_audit_labels: tuple[ReportAuditLabel, ...] = ()
     candidate_metadata: tuple[dict, ...] = ()
     authoring_warnings: tuple[str, ...] = ()
+    reconnaissance_heatmap: tuple[tuple[int, ...], ...] | None = None
     def to_dict(self): return asdict(self)
 
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
@@ -143,6 +144,40 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
 
 def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     """Author the default warehouse manifest from a clean recon rollout and heatmap candidates."""
+    # Build the exact starts and delivery queues that will be stored in the
+    # manifest before authoring reconnaissance. The earlier implementation
+    # authored candidates with one automatically generated task stream and
+    # then saved a slightly different stream, so attack candidates could miss
+    # the victim route during replay.
+    layout_world = sim2.GridWorld(np.asarray(grid, dtype=int))
+    layout_specs, layout_goals, _ = sim2.build_robot_specs_and_goals(
+        layout_world, prior_grid=layout_world.grid
+    )
+    layout_goals = sim2.filter_reachable_action_points(
+        layout_goals, layout_specs, layout_world.grid
+    )
+    sim2.relocate_starts_for_goals(layout_world, layout_specs, layout_goals, layout_world.grid)
+    layout_tasks = sim2.build_delivery_tasks(
+        layout_goals,
+        num_robots=sim2.DEFAULT_NUM_ROBOTS,
+        tasks_per_robot=config.deliveries_per_robot,
+    )
+    layout_tasks = sim2.repair_delivery_tasks(
+        layout_world,
+        layout_tasks,
+        layout_specs,
+        layout_world.grid,
+        action_points=layout_goals,
+    )
+    manifest_robot_starts = {
+        spec["robot_id"]: tuple(spec["start"])
+        for spec in layout_specs
+    }
+    manifest_task_queues = {
+        robot_id: tuple(tasks)
+        for robot_id, tasks in layout_tasks.items()
+    }
+
     old_phase = (sim2.MIN_RECON_STEPS, sim2.MAX_RECON_STEPS)
     sim2.MIN_RECON_STEPS = config.phases.recon_steps
     sim2.MAX_RECON_STEPS = config.phases.recon_steps
@@ -154,6 +189,8 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             max_steps=config.phases.total_steps,
             random_seed=config.seed,
             experiment_mode="clean",
+            manifest_robot_starts=manifest_robot_starts,
+            manifest_task_queues=manifest_task_queues,
         )
     finally:
         sim2.MIN_RECON_STEPS, sim2.MAX_RECON_STEPS = old_phase
@@ -227,7 +264,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             if not eligible:
                 step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
                 continue
-            episode = eligible[0]
+            episode = eligible[rng.randrange(len(eligible))]
             if selected_attack == AttackType.STALE_REASSERTION and any(
                 any(cell in other.cells and other.appearance_step <= step < other.clearance_step for other in episodes)
                 for cell in episode.cells
@@ -349,6 +386,12 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         task_queues=task_queues,
         candidate_metadata=tuple(metadata),
         authoring_warnings=tuple(dict.fromkeys(warnings)),
+        reconnaissance_heatmap=tuple(
+            tuple(int(value) for value in row)
+            for row in log["traffic_heatmap"][
+                min(config.phases.recon_steps, len(log["traffic_heatmap"]) - 1)
+            ]
+        ),
     )
 
 def save_manifest(manifest: ScenarioManifest, path: str | Path) -> None:
@@ -363,4 +406,5 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     queues={int(key):tuple(DeliveryTask(item["task_id"],tuple(item["pickup"]),tuple(item["dropoff"])) for item in value) for key,value in (raw.get("task_queues") or {}).items()}
     reports=tuple(ClaimReport(item["report_id"],item["sender_id"],tuple(item["target_cell"]),ClaimType(item["claim"]),item["observation_step"],item["sent_step"],item["received_step"],item.get("confidence",1.),item.get("scenario_event_id")) for item in raw.get("honest_attacker_reports",()))
     labels=tuple(ReportAuditLabel(item["report_id"],item["is_malicious"],AttackType(item["attack_type"]) if item.get("attack_type") else None,item.get("obstacle_episode_id"),ClaimType(item["actual_state_at_observation"]),item.get("original_obstacle_appearance_step"),item.get("original_obstacle_clearance_step")) for item in raw.get("report_audit_labels",()))
-    return ScenarioManifest(raw["schema_version"],raw["master_seed"],raw["derived_seeds"],raw["map_hash"],tuple(raw["map_shape"]),tuple(tuple(row) for row in raw["static_grid"]),raw["phase_boundaries"],raw["malicious_robot_id"],tuple(raw["benign_robot_ids"]),episodes,events,raw.get("scenario_id",""),raw.get("protocol_id","custom"),starts,queues,tuple(map(tuple,raw.get("attacker_positions",()))),reports,labels,tuple(raw.get("candidate_metadata",())),tuple(raw.get("authoring_warnings",())))
+    heatmap = raw.get("reconnaissance_heatmap")
+    return ScenarioManifest(raw["schema_version"],raw["master_seed"],raw["derived_seeds"],raw["map_hash"],tuple(raw["map_shape"]),tuple(tuple(row) for row in raw["static_grid"]),raw["phase_boundaries"],raw["malicious_robot_id"],tuple(raw["benign_robot_ids"]),episodes,events,raw.get("scenario_id",""),raw.get("protocol_id","custom"),starts,queues,tuple(map(tuple,raw.get("attacker_positions",()))),reports,labels,tuple(raw.get("candidate_metadata",())),tuple(raw.get("authoring_warnings",())),tuple(tuple(int(value) for value in row) for row in heatmap) if heatmap else None)

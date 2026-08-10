@@ -28,18 +28,16 @@ def export_temp_episodes(
         end = boundaries[index + 1]
         if start > 0:
             manager.refresh_active_blockages()
-        cells: list[tuple[int, int]] = []
         for pool_index in sorted(manager.active_indices):
             footprint_cells, _ = manager.current_footprints.get(pool_index, manager.pool[pool_index])
-            cells.extend(tuple(cell) for cell in footprint_cells)
-        unique = tuple(dict.fromkeys(cells))
-        if unique:
-            episodes.append(
-                TemporaryObstacleEpisode(
-                    f"legacy-temp-{index:03}",
-                    unique,
-                    start,
-                    end,
+            unique = tuple(dict.fromkeys(tuple(cell) for cell in footprint_cells))
+            if unique:
+                episodes.append(
+                    TemporaryObstacleEpisode(
+                        f"legacy-temp-{pool_index:02}-segment-{index:03}",
+                        unique,
+                        start,
+                        end,
+                    )
                 )
-            )
     return tuple(episodes)

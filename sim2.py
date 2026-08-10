@@ -8,7 +8,7 @@ from enum import IntEnum
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import RadioButtons
+from matplotlib.widgets import RadioButtons, Button
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 
@@ -20,7 +20,7 @@ from defense_method_runner import DEFENSE_METHODS, build_defense_runner
 # Configuration
 # ============================================================
 
-RANDOM_SEED = 10
+RANDOM_SEED = 12
 
 GRID_ROWS = 24
 GRID_COLS = 36
@@ -117,7 +117,7 @@ ATTACK_MODE = "recon_heatmap"
 
 # Occupancy-claim defense policy. Available values are defined in
 # defense_method_runner.py and can also be selected with --defense-method.
-DEFENSE_METHOD = "source_linked"
+DEFENSE_METHOD = "trust_threshold"
 
 # Phase 1: attacker observes benign movement and builds a traffic heatmap.
 MIN_RECON_STEPS = 300
@@ -240,6 +240,7 @@ SOURCE_LINKED_REPLAN_COOLDOWN_STEPS = 25
 SOURCE_LINKED_MIN_TRUST_DELTA = 0.10
 SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
 SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
+MALICIOUS_ROUTE_PROXIMITY_CELLS = 2
 
 # Shared replan churn controls. These apply to every defense method so fallback
 # stalls and empty-path retries do not dominate runtime or outcomes.
@@ -1799,8 +1800,8 @@ class RobotBeliefMap:
         Trust-weighted belief update.
 
         High-trust reports can mark cells blocked/free.
-        Lower-trust reports only create weak confidence updates.
-        Very low-trust reports are ignored by the Robot, before this is called.
+        Reports remain available to the defense runner for audit and trust
+        verification even when their current operational influence is zero.
         """
         cell = report.target_cell
 
@@ -1826,8 +1827,8 @@ class RobotBeliefMap:
         ):
             return False
 
-        # If this cell has direct sensor confidence, peer reports should not
-        # override it unless the report is extremely trusted.
+        # Fresh direct sensing remains authoritative. Operational route
+        # arbitration is handled by the defense runner and belief map.
         if self.source[r, c] == "self_sensor" and trust_score < 0.95:
             return False
 
@@ -1940,6 +1941,14 @@ class RobotBeliefMap:
             )
         )
 
+    def direct_free_strength(self, cell, timestamp=None):
+        if not self._direct_free_observation(cell):
+            return 0.0
+        r, c = tuple(cell)
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        age = max(0, now - int(self.last_updated[r, c]))
+        return 1.25 * float(self.confidence[r, c]) * math.exp(-0.01 * age)
+
     def footprint_is_peer_hard_blocked(self, footprint, timestamp=None):
         """Peer hard blocks apply only where direct sensing has not verified free."""
         if self.defense_runner is None:
@@ -1947,7 +1956,9 @@ class RobotBeliefMap:
 
         now = self.current_timestamp if timestamp is None else int(timestamp)
         for footprint_cell in footprint:
-            if self._direct_free_observation(footprint_cell):
+            if self._direct_free_observation(footprint_cell) and self.defense_runner.method != "trust_threshold":
+                continue
+            if self._direct_free_observation(footprint_cell) and self.defense_runner.blocked_support(footprint_cell, now) <= self.direct_free_strength(footprint_cell, now):
                 continue
             if self.defense_runner.is_hard_blocked(footprint_cell, now):
                 return True
@@ -2013,15 +2024,13 @@ class RobotBeliefMap:
             # ``is_blocked_for_planning`` above.
             peer_cost = 1.0
             for footprint_cell in robot_footprint_cells(cell):
-                if self._direct_free_observation(footprint_cell):
+                if self._direct_free_observation(footprint_cell) and self.defense_runner.method != "trust_threshold":
                     continue
-                peer_cost = max(
-                    peer_cost,
-                    self.defense_runner.routing_cost(
-                        footprint_cell,
-                        self.current_timestamp,
-                    ),
-                )
+                contribution = self.defense_runner.routing_cost(footprint_cell, self.current_timestamp)
+                if self._direct_free_observation(footprint_cell):
+                    ratio = min(1.0, self.defense_runner.blocked_support(footprint_cell, self.current_timestamp) / max(self.direct_free_strength(footprint_cell, self.current_timestamp), 1e-9))
+                    contribution = 1.0 + (contribution - 1.0) * ratio
+                peer_cost = max(peer_cost, contribution)
             if math.isinf(peer_cost):
                 return float("inf")
             max_cost = max(max_cost, peer_cost)
@@ -2874,6 +2883,7 @@ class GridRobot:
         self.last_trust_events = []
         self.last_shared_claim = {}
         self.last_shared_step = {}
+        self.pending_outbound = {}
         self.defense_replan_needed = False
         self.last_source_linked_replan_step = -10**9
         self.source_linked_replan_context = None
@@ -3189,6 +3199,37 @@ class GridRobot:
 
         self.pending_claims = still_pending
 
+        if self.defense_method == "trust_threshold" and verified_by_sender:
+            threshold = float(self.defense_runner.config.trust_threshold)
+            route_cells = self._source_linked_route_cells()
+            for sender_id in verified_by_sender:
+                old_trust = float(old_trust_by_sender[sender_id])
+                new_trust = float(self.trust_model.score(sender_id))
+                crossed = (old_trust >= threshold) != (new_trust >= threshold)
+                if not crossed or not route_cells:
+                    continue
+                risk_before = self.defense_runner.sender_route_risk(
+                    sender_id, route_cells, timestamp=timestamp, trust_override=old_trust
+                )
+                risk_after = self.defense_runner.sender_route_risk(
+                    sender_id, route_cells, timestamp=timestamp, trust_override=new_trust
+                )
+                if abs(risk_before - risk_after) <= 1e-9:
+                    continue
+                self.defense_replan_needed = True
+                self.source_linked_replan_context = {
+                    "sender_id": sender_id,
+                    "old_trust": old_trust,
+                    "new_trust": new_trust,
+                    "threshold": threshold,
+                    "crossing": "activated" if new_trust >= threshold else "deactivated",
+                    "route_risk_before": risk_before,
+                    "route_risk_after": risk_after,
+                    "route_risk_drop": max(0.0, risk_before - risk_after),
+                }
+                break
+            return
+
         if self.defense_method != "source_linked" or not verified_by_sender:
             return
 
@@ -3269,6 +3310,21 @@ class GridRobot:
             for anchor in remaining:
                 if target in robot_footprint_cells(anchor):
                     return True
+
+            # A fake footprint can be adjacent to the current route without
+            # covering its center anchor. Treat that as close enough to
+            # replan, allowing the robot to detour before it reaches the
+            # claimed obstacle and still recover if later direct sensing says
+            # the cell is actually free.
+            if (
+                report.is_malicious
+                and report.claim == ClaimType.BLOCKED
+                and any(
+                    manhattan(target, anchor) <= MALICIOUS_ROUTE_PROXIMITY_CELLS
+                    for anchor in remaining
+                )
+            ):
+                return True
 
         return False
 
@@ -3444,18 +3500,31 @@ class GridRobot:
         return self.advance_continuous_motion()
 
     def should_share_observation(self, cell, claim, timestamp):
-        """Share changed observations immediately and periodically refresh stable ones."""
+        """Return whether a fresh observation should enter the outbound queue."""
         cell = tuple(cell)
         claim_value = int(claim)
         previous = self.last_shared_claim.get(cell)
         last_step = self.last_shared_step.get(cell, -10**9)
+        pending = self.pending_outbound.get(cell)
 
         if previous == claim_value and timestamp - last_step < HONEST_REPORT_REFRESH_STEPS:
             return False
-
-        self.last_shared_claim[cell] = claim_value
-        self.last_shared_step[cell] = int(timestamp)
+        if pending is not None and int(pending.claim) == claim_value:
+            return False
         return True
+
+    def queue_outbound_reports(self, reports):
+        for report in reports:
+            self.pending_outbound[tuple(report.target_cell)] = report
+
+    def drain_outbound_reports(self, sent_step):
+        reports = list(self.pending_outbound.values())
+        self.pending_outbound.clear()
+        for report in reports:
+            cell = tuple(report.target_cell)
+            self.last_shared_claim[cell] = int(report.claim)
+            self.last_shared_step[cell] = int(sent_step)
+        return reports
 
     def make_observation_reports(
         self,
@@ -3666,42 +3735,17 @@ def make_demo_dynamic_grid(static_grid):
 # ============================================================
 
 def choose_malicious_robot_id(robot_specs, goals, prior_grid):
+    """Return the fixed attacker identity used by every experiment.
+
+    Robot identities are part of the experiment protocol: R0 is malicious and
+    R1/R2 are benign victims. Choosing the nearest reachable robot made the
+    role depend on the map and seed, which could silently turn R1 into the
+    attacker and invalidate comparisons and playback labels.
     """
-    Chooses a malicious robot from robots that can reach at least one action point.
-
-    This avoids tying malicious selection to goals[0], which may belong to
-    another disconnected region. Because apparently one bad anchor cell was
-    enough to ruin the whole production.
-    """
-    candidates = []
-
-    for spec in robot_specs:
-        robot_id = int(spec["robot_id"])
-        start = tuple(spec["start"])
-
-        reachable_goals = [
-            tuple(goal)
-            for goal in goals
-            if route_exists_for_prior(prior_grid, start, goal)
-        ]
-
-        if not reachable_goals:
-            continue
-
-        nearest_distance = min(
-            manhattan(start, goal)
-            for goal in reachable_goals
-        )
-
-        candidates.append((nearest_distance, robot_id))
-
-    if not candidates:
-        raise RuntimeError(
-            "No robot can reach any reachable action point."
-        )
-
-    candidates.sort()
-    return candidates[0][1]
+    robot_ids = {int(spec["robot_id"]) for spec in robot_specs}
+    if 0 not in robot_ids:
+        raise RuntimeError("The experiment team must include malicious Robot 0.")
+    return 0
 
 def validate_start_and_goal(world, robot_specs, goal):
     if not world.in_bounds(goal):
@@ -4400,7 +4444,7 @@ def run_simulation(
                 robot.last_trust_events = []
 
             if HONEST_ROBOTS_SHARE_OBSERVATIONS:
-                reports_by_sender[robot.robot_id].extend(
+                robot.queue_outbound_reports(
                     robot.make_observation_reports(
                         observations,
                         step,
@@ -4499,6 +4543,10 @@ def run_simulation(
         # disappear merely because that step falls between normal periodic
         # broadcasts (for example step 470 with a four-step cadence).
         if COMMUNICATION_PERIOD_STEPS > 0 and (step % COMMUNICATION_PERIOD_STEPS == 0 or fixed_attack_injected):
+            for robot in robots:
+                reports_by_sender[robot.robot_id].extend(
+                    robot.drain_outbound_reports(step)
+                )
             broadcast_reports(robots, reports_by_sender)
 
             for sender_id, reports in reports_by_sender.items():
@@ -4506,6 +4554,8 @@ def run_simulation(
                     log["reports"].append(
                         {
                             "step": step,
+                            "observation_step": report.timestamp,
+                            "sent_step": step,
                             "sender_id": sender_id,
                             "target_cell": report.target_cell,
                             "claim": int(report.claim),
@@ -4523,6 +4573,11 @@ def run_simulation(
             path_invalid = robot.should_replan_for_path_state(step)
             trust_reweight = bool(robot.defense_replan_needed)
             should_replan = route_affected or trust_reweight or path_invalid
+            accepted_malicious = [
+                report
+                for report in accepted
+                if report.is_malicious
+            ]
 
             if should_replan:
                 reasons = []
@@ -4535,6 +4590,8 @@ def run_simulation(
                     reasons.append("source_linked_trust_reweight")
                 if path_invalid:
                     reasons.append("path_invalid_or_empty")
+                if accepted_malicious:
+                    reasons.append("malicious_report_accepted")
 
                 try:
                     robot.plan_path(
@@ -4548,12 +4605,6 @@ def run_simulation(
                 finally:
                     robot.defense_replan_needed = False
                     robot.source_linked_replan_context = None
-
-            accepted_malicious = [
-                report
-                for report in accepted
-                if report.is_malicious
-            ]
 
             if accepted_malicious and old_path != list(robot.path):
                 print(
@@ -4704,6 +4755,13 @@ def run_simulation(
             local = robot.belief_map.initial_prior.copy()
             direct_mask = robot.belief_map.source == "self_sensor"
             local[direct_mask] = robot.belief_map.belief[direct_mask]
+            own_display = ROBOT_BELIEF_DISPLAY.get(rid, DISPLAY_PEER_BELIEF)
+            for dr, dc in np.argwhere(direct_mask):
+                if CellState(int(robot.belief_map.belief[dr, dc])) in (
+                    CellState.OCCUPIED_DYNAMIC,
+                    CellState.TEMPORARILY_BLOCKED,
+                ):
+                    local[dr, dc] = own_display
             rlog["local_belief"].append(local)
             effective = local.copy()
             peer_cells = []
@@ -4719,7 +4777,10 @@ def run_simulation(
                         and not is_blocking_state(robot.belief_map.initial_prior[r, c])):
                     # Own direct sensing remains authoritative in the display.
                     if robot.belief_map.source[r, c] != "self_sensor":
-                        effective[r, c] = DISPLAY_PEER_BELIEF
+                        source_id = state.dominant_source
+                        effective[r, c] = ROBOT_BELIEF_DISPLAY.get(
+                            source_id, DISPLAY_PEER_BELIEF
+                        )
                         peer_cells.append((r, c, state.claim, state.routing_cost, state.evidence))
                         peer_provenance.append({
                             "cell": (r, c),
@@ -4730,6 +4791,12 @@ def run_simulation(
                             }),
                             "claim": state.claim,
                             "evidence": state.evidence,
+                            "dominant_source": source_id,
+                            "supporting_sources": list(state.supporting_sources),
+                            "dominant_trust": (
+                                robot.trust_for(source_id)
+                                if source_id is not None else None
+                            ),
                         })
             rlog["combined_belief"].append(effective)
             rlog["effective_peer_cells"].append(peer_cells)
@@ -5090,6 +5157,12 @@ DISPLAY_GOAL = 10
 DISPLAY_MALICIOUS_FAKE_OBJECT = 11
 DISPLAY_PEER_BELIEF = 12
 DISPLAY_FALSE_CLEARANCE = 13
+DISPLAY_ROBOT0_BELIEF = 14
+DISPLAY_ROBOT1_BELIEF = DISPLAY_PEER_BELIEF
+DISPLAY_ROBOT2_BELIEF = 15
+
+ROBOT_COLORS = {0: "#8e24aa", 1: "#fb8c00", 2: "#1976d2"}
+ROBOT_BELIEF_DISPLAY = {0: DISPLAY_ROBOT0_BELIEF, 1: DISPLAY_ROBOT1_BELIEF, 2: DISPLAY_ROBOT2_BELIEF}
 
 def expand_fake_object_cells(fake_cells):
     expanded = set()
@@ -5193,9 +5266,9 @@ def make_belief_display_array(
     """
     Display array for a robot belief map.
 
-    Normal robots should not receive malicious_fake_objects here.
-    If they accept a fake blocked report, it remains green because their
-    belief map stores it as CellState.TEMPORARILY_BLOCKED.
+    Normal robots should not receive malicious_fake_objects here. If they
+    accept a fake blocked report, the combined map uses the normal source
+    color; the animation adds a red outline to identify its malicious origin.
 
     Malicious robots may receive malicious_fake_objects here so their own
     view shows the fake object in red.
@@ -5229,6 +5302,24 @@ def make_belief_display_array(
         arr[r, c] = DISPLAY_ROBOT
 
     return arr
+
+
+def draw_attack_outlines(ax, cells, color="#d32f2f"):
+    """Outline maliciously sourced cells that reached a victim's map."""
+    patches = []
+    for r, c in cells:
+        patch = plt.Rectangle(
+            (c - 0.5, r - 0.5),
+            1,
+            1,
+            fill=False,
+            edgecolor=color,
+            linewidth=2.4,
+            zorder=12,
+        )
+        ax.add_patch(patch)
+        patches.append(patch)
+    return patches
 
 
 def draw_path(ax, path, color="black", linewidth=1.8, alpha=0.8):
@@ -5312,14 +5403,16 @@ def animate(world, robots, log, map_view=None):
         "#bdbdbd",  # 3 unknown
         "#66bb6a",  # 4 temporarily_blocked, normal believed blockage
         "#f9a825",  # 5 congested
-        "#2e7d32",  # 6 pickup
-        "#1976d2",  # 7 dropoff
-        "#8e24aa",  # 8 charging
+        "#795548",  # 6 pickup
+        "#26a69a",  # 7 dropoff
+        "#607d8b",  # 8 charging
         "#00e5ff",  # 9 robot
         "#ffeb3b",  # 10 goal
         "#e53935",  # 11 malicious fake object overlay
-        "#fb8c00",  # 12 effective blocked peer belief
+        "#fb8c00",  # 12 robot 1 / orange provenance
         "#ef9a9a",  # 13 false-clearance attack overlay
+        "#8e24aa",  # 14 robot 0 / purple provenance
+        "#1976d2",  # 15 robot 2 / blue provenance
     ]
 
     cmap = ListedColormap(colors)
@@ -5331,7 +5424,7 @@ def animate(world, robots, log, map_view=None):
     fig, axes = plt.subplots(
         1,
         num_panels,
-        figsize=(7 * num_panels, 7),
+        figsize=(7 * num_panels, 8.6),
         squeeze=False,
     )
 
@@ -5343,9 +5436,10 @@ def animate(world, robots, log, map_view=None):
         for idx, robot in enumerate(robots)
     }
 
-    truth_ax.set_title("Ground Truth Map")
-    truth_ax.set_xlabel("col")
-    truth_ax.set_ylabel("row")
+    truth_ax.set_title("Ground Truth Map", fontsize=13, pad=6)
+    truth_ax.set_xlabel("col", fontsize=11)
+    truth_ax.set_ylabel("row", fontsize=11)
+    truth_ax.tick_params(labelsize=10)
 
     initial_positions = {}
 
@@ -5370,7 +5464,7 @@ def animate(world, robots, log, map_view=None):
         rid = robot.robot_id
         anchor_cell = log["robots"][rid]["position"][0]
 
-        edge_color = "purple" if robot.is_malicious else "blue"
+        edge_color = ROBOT_COLORS.get(rid, "#555555")
 
         patch = draw_robot_footprint(
             truth_ax,
@@ -5384,6 +5478,7 @@ def animate(world, robots, log, map_view=None):
     belief_imgs = {}
     belief_path_lines = {}
     belief_robot_patches = {}
+    belief_attack_outline_patches = {}
 
     for robot in robots:
         rid = robot.robot_id
@@ -5392,16 +5487,20 @@ def animate(world, robots, log, map_view=None):
         role = "MALICIOUS" if robot.is_malicious else "VICTIM"
         selected_view = map_view or log.get("map_view", "combined")
         view_label = "Combined Belief Map" if selected_view == "combined" else "Local Observation Map"
-        ax.set_title(f"Robot {rid} {view_label} ({role})")
-        ax.set_xlabel("col")
-        ax.set_ylabel("row")
+        ax.set_title(
+            f"Robot {rid}\n{view_label}\n({role})",
+            fontsize=13,
+            pad=6,
+            color=ROBOT_COLORS.get(rid, "#555555"),
+        )
+        ax.set_xlabel("col", fontsize=11)
+        ax.set_ylabel("row", fontsize=11)
+        ax.tick_params(labelsize=10)
 
         first_belief = log["robots"][rid].get(
             "combined_belief" if selected_view == "combined" else "local_belief",
             log["robots"][rid]["belief"],
         )[0]
-        first_position = log["robots"][rid]["position"][0]
-
         initial_attack_overlays = (
             log.get("attack_overlays", [[]])[0]
             if robot.is_malicious
@@ -5423,7 +5522,7 @@ def animate(world, robots, log, map_view=None):
 
         anchor_cell = log["robots"][rid]["position"][0]
 
-        edge_color = "red" if robot.is_malicious else "blue"
+        edge_color = ROBOT_COLORS.get(rid, "#555555")
 
         patch = draw_robot_footprint(
             ax,
@@ -5433,22 +5532,46 @@ def animate(world, robots, log, map_view=None):
         )
 
         belief_robot_patches[rid] = patch
+        belief_attack_outline_patches[rid] = []
 
         belief_path_lines[rid] = []
 
-    status_text = fig.text(
+    # Reserve a dedicated lower band for status, sharing guidance, controls,
+    # and the legend so wide multi-panel figures do not overlap or clip them.
+    status_text = fig.text(0.02, 0.285, "", fontsize=10, va="top", family="DejaVu Sans Mono")
+    sharing_text = fig.text(
         0.02,
-        0.18,
-        "",
+        0.14,
+        "Peer sharing: occupied cells use the source robot's color. "
+        "When multiple trusted robots support a cell, the highest-trust "
+        "source color is displayed.",
         fontsize=10,
+        va="top",
     )
 
     max_frames = len(log["truth_grid"])
     display_index = 0
     first_tick = True
-    speed_ax = fig.add_axes((0.02, 0.025, 0.22, 0.08))
-    speed_ax.set_title("Playback speed:", fontsize=9, loc="left")
+    controls_ax = fig.add_axes((0.02, 0.035, 0.30, 0.12))
+    controls_ax.set_title("Playback controls", fontsize=10, loc="left", pad=3)
+    controls_ax.set_xticks([])
+    controls_ax.set_yticks([])
+    speed_ax = fig.add_axes((0.035, 0.055, 0.14, 0.075))
+    speed_ax.set_title("Speed", fontsize=10, loc="left", pad=2)
     speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
+    for label in speed.labels:
+        label.set_fontsize(10)
+    pause_ax = fig.add_axes((0.20, 0.070, 0.085, 0.045))
+    pause_button = Button(pause_ax, "Pause", color="#eeeeee", hovercolor="#d0d0d0")
+    pause_button.label.set_fontsize(10)
+    paused = False
+
+    def toggle_pause(_event):
+        nonlocal paused
+        paused = not paused
+        pause_button.label.set_text("Resume" if paused else "Pause")
+
+    pause_button.on_clicked(toggle_pause)
 
     def selected_multiplier():
         try:
@@ -5461,15 +5584,18 @@ def animate(world, robots, log, map_view=None):
     fig.legend(
         handles=[
             Patch(facecolor="#222222", label="Static obstacle"),
-            Patch(facecolor="#66bb6a", label="Direct/self observation"),
-            Patch(facecolor="#fb8c00", label="Peer blocked belief"),
+            Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),
+            Patch(facecolor=ROBOT_COLORS[1], label="Robot 1 source (orange)"),
+            Patch(facecolor=ROBOT_COLORS[2], label="Robot 2 source (blue)"),
             Patch(facecolor="#ffeb3b", label="Goal/checkpoint"),
             Patch(facecolor="#e53935", label="Attack overlay"),
+            Patch(facecolor="#ef9a9a", label="False clearance"),
+            Patch(facecolor="none", edgecolor="#d32f2f", label="Malicious claim in victim map"),
         ],
         loc="lower center",
-        bbox_to_anchor=(0.58, 0.095),
-        ncol=5,
-        fontsize=8,
+        bbox_to_anchor=(0.72, 0.145),
+        ncol=2,
+        fontsize=10,
         frameon=False,
     )
 
@@ -5477,7 +5603,7 @@ def animate(world, robots, log, map_view=None):
         nonlocal truth_path_lines, truth_lidar_lines, display_index, first_tick
         if first_tick:
             first_tick = False
-        else:
+        elif not paused:
             display_index = min(max_frames - 1, display_index + selected_multiplier())
         frame = int(display_index)
         artists = []
@@ -5534,7 +5660,7 @@ def animate(world, robots, log, map_view=None):
             path = log["robots"][rid]["path"][frame]
 
             if path:
-                color = "blue" if not robot.is_malicious else "black"
+                color = ROBOT_COLORS.get(rid, "#555555")
                 line = draw_path(
                     truth_ax,
                     path,
@@ -5570,13 +5696,32 @@ def animate(world, robots, log, map_view=None):
             )
             artists.append(belief_imgs[rid])
 
-            x, y = log["robots"][rid]["position_xy"][frame]
-
             r, c = log["robots"][rid]["position"][frame]
 
             belief_robot_patches[rid].set_xy((c - 0.5, r - 0.5))
 
             artists.append(belief_robot_patches[rid])
+
+            for outline in belief_attack_outline_patches[rid]:
+                outline.remove()
+            belief_attack_outline_patches[rid] = []
+
+            if selected_view == "combined" and not robot.is_malicious:
+                provenance_frames = log["robots"][rid].get("peer_provenance", [])
+                provenance_at_frame = (
+                    provenance_frames[frame]
+                    if frame < len(provenance_frames)
+                    else ()
+                )
+                malicious_cells = [
+                    tuple(provenance["cell"])
+                    for provenance in provenance_at_frame
+                    if 0 in provenance.get("senders", ())
+                ]
+                belief_attack_outline_patches[rid] = draw_attack_outlines(
+                    belief_axes[rid], malicious_cells
+                )
+                artists.extend(belief_attack_outline_patches[rid])
 
             for line in belief_path_lines[rid]:
                 line.remove()
@@ -5585,7 +5730,7 @@ def animate(world, robots, log, map_view=None):
             path = log["robots"][rid]["path"][frame]
 
             if path:
-                color = "blue" if not robot.is_malicious else "black"
+                color = ROBOT_COLORS.get(rid, "#555555")
                 line = draw_path(
                     belief_axes[rid],
                     path,
@@ -5619,16 +5764,24 @@ def animate(world, robots, log, map_view=None):
                     latest = event
         friendly = {"fake_obstacle": "Fake Obstacle", "false_clearance": "False Clearance", "stale_reassertion": "Stale Reassertion"}
         latest_text = "None" if latest is None else f"{friendly.get(latest.get('attack_type'), latest.get('attack_type'))} - Step {latest['step']}"
-        status_parts = [
-            f"Step: {actual_step}",
-            f"Phase: {phase}",
-            f"Attack starts at: {attack_start_text}",
-            f"Spawn grace: {grace_active}",
-            f"Reports so far: {report_count}",
-            f"Malicious reports: {malicious_report_count}",
-            f"Attack overlays: {sum(len(item.get('cells', ())) for item in log.get('attack_overlays', [[]])[frame])}",
-            f"Malicious robot: R{malicious_robot_id}",
-            f"Latest attack: {latest_text}",
+        overlay_count = sum(
+            len(item.get("cells", ()))
+            for item in log.get("attack_overlays", [[]])[frame]
+        )
+        status_lines = [
+            " | ".join([
+                f"Step: {actual_step}",
+                f"Phase: {phase}",
+                f"Attack starts: {attack_start_text}",
+                f"Spawn grace: {grace_active}",
+            ]),
+            " | ".join([
+                f"Reports: {report_count}",
+                f"Malicious reports: {malicious_report_count}",
+                f"Attack overlays: {overlay_count}",
+                f"Malicious robot: R{malicious_robot_id}",
+                f"Latest attack: {latest_text}",
+            ]),
         ]
 
         for robot in robots:
@@ -5641,30 +5794,34 @@ def animate(world, robots, log, map_view=None):
             carrying = log["robots"][rid]["carrying_item"][frame]
             completed_tasks = log["robots"][rid]["completed_tasks"][frame]    
 
-            status_parts.append(
-                f"R{rid}: tasks={completed_tasks}, carrying={carrying}, accepted={accepted}, rejected={rejected}, replans={replans}, done={completed}"
+            status_lines.append(
+                f"R{rid}: tasks={completed_tasks}, carrying={carrying}, "
+                f"accepted={accepted}, rejected={rejected}, "
+                f"replans={replans}, done={completed}"
             )
 
-        status_text.set_text(" | ".join(status_parts))
-        artists.append(status_text)
+        status_text.set_text("\n".join(status_lines))
+        artists.extend((status_text, sharing_text))
 
         return artists
 
     anim = FuncAnimation(
         fig,
         update,
-        frames=max_frames,
+        # The slowest setting advances by 0.25 frame per callback; allocate
+        # enough callbacks that every playback speed reaches the final frame.
+        frames=(max_frames * 4) + 1,
         interval=ANIMATION_INTERVAL_MS,
         blit=False,
         repeat=False,
     )
 
-    plt.tight_layout(rect=(0, 0.21, 1, 1))
+    fig.subplots_adjust(left=0.02, right=0.99, bottom=0.32, top=0.88, wspace=0.12)
     plt.show()
 
     return anim
 
-def show_recon_heatmap(world, log):
+def show_recon_heatmap(world, log, output_path=None):
     """
     Shows the learned reconnaissance heatmap at the end of phase 1.
 
@@ -5720,7 +5877,11 @@ def show_recon_heatmap(world, log):
         label="benign traffic count",
     )
 
-    plt.tight_layout()
+    fig.tight_layout()
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
     plt.show()
 
 def parse_args():
@@ -5732,6 +5893,7 @@ def parse_args():
     parser.add_argument("--map-movingai", type=str, default=None)
     parser.add_argument("--no-animation", action="store_true")
     parser.add_argument("--defense-method", choices=DEFENSE_METHODS, default=DEFENSE_METHOD)
+    parser.add_argument("--trust-threshold", type=float, default=TRUST_ACCEPT_THRESHOLD)
 
     parser.add_argument("--decay-rate", type=float, default=0.006)
     parser.add_argument("--cost-scale", type=float, default=14.0)
@@ -5753,6 +5915,8 @@ def parse_args():
         parser.error("--deliveries-per-robot must be at least 1")
     if args.max_steps < 1:
         parser.error("--max-steps must be at least 1")
+    if not 0.0 <= args.trust_threshold <= 1.0:
+        parser.error("--trust-threshold must be in [0, 1]")
     return args
 
 # ============================================================
@@ -5777,6 +5941,7 @@ if __name__ == "__main__":
         grid = make_demo_dynamic_grid(prior_grid)
 
     defense_config = {
+        "trust_threshold": args.trust_threshold,
         "decay_rate": args.decay_rate,
         "cost_scale": args.cost_scale,
         "cost_exponent": args.cost_exponent,

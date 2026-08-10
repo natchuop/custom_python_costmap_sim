@@ -15,6 +15,8 @@ class RunResult:
     method: str
     manifest: ScenarioManifest
     summary: dict
+    world: object | None = None
+    log: dict | None = None
 
 
 def replay(
@@ -30,4 +32,11 @@ def replay(
         output_directory,
         show_animation=config.visualization.animation,
     )
-    return RunResult(result.output_directory, method, manifest, result.summary)
+    return RunResult(
+        result.output_directory,
+        method,
+        manifest,
+        result.summary,
+        result.world,
+        result.log,
+    )

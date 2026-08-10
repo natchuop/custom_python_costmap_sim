@@ -266,8 +266,8 @@ def check_project_files(project_root: Path) -> list[CheckResult]:
     results.append(CheckResult("Project root", "PASS", str(root)))
     for filename in expected:
         path = root / filename
-        status = "PASS" if path.is_file() else "WARN"
-        detail = f"Found {path}" if path.is_file() else f"Not found: {path}"
+        status = "PASS" if path.exists() else "WARN"
+        detail = f"Found {path}" if path.exists() else f"Not found: {path}"
         results.append(CheckResult(filename, status, detail))
 
     map_files = list(root.glob("converted_maps/**/*.npy")) + list(root.glob("**/*.map"))

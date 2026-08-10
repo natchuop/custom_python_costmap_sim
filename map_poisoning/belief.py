@@ -36,6 +36,13 @@ class RobotBeliefMap:
     def has_direct_free(self, cell: Cell) -> bool:
         return self.direct_state(cell) == ClaimType.FREE
 
+    def direct_free_strength(self, cell: Cell, step: int) -> float:
+        item = self.direct.get(cell)
+        if item is None or item.claim != ClaimType.FREE:
+            return 0.0
+        age = max(0, step - int(item.step))
+        return 1.25 * math.exp(-0.01 * age)
+
     def is_blocked_for_planning(self, cell: Cell, fusion, step: int) -> bool:
         if not self.in_bounds(cell) or self.static_grid[cell]:
             return True
@@ -43,7 +50,9 @@ class RobotBeliefMap:
         if direct == ClaimType.BLOCKED:
             return True
         if direct == ClaimType.FREE:
-            return fusion.footprint_hard_blocked([cell], step)
+            if fusion.method != "trust_threshold":
+                return fusion.footprint_hard_blocked([cell], step)
+            return fusion._runner.blocked_support(cell, step) > self.direct_free_strength(cell, step)
         return fusion.footprint_hard_blocked([cell], step)
 
     def traversal_cost(self, cell: Cell, step: int, fusion) -> float:
@@ -53,7 +62,11 @@ class RobotBeliefMap:
             return math.inf
         direct = self.direct_state(cell)
         if direct == ClaimType.FREE:
-            return 1.0
+            if fusion.method != "trust_threshold":
+                return 1.0
+            peer = fusion._runner.blocked_support(cell, step)
+            local = self.direct_free_strength(cell, step)
+            return 1.0 + fusion.routing_cost(cell, step) * min(1.0, peer / max(local, 1e-9))
         max_cost = self.UNKNOWN_TRAVERSAL_COST if direct is None else 1.0
         peer_cost = fusion.routing_cost(cell, step)
         if math.isinf(peer_cost):
