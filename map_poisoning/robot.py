@@ -82,6 +82,7 @@ class ModularRobot:
     last_source_linked_replan_step: int = -10**9
     last_shared_claim: dict[tuple[int, int], ClaimType] = field(default_factory=dict)
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
+    pending_outbound: dict[tuple[int, int], ClaimReport] = field(default_factory=dict)
     defense_replan_needed: bool = False
     source_linked_replan_context: dict | None = None
 
@@ -107,9 +108,19 @@ class ModularRobot:
         last_step = self.last_shared_step.get(cell, -10**9)
         if previous == claim and step - last_step < HONEST_REPORT_REFRESH_STEPS:
             return False
-        self.last_shared_claim[cell] = claim
-        self.last_shared_step[cell] = step
         return True
+
+    def queue_observation(self, report: ClaimReport) -> None:
+        self.pending_outbound[tuple(report.target_cell)] = report
+
+    def drain_outbox(self, sent_step: int) -> list[ClaimReport]:
+        reports = list(self.pending_outbound.values())
+        self.pending_outbound.clear()
+        for report in reports:
+            cell = tuple(report.target_cell)
+            self.last_shared_claim[cell] = report.claim
+            self.last_shared_step[cell] = int(sent_step)
+        return reports
 
     def _source_linked_route_cells(self, step: int) -> list[tuple[int, int]]:
         if not self.path:

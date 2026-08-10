@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $mapPath)) {
     throw "Map not found: $mapPath. Run: .\.venv\Scripts\python.exe .\convert_maps.py --input .\warehouse-world --output .\converted_maps --downsample 8"
 }
 
-$args = @("$projectRoot\main.py", "--headless", "--map-npy", $mapPath, "--max-steps", $MaxSteps, "--output-directory", (Join-Path $projectRoot "outputs"))
+$args = @("$projectRoot\main.py", "--headless", "--map-npy", $mapPath, "--max-steps", $MaxSteps, "--output-directory", (Join-Path $projectRoot "outputs\simulation_results"))
 if ($NoAnimation) { $args += "--no-animation" }
 & $python @args
 exit $LASTEXITCODE

@@ -32,6 +32,7 @@ DEFENSE_METHODS = (
     "time_decay",
     "trust_fused",
     "source_linked",
+    "trust_threshold",
 )
 
 
@@ -47,12 +48,23 @@ class StoredClaim:
     trust_at_report: float
     is_malicious: bool = False
 
+@dataclass(frozen=True)
+class EffectivePeerCell:
+    claim: int | None
+    has_active_evidence: bool
+    hard_blocked: bool
+    routing_cost: float
+    evidence: float
+    dominant_source: int | None = None
+    supporting_sources: tuple[int, ...] = ()
+
 
 @dataclass
 class DefenseConfig:
-    """Shared parameters for the five occupancy-defense policies."""
+    """Shared parameters for the selectable occupancy-defense policies."""
 
-    method: str = "source_linked"
+    method: str = "trust_threshold"
+    trust_threshold: float = 0.55
     decay_rate: float = 0.01
     cost_scale: float = 8.0
     cost_exponent: float = 2.0
@@ -77,6 +89,8 @@ class DefenseConfig:
             raise ValueError("blocked_probability_threshold must be in [0, 1]")
         if self.max_claim_age < 1:
             raise ValueError("max_claim_age must be at least 1")
+        if not 0.0 <= self.trust_threshold <= 1.0:
+            raise ValueError("trust_threshold must be in [0, 1]")
 
 
 class DefenseMethodRunner:
@@ -100,6 +114,10 @@ class DefenseMethodRunner:
       source_linked:
           Each report is weighted using current sender trust at planning time.
           Later trust changes therefore revise the influence of old claims.
+
+      trust_threshold:
+          Reports remain stored and verifiable, but current trust below the
+          configured threshold gives them zero operational influence.
     """
 
     def __init__(
@@ -249,13 +267,15 @@ class DefenseMethodRunner:
         if method == "trust_fused":
             return claim.confidence * claim.trust_at_report
 
-        if method == "source_linked":
+        if method in ("source_linked", "trust_threshold"):
             trust_value = (
                 self.trust_score(claim.sender_id)
                 if trust_override is None
                 else trust_override
             )
             current_trust = min(1.0, max(0.0, float(trust_value)))
+            if method == "trust_threshold" and current_trust < self.config.trust_threshold:
+                return 0.0
             return (
                 claim.confidence
                 * current_trust
@@ -346,6 +366,16 @@ class DefenseMethodRunner:
         probability = self.occupancy_probability(cell, timestamp)
         return min(1.0, max(0.0, 2.0 * (probability - 0.5)))
 
+    def blocked_support(self, cell: Cell, timestamp: Optional[int] = None) -> float:
+        """Bounded current support for occupancy, excluding FREE claims."""
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        support = 0.0
+        for claim in self.claims_for(cell):
+            if claim.claim != BLOCKED_CLAIM or now - claim.timestamp > self.config.max_claim_age:
+                continue
+            support += self._method_weight(claim, now)
+        return min(1.0, support)
+
     def routing_cost(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         """Return peer-derived traversal cost for a cell."""
         if self.method == "hard_threshold":
@@ -362,7 +392,7 @@ class DefenseMethodRunner:
     def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None) -> bool:
         if self.method == "majority_vote":
             return self.evidence(cell, timestamp) > 0.0
-        if self.method != "hard_threshold":
+        if self.method not in ("hard_threshold", "trust_threshold"):
             return False
         probability = self.occupancy_probability(cell, timestamp)
         return probability > self.config.blocked_probability_threshold
@@ -387,6 +417,41 @@ class DefenseMethodRunner:
         timestamp: Optional[int] = None,
     ) -> bool:
         return any(self.is_hard_blocked(cell, timestamp) for cell in cells)
+
+    def effective_cells(self, timestamp: Optional[int] = None) -> Dict[Cell, EffectivePeerCell]:
+        """Read-only, method-aware peer state used by combined visualization."""
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        result = {}
+        for cell, claims in self.claims_by_cell.items():
+            active = [claim for claim in claims if now - claim.timestamp <= self.config.max_claim_age]
+            if not active:
+                continue
+            evidence = self.evidence(cell, now)
+            effective_blocked = [
+                claim for claim in active
+                if claim.claim == BLOCKED_CLAIM
+                and self._method_weight(claim, now) > 0.0
+            ]
+            dominant = None
+            if effective_blocked:
+                dominant = max(
+                    effective_blocked,
+                    key=lambda item: (
+                        self.trust_score(item.sender_id),
+                        item.timestamp,
+                        -item.sender_id,
+                    ),
+                ).sender_id
+            result[cell] = EffectivePeerCell(
+                claim=max(active, key=lambda item: item.timestamp).claim,
+                has_active_evidence=bool(evidence),
+                hard_blocked=self.is_hard_blocked(cell, now),
+                routing_cost=self.routing_cost(cell, now),
+                evidence=evidence,
+                dominant_source=dominant,
+                supporting_sources=tuple(sorted({claim.sender_id for claim in effective_blocked})),
+            )
+        return result
 
     def snapshot(self, timestamp: Optional[int] = None) -> Dict[str, object]:
         now = self.current_timestamp if timestamp is None else int(timestamp)

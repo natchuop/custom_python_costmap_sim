@@ -32,6 +32,18 @@ def test_primary_weighting_contracts_and_active_replacement():
     assert before["full_trust"] >= before["trust_fused"]
 
 
+def test_trust_threshold_is_dynamic_but_retains_below_threshold_reports():
+    trust = {0: .8}
+    engine = FusionEngine("trust_threshold", lambda sender: trust[sender])
+    engine.add(report("threshold", 0, ClaimType.BLOCKED))
+    assert engine.evidence((2, 2), 0) > 0
+    trust[0] = .4
+    assert engine.evidence((2, 2), 0) == 0
+    trust[0] = .7
+    assert engine.evidence((2, 2), 0) > 0
+    assert len(engine.claims[(2, 2)]) == 1
+
+
 def test_majority_is_one_vote_per_sender_and_discrete():
     engine = FusionEngine("majority_vote", lambda _: .1)
     engine.add(report("a", 0, ClaimType.BLOCKED))

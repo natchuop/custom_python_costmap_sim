@@ -20,6 +20,7 @@ def _defense_config_dict(config: SimulationConfig) -> dict:
         "max_claim_age": config.fusion.max_claim_age,
         "congested_impact": config.fusion.congested_impact,
         "duplicate_window_steps": config.fusion.duplicate_window_steps,
+        "trust_threshold": config.trust.threshold,
     }
 
 
@@ -84,6 +85,10 @@ def run_manifest_rollout(
     method: str,
 ) -> tuple[sim2.GridWorld, list, dict]:
     """Run the validated continuous-motion loop on a fixed manifest."""
+    if manifest.malicious_robot_id != 0 or tuple(manifest.benign_robot_ids) != (1, 2):
+        raise ValueError(
+            "Invalid team roles: Robot 0 must be malicious and Robots 1 and 2 must be benign."
+        )
     max_steps = config.max_steps or config.phases.total_steps
     static_grid = np.asarray(manifest.static_grid, dtype=np.uint8)
     obstacle_episodes = manifest.obstacle_episodes if manifest.obstacle_episodes else None
@@ -103,6 +108,7 @@ def run_manifest_rollout(
             manifest_robot_starts=manifest.robot_starts,
             manifest_task_queues=_manifest_task_queues(manifest),
             manifest_malicious_robot_id=manifest.malicious_robot_id,
+            map_view=config.visualization.map_view,
         )
     finally:
         _restore_legacy_globals(old_phase, old_trust)
@@ -142,6 +148,17 @@ def collect_rollout_metrics(
         rlog = log["robots"][rid]
         for step, event in enumerate(rlog["events"]):
             collector.event(step, "robot_action", method=method, robot_id=rid, action=event)
+        for replan in robot.replan_events:
+            collector.event(
+                replan["step"],
+                "replan",
+                method=method,
+                robot_id=rid,
+                reason=replan["reason"],
+                next_five_changed=replan["next_five_changed"],
+                old_path_length=replan["old_path_length"],
+                new_path_length=replan["new_path_length"],
+            )
         for step in range(0, len(rlog["position"]), config.logging.timeseries_period_steps):
             collector.sample(
                 step=step,
@@ -182,6 +199,16 @@ def collect_rollout_metrics(
         "benign_total_distance": calculated["benign_total_grid_distance"],
         "benign_total_replans": calculated["benign_total_replans"],
         "benign_productive_replans": calculated["benign_next_five_changed_replans"],
+        "benign_malicious_report_replans": sum(
+            "malicious_report" in event["reason"]
+            for robot in benign
+            for event in robot.replan_events
+        ),
+        "benign_malicious_route_replans": sum(
+            "malicious_report_on_route" in event["reason"]
+            for robot in benign
+            for event in robot.replan_events
+        ),
         "benign_blocked_moves": sum(calculated["blocked_moves_per_robot"][r.robot_id] for r in benign),
         "time_to_distrust_malicious_robot": calculated["time_to_distrust_malicious_robot"],
         "malicious_verified_false_reports": calculated["malicious_verified_false_reports"],
@@ -205,7 +232,7 @@ def replay_manifest(
     world, robots, log = run_manifest_rollout(config, manifest, method)
     if show_animation:
         sim2.show_recon_heatmap(world, log)
-        sim2.animate(world, robots, log)
+        sim2.animate(world, robots, log, map_view=config.visualization.map_view)
     summary, collector = collect_rollout_metrics(
         config, manifest, method, world, robots, log
     )

@@ -8,7 +8,9 @@ from enum import IntEnum
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import RadioButtons, Button
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
 
 from defense_method_runner import DEFENSE_METHODS, build_defense_runner
 
@@ -18,7 +20,7 @@ from defense_method_runner import DEFENSE_METHODS, build_defense_runner
 # Configuration
 # ============================================================
 
-RANDOM_SEED = 15
+RANDOM_SEED = 12
 
 GRID_ROWS = 24
 GRID_COLS = 36
@@ -35,12 +37,12 @@ EXPERIMENT_MODE = "attack"  # "clean" or "attack"
 ENABLE_MALICIOUS_REPORTS = EXPERIMENT_MODE == "attack"
 
 TRUST_ACCEPT_THRESHOLD = 0.55
-TRUST_INITIAL_VALUE = 0.70
+TRUST_INITIAL_VALUE = 0.90
 TRUST_REWARD = 0.02
 TRUST_PENALTY = 0.06
 TRUST_MODEL_NAME = "scalar"
-TRUST_BAYES_PRIOR_ALPHA = 7.0
-TRUST_BAYES_PRIOR_BETA = 3.0
+TRUST_BAYES_PRIOR_ALPHA = 9.0
+TRUST_BAYES_PRIOR_BETA = 1.0
 
 SENSOR_RADIUS = 4
 
@@ -57,11 +59,13 @@ TEMP_OBJECT_POOL_MULTIPLIER = 4
 TEMP_OBJECT_MIN_SPACING = 5
 TEMP_OBJECT_EDGE_MARGIN_RATIO = 0.12
 
-TEMP_BLOCKED_OBJECT_SIZE_RANGE = (2, 5)
+TEMP_BLOCKED_OBJECT_SIZE_RANGE = (1, 5)
+RECTANGLE_MIN_AREA = 4
+RECTANGLE_MAX_SIDE = 5
 TEMP_OBJECT_PLACEMENT_ATTEMPTS = 500
 
 ENABLE_DYNAMIC_TEMP_BLOCKAGES = True
-TEMP_BLOCKAGE_CHANGE_PERIOD_STEPS = 400
+TEMP_BLOCKAGE_CHANGE_PERIOD_STEPS = 150
 
 ENABLE_AUTO_TEMP_OBJECTS_FOR_LOADED_MAPS = True
 
@@ -113,7 +117,7 @@ ATTACK_MODE = "recon_heatmap"
 
 # Occupancy-claim defense policy. Available values are defined in
 # defense_method_runner.py and can also be selected with --defense-method.
-DEFENSE_METHOD = "source_linked"
+DEFENSE_METHOD = "trust_threshold"
 
 # Phase 1: attacker observes benign movement and builds a traffic heatmap.
 MIN_RECON_STEPS = 300
@@ -122,26 +126,26 @@ RECON_MIN_GOAL_VISITS = 1
 RECON_MIN_GOAL_COVERAGE_RATIO = 0.70
 
 # Phase 2: attacker injects fake blocked-object reports at learned medium-traffic corridors.
-ATTACK_CANDIDATE_LIMIT = 12
+ATTACK_CANDIDATE_LIMIT = 24
 
 # Instead of attacking the hottest corridors, attack average-traveled corridors.
 # These are common enough to matter, but not constantly visited and instantly verified.
-ATTACK_TRAFFIC_LOW_PERCENTILE = 45
-ATTACK_TRAFFIC_HIGH_PERCENTILE = 90
+ATTACK_TRAFFIC_LOW_PERCENTILE = 35
+ATTACK_TRAFFIC_HIGH_PERCENTILE = 95
 
 # Fake object footprint. It may visually overlap walls, but only free/action cells
 # will receive malicious BLOCKED reports.
-MALICIOUS_FAKE_OBJECT_ROWS = 4
-MALICIOUS_FAKE_OBJECT_COLS = 7
+MALICIOUS_FAKE_OBJECT_ROWS = 5
+MALICIOUS_FAKE_OBJECT_COLS = 5
 
 # Prefer fake objects that block several usable cells, not one sad pixel of deception.
-MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS = 8
+MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS = 4
 
 # Add a new malicious fake object periodically during the attack phase.
 MALICIOUS_FAKE_OBJECT_INJECTION_PERIOD_STEPS = 20
 
 # Keep fake object centers separated so the attacker does not spam the same area.
-MALICIOUS_FAKE_OBJECT_CENTER_MIN_SPACING = 4
+MALICIOUS_FAKE_OBJECT_CENTER_MIN_SPACING = 6
 
 # Do not place fake objects near goals. Robots must eventually visit goals,
 # so fake blocks there are easy to disprove and weakly disruptive.
@@ -159,14 +163,10 @@ ATTACK_MAX_DISTANCE_FROM_VICTIM = 45
 # Keep red fake-object display visible briefly, but do not accumulate forever.
 MALICIOUS_FAKE_OBJECT_DISPLAY_TTL = 50
 
-# Topology-aware stress dynamics. The experiment should distinguish a real
-# temporary obstruction from a maliciously reported one by making both matter
-# at corridor bottlenecks rather than scattering rectangles across open floor.
+# Topology-aware diagnostics help place legitimate temporary objects in useful
+# warehouse regions. Attack candidate ranking remains route/traffic driven.
 ENABLE_TOPOLOGY_AWARE_BLOCKAGES = True
-TEMP_BOTTLENECK_SCORE_WEIGHT = 8.0
-ATTACK_BOTTLENECK_SCORE_WEIGHT = 20.0
-ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = True
-MALICIOUS_REINFORCE_BOTTLENECKS = True
+ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = False
 
 # Finite poisoning window followed by recovery. Old malicious claims remain in
 # each defense method, but no new lies are added after the burst. This directly
@@ -240,6 +240,7 @@ SOURCE_LINKED_REPLAN_COOLDOWN_STEPS = 25
 SOURCE_LINKED_MIN_TRUST_DELTA = 0.10
 SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
 SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
+MALICIOUS_ROUTE_PROXIMITY_CELLS = 2
 
 # Shared replan churn controls. These apply to every defense method so fallback
 # stalls and empty-path retries do not dominate runtime or outcomes.
@@ -415,6 +416,21 @@ def footprint_cells(top_left, height, width):
     ]
 
 
+def sample_rectangle_dimensions(rng, min_side=1, max_side=RECTANGLE_MAX_SIDE,
+                                min_area=RECTANGLE_MIN_AREA):
+    """Sample a bounded rectangular footprint from the supplied seeded RNG."""
+    for _ in range(100):
+        if hasattr(rng, "integers"):
+            height = int(rng.integers(min_side, max_side + 1))
+            width = int(rng.integers(min_side, max_side + 1))
+        else:
+            height = int(rng.randint(min_side, max_side))
+            width = int(rng.randint(min_side, max_side))
+        if height * width >= min_area:
+            return height, width
+    return min_side, max(min_side, (min_area + min_side - 1) // min_side)
+
+
 def can_place_temporary_footprint(grid, cells, forbidden_cells=None):
     """
     A temporary object footprint is valid only if every cell is normal FREE.
@@ -571,8 +587,9 @@ def choose_temporary_object_footprints(
             r_min, r_max, c_min, c_max = regions[region_idx]
 
             for _ in range(TEMP_OBJECT_PLACEMENT_ATTEMPTS):
-                height = int(rng.integers(size_range[0], size_range[1] + 1))
-                width = int(rng.integers(size_range[0], size_range[1] + 1))
+                height, width = sample_rectangle_dimensions(
+                    rng, size_range[0], size_range[1]
+                )
 
                 # Sometimes make blockages cart-like instead of square.
                 if rng.random() < 0.4:
@@ -580,6 +597,9 @@ def choose_temporary_object_footprints(
                         height = 1
                     else:
                         width = 1
+
+                if height * width < RECTANGLE_MIN_AREA:
+                    continue
 
                 if r_max - r_min <= height + 2 or c_max - c_min <= width + 2:
                     continue
@@ -679,7 +699,7 @@ class TemporaryBlockageManager:
 
         self.pool = choose_temporary_object_footprints(
             self.static_grid,
-            blocked_count=self.active_count * TEMP_OBJECT_POOL_MULTIPLIER,
+            blocked_count=self.active_count,
             rng=self.rng,
         )
 
@@ -690,6 +710,8 @@ class TemporaryBlockageManager:
             )
 
         self.active_indices = set()
+        self.current_footprints = {}
+        self.movement_decisions = {}
         self.refresh_active_blockages(force=True)
 
     def refresh_active_blockages(self, force=False, forbidden_cells=None):
@@ -698,15 +720,34 @@ class TemporaryBlockageManager:
             self.active_indices = set()
             return
 
-        candidate_indices = list(range(len(self.pool)))
+        # Existing objects persist and use a seeded 50/50 shift/teleport choice.
+        if not force:
+            for idx in tuple(self.active_indices):
+                cells, state = self.current_footprints.get(idx, self.pool[idx])
+                moved, movement = self._move_footprint(cells, forbidden_cells)
+                self.movement_decisions[idx] = movement
+                if moved is not None:
+                    self.current_footprints[idx] = (moved, state)
+        else:
+            self.movement_decisions = {idx: "unchanged" for idx in self.active_indices}
+        candidate_indices = [idx for idx in range(len(self.pool)) if idx not in self.active_indices]
         self.rng.shuffle(candidate_indices)
 
         eligible = []
+        occupied_by_kept = {
+            cell
+            for idx in self.active_indices
+            if idx in self.current_footprints
+            for cell in self.current_footprints[idx][0]
+        }
         for idx in candidate_indices:
             cells, _ = self.pool[idx]
             if any(cell in forbidden_cells for cell in cells):
                 continue
+            if any(cell in occupied_by_kept for cell in cells):
+                continue
             eligible.append(idx)
+            occupied_by_kept.update(cells)
             if len(eligible) >= self.active_count:
                 break
 
@@ -735,16 +776,54 @@ class TemporaryBlockageManager:
                     )
                 return
 
-        self.active_indices = set(eligible[:active_count])
+        kept = [idx for idx in self.active_indices if idx in self.current_footprints]
+        self.active_indices = set((kept + eligible)[:active_count])
+        for idx in self.active_indices:
+            self.current_footprints.setdefault(idx, self.pool[idx])
 
-        print("Active temporary blockages:")
-        for idx in sorted(self.active_indices):
-            cells, state = self.pool[idx]
-            center_r, center_c = footprint_center(cells)
-            print(
-                f"  candidate {idx}: {state_name(state)}, "
-                f"cells={len(cells)}, center=({center_r:.1f}, {center_c:.1f})"
-            )
+    def _try_shift_footprint(self, cells, forbidden_cells):
+        if not cells:
+            return None
+        distance = int(self.rng.integers(1, 4))
+        directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+        self.rng.shuffle(directions)
+        for dr, dc in directions:
+            candidate = [(r + dr * distance, c + dc * distance) for r, c in cells]
+            if can_place_temporary_footprint(self.static_grid, candidate, forbidden_cells):
+                return candidate
+        return None
+
+    def _try_teleport_footprint(self, cells, forbidden_cells, other_footprints=()):
+        if not cells:
+            return None
+        height = max(r for r, _ in cells) - min(r for r, _ in cells) + 1
+        width = max(c for _, c in cells) - min(c for _, c in cells) + 1
+        old_center = footprint_center(cells)
+        for _ in range(TEMP_OBJECT_PLACEMENT_ATTEMPTS):
+            r = int(self.rng.integers(1, max(2, self.static_grid.shape[0] - height)))
+            c = int(self.rng.integers(1, max(2, self.static_grid.shape[1] - width)))
+            candidate = footprint_cells((r, c), height, width)
+            center = footprint_center(candidate)
+            if abs(center[0] - old_center[0]) + abs(center[1] - old_center[1]) < 3:
+                continue
+            if any(set(candidate) & set(other) for other in other_footprints):
+                continue
+            if can_place_temporary_footprint(self.static_grid, candidate, forbidden_cells):
+                return candidate
+        return None
+
+    def _move_footprint(self, cells, forbidden_cells):
+        other = [self.current_footprints[idx][0] for idx in self.active_indices
+                 if self.current_footprints.get(idx, (None,))[0] is not cells]
+        preferred_shift = bool(self.rng.random() >= 0.5)
+        methods = (self._try_shift_footprint, self._try_teleport_footprint) if preferred_shift else (self._try_teleport_footprint, self._try_shift_footprint)
+        for method in methods:
+            candidate = (method(cells, forbidden_cells, other)
+                         if method.__name__ == "_try_teleport_footprint"
+                         else method(cells, forbidden_cells))
+            if candidate is not None:
+                return candidate, "shift" if method.__name__ == "_try_shift_footprint" else "teleport"
+        return cells, "unchanged"
 
     def should_update(self, step):
         if not ENABLE_DYNAMIC_TEMP_BLOCKAGES:
@@ -760,7 +839,7 @@ class TemporaryBlockageManager:
         dynamic = self.static_grid.copy()
 
         active_footprints = [
-            self.pool[idx]
+            self.current_footprints.get(idx, self.pool[idx])
             for idx in sorted(self.active_indices)
         ]
 
@@ -1360,8 +1439,8 @@ class BayesianTrustModel(TrustModel):
     def __init__(
         self,
         self_id,
-        prior_alpha=7.0,
-        prior_beta=3.0,
+        prior_alpha=9.0,
+        prior_beta=1.0,
         accept_threshold=TRUST_ACCEPT_THRESHOLD,
     ):
         self.self_id = int(self_id)
@@ -1721,8 +1800,8 @@ class RobotBeliefMap:
         Trust-weighted belief update.
 
         High-trust reports can mark cells blocked/free.
-        Lower-trust reports only create weak confidence updates.
-        Very low-trust reports are ignored by the Robot, before this is called.
+        Reports remain available to the defense runner for audit and trust
+        verification even when their current operational influence is zero.
         """
         cell = report.target_cell
 
@@ -1748,8 +1827,8 @@ class RobotBeliefMap:
         ):
             return False
 
-        # If this cell has direct sensor confidence, peer reports should not
-        # override it unless the report is extremely trusted.
+        # Fresh direct sensing remains authoritative. Operational route
+        # arbitration is handled by the defense runner and belief map.
         if self.source[r, c] == "self_sensor" and trust_score < 0.95:
             return False
 
@@ -1862,6 +1941,14 @@ class RobotBeliefMap:
             )
         )
 
+    def direct_free_strength(self, cell, timestamp=None):
+        if not self._direct_free_observation(cell):
+            return 0.0
+        r, c = tuple(cell)
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        age = max(0, now - int(self.last_updated[r, c]))
+        return 1.25 * float(self.confidence[r, c]) * math.exp(-0.01 * age)
+
     def footprint_is_peer_hard_blocked(self, footprint, timestamp=None):
         """Peer hard blocks apply only where direct sensing has not verified free."""
         if self.defense_runner is None:
@@ -1869,7 +1956,9 @@ class RobotBeliefMap:
 
         now = self.current_timestamp if timestamp is None else int(timestamp)
         for footprint_cell in footprint:
-            if self._direct_free_observation(footprint_cell):
+            if self._direct_free_observation(footprint_cell) and self.defense_runner.method != "trust_threshold":
+                continue
+            if self._direct_free_observation(footprint_cell) and self.defense_runner.blocked_support(footprint_cell, now) <= self.direct_free_strength(footprint_cell, now):
                 continue
             if self.defense_runner.is_hard_blocked(footprint_cell, now):
                 return True
@@ -1935,15 +2024,13 @@ class RobotBeliefMap:
             # ``is_blocked_for_planning`` above.
             peer_cost = 1.0
             for footprint_cell in robot_footprint_cells(cell):
-                if self._direct_free_observation(footprint_cell):
+                if self._direct_free_observation(footprint_cell) and self.defense_runner.method != "trust_threshold":
                     continue
-                peer_cost = max(
-                    peer_cost,
-                    self.defense_runner.routing_cost(
-                        footprint_cell,
-                        self.current_timestamp,
-                    ),
-                )
+                contribution = self.defense_runner.routing_cost(footprint_cell, self.current_timestamp)
+                if self._direct_free_observation(footprint_cell):
+                    ratio = min(1.0, self.defense_runner.blocked_support(footprint_cell, self.current_timestamp) / max(self.direct_free_strength(footprint_cell, self.current_timestamp), 1e-9))
+                    contribution = 1.0 + (contribution - 1.0) * ratio
+                peer_cost = max(peer_cost, contribution)
             if math.isinf(peer_cost):
                 return float("inf")
             max_cost = max(max_cost, peer_cost)
@@ -2354,7 +2441,8 @@ def is_average_traffic_cell(cell, traffic_heatmap):
     return low <= score <= high
 
 
-def fake_object_footprint_cells(center_cell):
+def fake_object_footprint_cells(center_cell, height=MALICIOUS_FAKE_OBJECT_ROWS,
+                                width=MALICIOUS_FAKE_OBJECT_COLS):
     """
     Builds a rectangular fake object footprint around a center cell.
 
@@ -2363,13 +2451,13 @@ def fake_object_footprint_cells(center_cell):
     """
     center_r, center_c = center_cell
 
-    row_start = center_r - MALICIOUS_FAKE_OBJECT_ROWS // 2
-    col_start = center_c - MALICIOUS_FAKE_OBJECT_COLS // 2
+    row_start = center_r - height // 2
+    col_start = center_c - width // 2
 
     cells = []
 
-    for dr in range(MALICIOUS_FAKE_OBJECT_ROWS):
-        for dc in range(MALICIOUS_FAKE_OBJECT_COLS):
+    for dr in range(height):
+        for dc in range(width):
             cells.append((row_start + dr, col_start + dc))
 
     return cells
@@ -2400,7 +2488,8 @@ def can_report_fake_block_cell(cell, world, goals, robots):
     return True
 
 
-def fake_object_report_cells(center_cell, world, goals, robots):
+def fake_object_report_cells(center_cell, world, goals, robots, height=MALICIOUS_FAKE_OBJECT_ROWS,
+                             width=MALICIOUS_FAKE_OBJECT_COLS):
     """
     Returns the subset of the fake object footprint that should actually be
     reported as BLOCKED.
@@ -2410,18 +2499,19 @@ def fake_object_report_cells(center_cell, world, goals, robots):
     """
     report_cells = []
 
-    for cell in fake_object_footprint_cells(center_cell):
+    for cell in fake_object_footprint_cells(center_cell, height, width):
         if can_report_fake_block_cell(cell, world, goals, robots):
             report_cells.append(cell)
 
     return report_cells
 
 
-def fake_object_average_traffic_score(center_cell, traffic_heatmap):
+def fake_object_average_traffic_score(center_cell, traffic_heatmap, height=MALICIOUS_FAKE_OBJECT_ROWS,
+                                      width=MALICIOUS_FAKE_OBJECT_COLS):
     """
     Scores the fake object by average traffic over reportable footprint cells.
     """
-    cells = fake_object_footprint_cells(center_cell)
+    cells = fake_object_footprint_cells(center_cell, height, width)
 
     scores = [
         traffic_heatmap_score(cell, traffic_heatmap)
@@ -2515,6 +2605,7 @@ def recon_heatmap_attack_candidates(
     robots,
     traffic_heatmap,
     placed_fake_object_centers=None,
+    rng=None,
 ):
     candidates = []
 
@@ -2522,18 +2613,16 @@ def recon_heatmap_attack_candidates(
         placed_fake_object_centers = []
 
     rows, cols = traffic_heatmap.shape
+    rng = rng or np.random.default_rng(RANDOM_SEED)
 
     for r in range(rows):
         for c in range(cols):
             cell = (r, c)
 
-            if (
-                not MALICIOUS_REINFORCE_BOTTLENECKS
-                and is_near_previous_fake_object_center(
+            if is_near_previous_fake_object_center(
                     cell,
                     placed_fake_object_centers,
-                )
-            ):
+                ):
                 continue
 
             if not is_valid_recon_attack_cell(
@@ -2545,12 +2634,10 @@ def recon_heatmap_attack_candidates(
             ):
                 continue
 
-            report_cells = fake_object_report_cells(
-                cell,
-                world,
-                goals,
-                robots,
-            )
+            height, width = sample_rectangle_dimensions(rng)
+            report_cells = fake_object_report_cells(cell, world, goals, robots, height, width)
+            if len(report_cells) < MALICIOUS_FAKE_OBJECT_MIN_REPORT_CELLS:
+                continue
 
             benign_victims = [robot for robot in robots if not robot.is_malicious]
             path_overlap = 0
@@ -2603,10 +2690,9 @@ def recon_heatmap_attack_candidates(
                 {
                     "center_cell": cell,
                     "report_cells": report_cells,
-                    "traffic_score": fake_object_average_traffic_score(
-                        cell,
-                        traffic_heatmap,
-                    ),
+                    "traffic_score": fake_object_average_traffic_score(cell, traffic_heatmap, height, width),
+                    "footprint_height": height,
+                    "footprint_width": width,
                     "report_cell_count": len(report_cells),
                     "path_overlap": path_overlap,
                     "path_proximity_score": path_proximity_score,
@@ -2621,7 +2707,6 @@ def recon_heatmap_attack_candidates(
         key=lambda item: (
             item["affected_victims"],
             item["path_overlap"],
-            ATTACK_BOTTLENECK_SCORE_WEIGHT * item["bottleneck_score"],
             item["path_proximity_score"],
             item["report_cell_count"],
             item["traffic_score"],
@@ -2798,6 +2883,7 @@ class GridRobot:
         self.last_trust_events = []
         self.last_shared_claim = {}
         self.last_shared_step = {}
+        self.pending_outbound = {}
         self.defense_replan_needed = False
         self.last_source_linked_replan_step = -10**9
         self.source_linked_replan_context = None
@@ -3113,6 +3199,37 @@ class GridRobot:
 
         self.pending_claims = still_pending
 
+        if self.defense_method == "trust_threshold" and verified_by_sender:
+            threshold = float(self.defense_runner.config.trust_threshold)
+            route_cells = self._source_linked_route_cells()
+            for sender_id in verified_by_sender:
+                old_trust = float(old_trust_by_sender[sender_id])
+                new_trust = float(self.trust_model.score(sender_id))
+                crossed = (old_trust >= threshold) != (new_trust >= threshold)
+                if not crossed or not route_cells:
+                    continue
+                risk_before = self.defense_runner.sender_route_risk(
+                    sender_id, route_cells, timestamp=timestamp, trust_override=old_trust
+                )
+                risk_after = self.defense_runner.sender_route_risk(
+                    sender_id, route_cells, timestamp=timestamp, trust_override=new_trust
+                )
+                if abs(risk_before - risk_after) <= 1e-9:
+                    continue
+                self.defense_replan_needed = True
+                self.source_linked_replan_context = {
+                    "sender_id": sender_id,
+                    "old_trust": old_trust,
+                    "new_trust": new_trust,
+                    "threshold": threshold,
+                    "crossing": "activated" if new_trust >= threshold else "deactivated",
+                    "route_risk_before": risk_before,
+                    "route_risk_after": risk_after,
+                    "route_risk_drop": max(0.0, risk_before - risk_after),
+                }
+                break
+            return
+
         if self.defense_method != "source_linked" or not verified_by_sender:
             return
 
@@ -3193,6 +3310,21 @@ class GridRobot:
             for anchor in remaining:
                 if target in robot_footprint_cells(anchor):
                     return True
+
+            # A fake footprint can be adjacent to the current route without
+            # covering its center anchor. Treat that as close enough to
+            # replan, allowing the robot to detour before it reaches the
+            # claimed obstacle and still recover if later direct sensing says
+            # the cell is actually free.
+            if (
+                report.is_malicious
+                and report.claim == ClaimType.BLOCKED
+                and any(
+                    manhattan(target, anchor) <= MALICIOUS_ROUTE_PROXIMITY_CELLS
+                    for anchor in remaining
+                )
+            ):
+                return True
 
         return False
 
@@ -3368,18 +3500,31 @@ class GridRobot:
         return self.advance_continuous_motion()
 
     def should_share_observation(self, cell, claim, timestamp):
-        """Share changed observations immediately and periodically refresh stable ones."""
+        """Return whether a fresh observation should enter the outbound queue."""
         cell = tuple(cell)
         claim_value = int(claim)
         previous = self.last_shared_claim.get(cell)
         last_step = self.last_shared_step.get(cell, -10**9)
+        pending = self.pending_outbound.get(cell)
 
         if previous == claim_value and timestamp - last_step < HONEST_REPORT_REFRESH_STEPS:
             return False
-
-        self.last_shared_claim[cell] = claim_value
-        self.last_shared_step[cell] = int(timestamp)
+        if pending is not None and int(pending.claim) == claim_value:
+            return False
         return True
+
+    def queue_outbound_reports(self, reports):
+        for report in reports:
+            self.pending_outbound[tuple(report.target_cell)] = report
+
+    def drain_outbound_reports(self, sent_step):
+        reports = list(self.pending_outbound.values())
+        self.pending_outbound.clear()
+        for report in reports:
+            cell = tuple(report.target_cell)
+            self.last_shared_claim[cell] = int(report.claim)
+            self.last_shared_step[cell] = int(sent_step)
+        return reports
 
     def make_observation_reports(
         self,
@@ -3590,42 +3735,17 @@ def make_demo_dynamic_grid(static_grid):
 # ============================================================
 
 def choose_malicious_robot_id(robot_specs, goals, prior_grid):
+    """Return the fixed attacker identity used by every experiment.
+
+    Robot identities are part of the experiment protocol: R0 is malicious and
+    R1/R2 are benign victims. Choosing the nearest reachable robot made the
+    role depend on the map and seed, which could silently turn R1 into the
+    attacker and invalidate comparisons and playback labels.
     """
-    Chooses a malicious robot from robots that can reach at least one action point.
-
-    This avoids tying malicious selection to goals[0], which may belong to
-    another disconnected region. Because apparently one bad anchor cell was
-    enough to ruin the whole production.
-    """
-    candidates = []
-
-    for spec in robot_specs:
-        robot_id = int(spec["robot_id"])
-        start = tuple(spec["start"])
-
-        reachable_goals = [
-            tuple(goal)
-            for goal in goals
-            if route_exists_for_prior(prior_grid, start, goal)
-        ]
-
-        if not reachable_goals:
-            continue
-
-        nearest_distance = min(
-            manhattan(start, goal)
-            for goal in reachable_goals
-        )
-
-        candidates.append((nearest_distance, robot_id))
-
-    if not candidates:
-        raise RuntimeError(
-            "No robot can reach any reachable action point."
-        )
-
-    candidates.sort()
-    return candidates[0][1]
+    robot_ids = {int(spec["robot_id"]) for spec in robot_specs}
+    if 0 not in robot_ids:
+        raise RuntimeError("The experiment team must include malicious Robot 0.")
+    return 0
 
 def validate_start_and_goal(world, robot_specs, goal):
     if not world.in_bounds(goal):
@@ -4008,6 +4128,7 @@ def run_simulation(
     manifest_robot_starts=None,
     manifest_task_queues=None,
     manifest_malicious_robot_id=None,
+    map_view="combined",
 ):
     np.random.seed(random_seed)
 
@@ -4160,6 +4281,14 @@ def run_simulation(
         "truth_grid": [],
         "truth_dynamic": [],
         "malicious_fake_objects": [],
+        "attack_overlays": [],
+        "temporary_movement": [],
+        "attack_events": [
+            {"event_id": getattr(event, "event_id", ""), "step": int(event.step),
+             "attack_type": getattr(getattr(event, "attack_type", None), "value", str(getattr(event, "attack_type", "")))}
+            for event in (attack_events or ())
+        ],
+        "map_view": map_view,
         "traffic_heatmap": [],
         "phase": [],
         "robots": {
@@ -4168,6 +4297,11 @@ def run_simulation(
                 "position_xy": [],
                 "path": [],
                 "belief": [],
+                "local_belief": [],
+                "combined_belief": [],
+                "effective_peer_cells": [],
+                "peer_provenance": [],
+                "direct_blocked_cells": [],
                 "trust": [],
                 "events": [],
                 "accepted_reports": [],
@@ -4217,6 +4351,7 @@ def run_simulation(
     attack_injection_stop_step = None
 
     active_malicious_fake_objects = {}
+    active_attack_overlays = {}
 
     placed_malicious_fake_object_centers = []
     last_malicious_fake_object_step = None
@@ -4240,6 +4375,11 @@ def run_simulation(
             cell: created_step
             for cell, created_step in active_malicious_fake_objects.items()
             if step - created_step <= MALICIOUS_FAKE_OBJECT_DISPLAY_TTL
+        }
+        active_attack_overlays = {
+            key: value
+            for key, value in active_attack_overlays.items()
+            if step - value[0] <= MALICIOUS_FAKE_OBJECT_DISPLAY_TTL
         }
         if temp_blockage_manager is not None:
             changed_temp_blockages = temp_blockage_manager.update_world_if_needed(
@@ -4268,6 +4408,11 @@ def run_simulation(
                     robot.path_index = 0
                     robot.motion_target_cell = None
                     robot.motion_target_xy = None
+
+        log["temporary_movement"].append(
+            dict(temp_blockage_manager.movement_decisions)
+            if temp_blockage_manager is not None and changed_temp_blockages else {}
+        )
 
         reports_by_sender = {robot.robot_id: [] for robot in robots}
 
@@ -4299,7 +4444,7 @@ def run_simulation(
                 robot.last_trust_events = []
 
             if HONEST_ROBOTS_SHARE_OBSERVATIONS:
-                reports_by_sender[robot.robot_id].extend(
+                robot.queue_outbound_reports(
                     robot.make_observation_reports(
                         observations,
                         step,
@@ -4371,6 +4516,8 @@ def run_simulation(
 
                     placed_malicious_fake_object_centers.append(center)
                     last_malicious_fake_object_step = step
+                    for report in fake_reports:
+                        active_attack_overlays[("fake_obstacle", tuple(report.target_cell))] = (step, "fake_obstacle")
 
         fixed_attack_injected = False
         if attack_events is not None:
@@ -4378,6 +4525,8 @@ def run_simulation(
                 if int(event.step) != step:
                     continue
                 fixed_attack_injected = True
+                for cell in event.cells:
+                    active_attack_overlays[(event.attack_type.value, tuple(cell))] = (step, event.attack_type.value)
                 for cell in event.cells:
                     reports_by_sender[event.sender_id].append(
                         PeerReport(
@@ -4394,6 +4543,10 @@ def run_simulation(
         # disappear merely because that step falls between normal periodic
         # broadcasts (for example step 470 with a four-step cadence).
         if COMMUNICATION_PERIOD_STEPS > 0 and (step % COMMUNICATION_PERIOD_STEPS == 0 or fixed_attack_injected):
+            for robot in robots:
+                reports_by_sender[robot.robot_id].extend(
+                    robot.drain_outbound_reports(step)
+                )
             broadcast_reports(robots, reports_by_sender)
 
             for sender_id, reports in reports_by_sender.items():
@@ -4401,6 +4554,8 @@ def run_simulation(
                     log["reports"].append(
                         {
                             "step": step,
+                            "observation_step": report.timestamp,
+                            "sent_step": step,
                             "sender_id": sender_id,
                             "target_cell": report.target_cell,
                             "claim": int(report.claim),
@@ -4414,14 +4569,15 @@ def run_simulation(
 
             accepted, rejected = robot.process_inbox()
 
-            for report in accepted:
-                if report.is_malicious and report.claim == ClaimType.BLOCKED:
-                    active_malicious_fake_objects[tuple(report.target_cell)] = step
-
             route_affected = robot.reports_affect_remaining_route(accepted)
             path_invalid = robot.should_replan_for_path_state(step)
             trust_reweight = bool(robot.defense_replan_needed)
             should_replan = route_affected or trust_reweight or path_invalid
+            accepted_malicious = [
+                report
+                for report in accepted
+                if report.is_malicious
+            ]
 
             if should_replan:
                 reasons = []
@@ -4434,6 +4590,8 @@ def run_simulation(
                     reasons.append("source_linked_trust_reweight")
                 if path_invalid:
                     reasons.append("path_invalid_or_empty")
+                if accepted_malicious:
+                    reasons.append("malicious_report_accepted")
 
                 try:
                     robot.plan_path(
@@ -4447,12 +4605,6 @@ def run_simulation(
                 finally:
                     robot.defense_replan_needed = False
                     robot.source_linked_replan_context = None
-
-            accepted_malicious = [
-                report
-                for report in accepted
-                if report.is_malicious
-            ]
 
             if accepted_malicious and old_path != list(robot.path):
                 print(
@@ -4570,6 +4722,22 @@ def run_simulation(
         log["malicious_fake_objects"].append(
             sorted(active_malicious_fake_objects.keys())
         )
+        # Show only the newest attack footprint. Older events remain in the
+        # log for audit/playback data, but stacking their TTLs makes the debug
+        # map look as if the whole warehouse is under attack.
+        latest_overlay_step = max(
+            (value[0] for value in active_attack_overlays.values()),
+            default=None,
+        )
+        overlay_groups = {}
+        for (attack_type, cell), value in active_attack_overlays.items():
+            if value[0] != latest_overlay_step:
+                continue
+            overlay_groups.setdefault(attack_type, []).append(cell)
+        log["attack_overlays"].append([
+            {"attack_type": attack_type, "cells": sorted(cells)}
+            for attack_type, cells in sorted(overlay_groups.items())
+        ])
 
         log["traffic_heatmap"].append(traffic_heatmap.copy())
         log["phase"].append(
@@ -4584,6 +4752,65 @@ def run_simulation(
             rlog["position_xy"].append(tuple(robot.position_xy.tolist()))
             rlog["path"].append(copy.deepcopy(robot.path))
             rlog["belief"].append(robot.belief_map.display_grid())
+            local = robot.belief_map.initial_prior.copy()
+            direct_mask = robot.belief_map.source == "self_sensor"
+            local[direct_mask] = robot.belief_map.belief[direct_mask]
+            own_display = ROBOT_BELIEF_DISPLAY.get(rid, DISPLAY_PEER_BELIEF)
+            for dr, dc in np.argwhere(direct_mask):
+                if CellState(int(robot.belief_map.belief[dr, dc])) in (
+                    CellState.OCCUPIED_DYNAMIC,
+                    CellState.TEMPORARILY_BLOCKED,
+                ):
+                    local[dr, dc] = own_display
+            rlog["local_belief"].append(local)
+            effective = local.copy()
+            peer_cells = []
+            peer_provenance = []
+            for cell, state in robot.defense_runner.effective_cells(step).items():
+                r, c = cell
+                # Combined-view yellow is reserved for effective blocked peer
+                # belief. Free reports are still fused for navigation, but do
+                # not paint large areas of otherwise unoccupied floor yellow.
+                if (state.has_active_evidence and state.evidence > 0.0
+                        and 0 <= r < effective.shape[0]
+                        and 0 <= c < effective.shape[1]
+                        and not is_blocking_state(robot.belief_map.initial_prior[r, c])):
+                    # Own direct sensing remains authoritative in the display.
+                    if robot.belief_map.source[r, c] != "self_sensor":
+                        source_id = state.dominant_source
+                        effective[r, c] = ROBOT_BELIEF_DISPLAY.get(
+                            source_id, DISPLAY_PEER_BELIEF
+                        )
+                        peer_cells.append((r, c, state.claim, state.routing_cost, state.evidence))
+                        peer_provenance.append({
+                            "cell": (r, c),
+                            "senders": sorted({
+                                claim.sender_id
+                                for claim in robot.defense_runner.claims_for(cell)
+                                if step - claim.timestamp <= robot.defense_runner.config.max_claim_age
+                            }),
+                            "claim": state.claim,
+                            "evidence": state.evidence,
+                            "dominant_source": source_id,
+                            "supporting_sources": list(state.supporting_sources),
+                            "dominant_trust": (
+                                robot.trust_for(source_id)
+                                if source_id is not None else None
+                            ),
+                        })
+            rlog["combined_belief"].append(effective)
+            rlog["effective_peer_cells"].append(peer_cells)
+            rlog.setdefault("peer_provenance", []).append(peer_provenance)
+            rlog["direct_blocked_cells"].append([
+                (r, c)
+                for r in range(robot.belief_map.rows)
+                for c in range(robot.belief_map.cols)
+                if robot.belief_map.source[r, c] == "self_sensor"
+                and CellState(int(robot.belief_map.belief[r, c])) in (
+                    CellState.OCCUPIED_DYNAMIC,
+                    CellState.TEMPORARILY_BLOCKED,
+                )
+            ])
             rlog["trust"].append(robot.trust_model.snapshot())
             rlog["accepted_reports"].append(robot.accepted_reports)
             rlog["rejected_reports"].append(robot.rejected_reports)
@@ -4928,6 +5155,14 @@ def print_summary(world, robots, log):
 DISPLAY_ROBOT = 9
 DISPLAY_GOAL = 10
 DISPLAY_MALICIOUS_FAKE_OBJECT = 11
+DISPLAY_PEER_BELIEF = 12
+DISPLAY_FALSE_CLEARANCE = 13
+DISPLAY_ROBOT0_BELIEF = 14
+DISPLAY_ROBOT1_BELIEF = DISPLAY_PEER_BELIEF
+DISPLAY_ROBOT2_BELIEF = 15
+
+ROBOT_COLORS = {0: "#8e24aa", 1: "#fb8c00", 2: "#1976d2"}
+ROBOT_BELIEF_DISPLAY = {0: DISPLAY_ROBOT0_BELIEF, 1: DISPLAY_ROBOT1_BELIEF, 2: DISPLAY_ROBOT2_BELIEF}
 
 def expand_fake_object_cells(fake_cells):
     expanded = set()
@@ -4944,6 +5179,7 @@ def make_display_array(
     goal=None,
     goals=None,
     malicious_fake_objects=None,
+    attack_overlays=None,
 ):
     """
     Display array for the shared truth/debug map.
@@ -4972,6 +5208,16 @@ def make_display_array(
         for r, c in expand_fake_object_cells(malicious_fake_objects):
             if 0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]:
                 arr[r, c] = DISPLAY_MALICIOUS_FAKE_OBJECT
+
+    for overlay in attack_overlays or ():
+        display_state = (
+            DISPLAY_FALSE_CLEARANCE
+            if overlay.get("attack_type") == "false_clearance"
+            else DISPLAY_MALICIOUS_FAKE_OBJECT
+        )
+        for r, c in overlay.get("cells", ()):
+            if 0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]:
+                arr[r, c] = display_state
 
     if goals:
         for gr, gc in goals:
@@ -5015,13 +5261,14 @@ def make_belief_display_array(
     goal=None,
     goals=None,
     malicious_fake_objects=None,
+    attack_overlays=None,
 ):
     """
     Display array for a robot belief map.
 
-    Normal robots should not receive malicious_fake_objects here.
-    If they accept a fake blocked report, it remains green because their
-    belief map stores it as CellState.TEMPORARILY_BLOCKED.
+    Normal robots should not receive malicious_fake_objects here. If they
+    accept a fake blocked report, the combined map uses the normal source
+    color; the animation adds a red outline to identify its malicious origin.
 
     Malicious robots may receive malicious_fake_objects here so their own
     view shows the fake object in red.
@@ -5032,6 +5279,16 @@ def make_belief_display_array(
         for r, c in malicious_fake_objects:
             if 0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]:
                 arr[r, c] = DISPLAY_MALICIOUS_FAKE_OBJECT
+
+    for overlay in attack_overlays or ():
+        display_state = (
+            DISPLAY_FALSE_CLEARANCE
+            if overlay.get("attack_type") == "false_clearance"
+            else DISPLAY_MALICIOUS_FAKE_OBJECT
+        )
+        for r, c in overlay.get("cells", ()):
+            if 0 <= r < arr.shape[0] and 0 <= c < arr.shape[1]:
+                arr[r, c] = display_state
 
     if goals:
         for gr, gc in goals:
@@ -5045,6 +5302,24 @@ def make_belief_display_array(
         arr[r, c] = DISPLAY_ROBOT
 
     return arr
+
+
+def draw_attack_outlines(ax, cells, color="#d32f2f"):
+    """Outline maliciously sourced cells that reached a victim's map."""
+    patches = []
+    for r, c in cells:
+        patch = plt.Rectangle(
+            (c - 0.5, r - 0.5),
+            1,
+            1,
+            fill=False,
+            edgecolor=color,
+            linewidth=2.4,
+            zorder=12,
+        )
+        ax.add_patch(patch)
+        patches.append(patch)
+    return patches
 
 
 def draw_path(ax, path, color="black", linewidth=1.8, alpha=0.8):
@@ -5120,7 +5395,7 @@ def draw_robot_footprint(ax, anchor_cell, **kwargs):
     ax.add_patch(rect)
     return rect
 
-def animate(world, robots, log):
+def animate(world, robots, log, map_view=None):
     colors = [
         "#ffffff",  # 0 free
         "#222222",  # 1 occupied_static
@@ -5128,12 +5403,16 @@ def animate(world, robots, log):
         "#bdbdbd",  # 3 unknown
         "#66bb6a",  # 4 temporarily_blocked, normal believed blockage
         "#f9a825",  # 5 congested
-        "#2e7d32",  # 6 pickup
-        "#1976d2",  # 7 dropoff
-        "#8e24aa",  # 8 charging
+        "#795548",  # 6 pickup
+        "#26a69a",  # 7 dropoff
+        "#607d8b",  # 8 charging
         "#00e5ff",  # 9 robot
         "#ffeb3b",  # 10 goal
         "#e53935",  # 11 malicious fake object overlay
+        "#fb8c00",  # 12 robot 1 / orange provenance
+        "#ef9a9a",  # 13 false-clearance attack overlay
+        "#8e24aa",  # 14 robot 0 / purple provenance
+        "#1976d2",  # 15 robot 2 / blue provenance
     ]
 
     cmap = ListedColormap(colors)
@@ -5145,7 +5424,7 @@ def animate(world, robots, log):
     fig, axes = plt.subplots(
         1,
         num_panels,
-        figsize=(7 * num_panels, 7),
+        figsize=(7 * num_panels, 8.6),
         squeeze=False,
     )
 
@@ -5157,9 +5436,10 @@ def animate(world, robots, log):
         for idx, robot in enumerate(robots)
     }
 
-    truth_ax.set_title("Ground Truth Map")
-    truth_ax.set_xlabel("col")
-    truth_ax.set_ylabel("row")
+    truth_ax.set_title("Ground Truth Map", fontsize=13, pad=6)
+    truth_ax.set_xlabel("col", fontsize=11)
+    truth_ax.set_ylabel("row", fontsize=11)
+    truth_ax.tick_params(labelsize=10)
 
     initial_positions = {}
 
@@ -5169,7 +5449,7 @@ def animate(world, robots, log):
             initial_positions,
             log["goal"],
             goals=log.get("display_goals"),
-            malicious_fake_objects=log.get("malicious_fake_objects", [[]])[0],
+            attack_overlays=log.get("attack_overlays", [[]])[0],
         ),
         cmap=cmap,
         norm=norm,
@@ -5184,7 +5464,7 @@ def animate(world, robots, log):
         rid = robot.robot_id
         anchor_cell = log["robots"][rid]["position"][0]
 
-        edge_color = "purple" if robot.is_malicious else "blue"
+        edge_color = ROBOT_COLORS.get(rid, "#555555")
 
         patch = draw_robot_footprint(
             truth_ax,
@@ -5198,21 +5478,31 @@ def animate(world, robots, log):
     belief_imgs = {}
     belief_path_lines = {}
     belief_robot_patches = {}
+    belief_attack_outline_patches = {}
 
     for robot in robots:
         rid = robot.robot_id
         ax = belief_axes[rid]
 
         role = "MALICIOUS" if robot.is_malicious else "VICTIM"
-        ax.set_title(f"Robot {rid} Belief Map ({role})")
-        ax.set_xlabel("col")
-        ax.set_ylabel("row")
+        selected_view = map_view or log.get("map_view", "combined")
+        view_label = "Combined Belief Map" if selected_view == "combined" else "Local Observation Map"
+        ax.set_title(
+            f"Robot {rid}\n{view_label}\n({role})",
+            fontsize=13,
+            pad=6,
+            color=ROBOT_COLORS.get(rid, "#555555"),
+        )
+        ax.set_xlabel("col", fontsize=11)
+        ax.set_ylabel("row", fontsize=11)
+        ax.tick_params(labelsize=10)
 
-        first_belief = log["robots"][rid]["belief"][0]
-        first_position = log["robots"][rid]["position"][0]
-
-        initial_fake_overlay = (
-            log.get("malicious_fake_objects", [[]])[0]
+        first_belief = log["robots"][rid].get(
+            "combined_belief" if selected_view == "combined" else "local_belief",
+            log["robots"][rid]["belief"],
+        )[0]
+        initial_attack_overlays = (
+            log.get("attack_overlays", [[]])[0]
             if robot.is_malicious
             else None
         )
@@ -5223,7 +5513,7 @@ def animate(world, robots, log):
                 robot_position=None,
                 goal=log["goal"],
                 goals=log.get("display_goals"),
-                malicious_fake_objects=initial_fake_overlay,
+                attack_overlays=initial_attack_overlays,
             ),
             cmap=cmap,
             norm=norm,
@@ -5232,7 +5522,7 @@ def animate(world, robots, log):
 
         anchor_cell = log["robots"][rid]["position"][0]
 
-        edge_color = "red" if robot.is_malicious else "blue"
+        edge_color = ROBOT_COLORS.get(rid, "#555555")
 
         patch = draw_robot_footprint(
             ax,
@@ -5242,20 +5532,80 @@ def animate(world, robots, log):
         )
 
         belief_robot_patches[rid] = patch
+        belief_attack_outline_patches[rid] = []
 
         belief_path_lines[rid] = []
 
-    status_text = fig.text(
+    # Reserve a dedicated lower band for status, sharing guidance, controls,
+    # and the legend so wide multi-panel figures do not overlap or clip them.
+    status_text = fig.text(0.02, 0.285, "", fontsize=10, va="top", family="DejaVu Sans Mono")
+    sharing_text = fig.text(
         0.02,
-        0.02,
-        "",
+        0.14,
+        "Peer sharing: occupied cells use the source robot's color. "
+        "When multiple trusted robots support a cell, the highest-trust "
+        "source color is displayed.",
         fontsize=10,
+        va="top",
     )
 
     max_frames = len(log["truth_grid"])
+    display_index = 0
+    first_tick = True
+    controls_ax = fig.add_axes((0.02, 0.035, 0.30, 0.12))
+    controls_ax.set_title("Playback controls", fontsize=10, loc="left", pad=3)
+    controls_ax.set_xticks([])
+    controls_ax.set_yticks([])
+    speed_ax = fig.add_axes((0.035, 0.055, 0.14, 0.075))
+    speed_ax.set_title("Speed", fontsize=10, loc="left", pad=2)
+    speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
+    for label in speed.labels:
+        label.set_fontsize(10)
+    pause_ax = fig.add_axes((0.20, 0.070, 0.085, 0.045))
+    pause_button = Button(pause_ax, "Pause", color="#eeeeee", hovercolor="#d0d0d0")
+    pause_button.label.set_fontsize(10)
+    paused = False
+
+    def toggle_pause(_event):
+        nonlocal paused
+        paused = not paused
+        pause_button.label.set_text("Resume" if paused else "Pause")
+
+    pause_button.on_clicked(toggle_pause)
+
+    def selected_multiplier():
+        try:
+            # Playback labels are intentionally twice the frame-advance rate:
+            # the former 0.5x behavior is now the normal 1x setting.
+            return float(speed.value_selected.rstrip("x")) / 2.0
+        except (TypeError, ValueError):
+            return 1
+
+    fig.legend(
+        handles=[
+            Patch(facecolor="#222222", label="Static obstacle"),
+            Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),
+            Patch(facecolor=ROBOT_COLORS[1], label="Robot 1 source (orange)"),
+            Patch(facecolor=ROBOT_COLORS[2], label="Robot 2 source (blue)"),
+            Patch(facecolor="#ffeb3b", label="Goal/checkpoint"),
+            Patch(facecolor="#e53935", label="Attack overlay"),
+            Patch(facecolor="#ef9a9a", label="False clearance"),
+            Patch(facecolor="none", edgecolor="#d32f2f", label="Malicious claim in victim map"),
+        ],
+        loc="lower center",
+        bbox_to_anchor=(0.72, 0.145),
+        ncol=2,
+        fontsize=10,
+        frameon=False,
+    )
 
     def update(frame):
-        nonlocal truth_path_lines, truth_lidar_lines
+        nonlocal truth_path_lines, truth_lidar_lines, display_index, first_tick
+        if first_tick:
+            first_tick = False
+        elif not paused:
+            display_index = min(max_frames - 1, display_index + selected_multiplier())
+        frame = int(display_index)
         artists = []
 
         robot_positions = {}
@@ -5266,7 +5616,7 @@ def animate(world, robots, log):
                 robot_positions,
                 log["goal"],
                 goals=log.get("display_goals"),
-                malicious_fake_objects=log.get("malicious_fake_objects", [[]])[frame],
+                attack_overlays=log.get("attack_overlays", [[]])[frame],
             )
         )
         artists.append(truth_img)
@@ -5310,7 +5660,7 @@ def animate(world, robots, log):
             path = log["robots"][rid]["path"][frame]
 
             if path:
-                color = "blue" if not robot.is_malicious else "black"
+                color = ROBOT_COLORS.get(rid, "#555555")
                 line = draw_path(
                     truth_ax,
                     path,
@@ -5323,11 +5673,14 @@ def animate(world, robots, log):
 
         for robot in robots:
             rid = robot.robot_id
-            belief = log["robots"][rid]["belief"][frame]
+            belief = log["robots"][rid].get(
+                "combined_belief" if selected_view == "combined" else "local_belief",
+                log["robots"][rid]["belief"],
+            )[frame]
             position = log["robots"][rid]["position"][frame]
 
-            fake_overlay = (
-                log.get("malicious_fake_objects", [[]])[frame]
+            attack_overlay = (
+                log.get("attack_overlays", [[]])[frame]
                 if robot.is_malicious
                 else None
             )
@@ -5338,18 +5691,37 @@ def animate(world, robots, log):
                     robot_position=None,
                     goal=log["goal"],
                     goals=log.get("display_goals"),
-                    malicious_fake_objects=fake_overlay,
+                    attack_overlays=attack_overlay,
                 )
             )
             artists.append(belief_imgs[rid])
-
-            x, y = log["robots"][rid]["position_xy"][frame]
 
             r, c = log["robots"][rid]["position"][frame]
 
             belief_robot_patches[rid].set_xy((c - 0.5, r - 0.5))
 
             artists.append(belief_robot_patches[rid])
+
+            for outline in belief_attack_outline_patches[rid]:
+                outline.remove()
+            belief_attack_outline_patches[rid] = []
+
+            if selected_view == "combined" and not robot.is_malicious:
+                provenance_frames = log["robots"][rid].get("peer_provenance", [])
+                provenance_at_frame = (
+                    provenance_frames[frame]
+                    if frame < len(provenance_frames)
+                    else ()
+                )
+                malicious_cells = [
+                    tuple(provenance["cell"])
+                    for provenance in provenance_at_frame
+                    if 0 in provenance.get("senders", ())
+                ]
+                belief_attack_outline_patches[rid] = draw_attack_outlines(
+                    belief_axes[rid], malicious_cells
+                )
+                artists.extend(belief_attack_outline_patches[rid])
 
             for line in belief_path_lines[rid]:
                 line.remove()
@@ -5358,7 +5730,7 @@ def animate(world, robots, log):
             path = log["robots"][rid]["path"][frame]
 
             if path:
-                color = "blue" if not robot.is_malicious else "black"
+                color = ROBOT_COLORS.get(rid, "#555555")
                 line = draw_path(
                     belief_axes[rid],
                     path,
@@ -5384,15 +5756,32 @@ def animate(world, robots, log):
         attack_start = log.get("attack_phase_start_step")
         attack_start_text = attack_start if attack_start is not None else "not yet"
 
-        status_parts = [
-            f"Step: {frame}",
-            f"Phase: {phase}",
-            f"Attack starts at: {attack_start_text}",
-            f"Spawn grace: {grace_active}",
-            f"Reports so far: {report_count}",
-            f"Malicious reports: {malicious_report_count}",
-            f"Fake objects: {len(log.get('malicious_fake_objects', [[]])[frame])}",
-            f"Malicious robot: R{malicious_robot_id}",
+        actual_step = frame
+        latest = None
+        for event in log.get("attack_events", ()):
+            if int(event.get("step", -1)) <= actual_step:
+                if latest is None or int(event["step"]) >= int(latest["step"]):
+                    latest = event
+        friendly = {"fake_obstacle": "Fake Obstacle", "false_clearance": "False Clearance", "stale_reassertion": "Stale Reassertion"}
+        latest_text = "None" if latest is None else f"{friendly.get(latest.get('attack_type'), latest.get('attack_type'))} - Step {latest['step']}"
+        overlay_count = sum(
+            len(item.get("cells", ()))
+            for item in log.get("attack_overlays", [[]])[frame]
+        )
+        status_lines = [
+            " | ".join([
+                f"Step: {actual_step}",
+                f"Phase: {phase}",
+                f"Attack starts: {attack_start_text}",
+                f"Spawn grace: {grace_active}",
+            ]),
+            " | ".join([
+                f"Reports: {report_count}",
+                f"Malicious reports: {malicious_report_count}",
+                f"Attack overlays: {overlay_count}",
+                f"Malicious robot: R{malicious_robot_id}",
+                f"Latest attack: {latest_text}",
+            ]),
         ]
 
         for robot in robots:
@@ -5405,30 +5794,34 @@ def animate(world, robots, log):
             carrying = log["robots"][rid]["carrying_item"][frame]
             completed_tasks = log["robots"][rid]["completed_tasks"][frame]    
 
-            status_parts.append(
-                f"R{rid}: tasks={completed_tasks}, carrying={carrying}, accepted={accepted}, rejected={rejected}, replans={replans}, done={completed}"
+            status_lines.append(
+                f"R{rid}: tasks={completed_tasks}, carrying={carrying}, "
+                f"accepted={accepted}, rejected={rejected}, "
+                f"replans={replans}, done={completed}"
             )
 
-        status_text.set_text(" | ".join(status_parts))
-        artists.append(status_text)
+        status_text.set_text("\n".join(status_lines))
+        artists.extend((status_text, sharing_text))
 
         return artists
 
     anim = FuncAnimation(
         fig,
         update,
-        frames=max_frames,
+        # The slowest setting advances by 0.25 frame per callback; allocate
+        # enough callbacks that every playback speed reaches the final frame.
+        frames=(max_frames * 4) + 1,
         interval=ANIMATION_INTERVAL_MS,
         blit=False,
         repeat=False,
     )
 
-    plt.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.subplots_adjust(left=0.02, right=0.99, bottom=0.32, top=0.88, wspace=0.12)
     plt.show()
 
     return anim
 
-def show_recon_heatmap(world, log):
+def show_recon_heatmap(world, log, output_path=None):
     """
     Shows the learned reconnaissance heatmap at the end of phase 1.
 
@@ -5484,7 +5877,11 @@ def show_recon_heatmap(world, log):
         label="benign traffic count",
     )
 
-    plt.tight_layout()
+    fig.tight_layout()
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
     plt.show()
 
 def parse_args():
@@ -5496,6 +5893,7 @@ def parse_args():
     parser.add_argument("--map-movingai", type=str, default=None)
     parser.add_argument("--no-animation", action="store_true")
     parser.add_argument("--defense-method", choices=DEFENSE_METHODS, default=DEFENSE_METHOD)
+    parser.add_argument("--trust-threshold", type=float, default=TRUST_ACCEPT_THRESHOLD)
 
     parser.add_argument("--decay-rate", type=float, default=0.006)
     parser.add_argument("--cost-scale", type=float, default=14.0)
@@ -5517,6 +5915,8 @@ def parse_args():
         parser.error("--deliveries-per-robot must be at least 1")
     if args.max_steps < 1:
         parser.error("--max-steps must be at least 1")
+    if not 0.0 <= args.trust_threshold <= 1.0:
+        parser.error("--trust-threshold must be in [0, 1]")
     return args
 
 # ============================================================
@@ -5541,6 +5941,7 @@ if __name__ == "__main__":
         grid = make_demo_dynamic_grid(prior_grid)
 
     defense_config = {
+        "trust_threshold": args.trust_threshold,
         "decay_rate": args.decay_rate,
         "cost_scale": args.cost_scale,
         "cost_exponent": args.cost_exponent,
