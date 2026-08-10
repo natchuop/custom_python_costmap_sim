@@ -1,10 +1,12 @@
 from dataclasses import replace
 import contextlib
 import io
+from collections import Counter
 from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, VisualizationConfig
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.models import ClaimReport, ClaimType, DeliveryTask, VerificationOutcome
 from map_poisoning.scenario import author_manifest
+from map_poisoning.audit import audit_manifest
 from map_poisoning.models import AttackType
 from map_poisoning.rollout import run_manifest_rollout
 from map_poisoning.sensing import lidar_observations
@@ -100,6 +102,47 @@ def test_fake_obstacles_use_enlarged_footprints():
     assert fake_events
     assert max(len(event.cells) for event in fake_events) >= 15
     assert all(not manifest.static_grid[r][c] for event in fake_events for r, c in event.cells)
+
+
+def test_attack_labels_and_peer_delivery_provenance_cover_all_attack_types():
+    config = SimulationConfig(
+        seed=0,
+        phases=PhaseConfig(20, 120, 20),
+        attacks=AttackConfig(interval_min=10, interval_max=10),
+        deliveries_per_robot=1,
+        max_steps=160,
+        visualization=VisualizationConfig(False),
+    )
+    manifest = author_manifest(config)
+    assert audit_manifest(manifest)["passed"]
+    assert {event.attack_type for event in manifest.attack_events} == set(AttackType)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        _, robots, log = run_manifest_rollout(config, manifest, "source_linked")
+
+    malicious_sent = [report for report in log["reports"] if report["is_malicious"]]
+    malicious_deliveries = [
+        delivery for delivery in log["report_deliveries"]
+        if delivery["is_malicious"]
+    ]
+    assert Counter(report["attack_type"] for report in malicious_sent) == Counter({
+        "fake_obstacle": 51,
+        "false_clearance": 5,
+        "stale_reassertion": 1,
+    })
+    assert len(malicious_deliveries) == 2 * len(malicious_sent)
+    assert {delivery["recipient_id"] for delivery in malicious_deliveries} == {1, 2}
+
+    processed = [
+        item for item in log["report_processing"] if item["is_malicious"]
+    ]
+    assert len(processed) == len(malicious_deliveries)
+    assert all(item["accepted"] for item in processed)
+    assert any(
+        "malicious_report_on_route" in event["reason"]
+        for robot in robots if not robot.is_malicious
+        for event in robot.replan_events
+    )
 
 def test_source_linked_is_retroactive_and_trust_fused_is_not():
     trust={0:.7}; score=lambda sender: trust[sender]

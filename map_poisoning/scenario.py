@@ -369,6 +369,21 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         )
         for robot_id in layout_tasks
     }
+    report_audit_labels = tuple(
+        ReportAuditLabel(
+            report_id=report_id,
+            is_malicious=True,
+            attack_type=event.attack_type,
+            obstacle_episode_id=event.obstacle_episode_id,
+            actual_state_at_observation=(
+                ClaimType.BLOCKED
+                if event.attack_type == AttackType.FALSE_CLEARANCE
+                else ClaimType.FREE
+            ),
+        )
+        for event in events
+        for report_id in event.report_ids
+    )
     return ScenarioManifest(
         SCHEMA_VERSION,
         config.seed,
@@ -389,6 +404,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         protocol_id="original_legacy_cli",
         robot_starts=robot_starts,
         task_queues=task_queues,
+        report_audit_labels=report_audit_labels,
         candidate_metadata=tuple(metadata),
         authoring_warnings=tuple(dict.fromkeys(warnings)),
         reconnaissance_heatmap=tuple(

@@ -1335,6 +1335,9 @@ class PeerReport:
     timestamp: int
     confidence: float = 1.0
     is_malicious: bool = False
+    report_id: str | None = None
+    attack_event_id: str | None = None
+    attack_type: str | None = None
 
 
 @dataclass
@@ -1344,6 +1347,9 @@ class PendingClaim:
     claim: ClaimType
     timestamp: int
     is_malicious: bool = False
+    report_id: str | None = None
+    attack_event_id: str | None = None
+    attack_type: str | None = None
 
 @dataclass
 class DeliveryTask:
@@ -3264,6 +3270,9 @@ class GridRobot:
                 "step": timestamp,
                 "observer_id": self.robot_id,
                 "sender_id": claim.sender_id,
+                "report_id": claim.report_id,
+                "attack_event_id": claim.attack_event_id,
+                "attack_type": claim.attack_type,
                 "target_cell": claim.target_cell,
                 "claim": int(claim.claim),
                 "truth_matches": truth_matches,
@@ -3428,6 +3437,9 @@ class GridRobot:
                         claim=report.claim,
                         timestamp=report.timestamp,
                         is_malicious=report.is_malicious,
+                        report_id=report.report_id,
+                        attack_event_id=report.attack_event_id,
+                        attack_type=report.attack_type,
                     )
                 )
                 self.trust_model.observe_claim(report)
@@ -3595,6 +3607,12 @@ class GridRobot:
 
     def queue_outbound_reports(self, reports):
         for report in reports:
+            if report.report_id is None:
+                report.report_id = (
+                    f"observation-{self.robot_id}-{int(report.timestamp)}-"
+                    f"{int(report.target_cell[0])}-{int(report.target_cell[1])}-"
+                    f"{int(report.claim)}"
+                )
             self.pending_outbound[tuple(report.target_cell)] = report
 
     def drain_outbound_reports(self, sent_step):
@@ -3722,6 +3740,9 @@ class GridRobot:
                     claim=ClaimType.BLOCKED,
                     timestamp=timestamp,
                     is_malicious=True,
+                    report_id=f"dynamic-fake-{timestamp:06d}-{cell[0]}-{cell[1]}",
+                    attack_event_id=f"dynamic-fake-{timestamp:06d}",
+                    attack_type="fake_obstacle",
                 )
             )
 
@@ -4185,6 +4206,7 @@ def broadcast_reports(robots, reports_by_sender):
     Later, replace this with range-limited communication.
     For now, the research variable is trust, not wireless propagation drama.
     """
+    deliveries = []
     for sender_id, reports in reports_by_sender.items():
         for report in reports:
             for robot in robots:
@@ -4192,6 +4214,18 @@ def broadcast_reports(robots, reports_by_sender):
                     continue
 
                 robot.receive_report(report)
+                deliveries.append({
+                    "report_id": report.report_id,
+                    "sender_id": int(sender_id),
+                    "recipient_id": int(robot.robot_id),
+                    "target_cell": tuple(report.target_cell),
+                    "claim": int(report.claim),
+                    "observation_step": int(report.timestamp),
+                    "is_malicious": bool(report.is_malicious),
+                    "attack_event_id": report.attack_event_id,
+                    "attack_type": report.attack_type,
+                })
+    return deliveries
 
 
 def _traffic_yield_target(robot, robots, world):
@@ -4451,7 +4485,12 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
                 conflict_kind = "traffic_vertex_conflict"
                 blockers.append(other_robot.robot_id)
                 break
-            if target & other["current"] and not other["approved"]:
+            # A robot with no target is stationary, even if coordination marked
+            # its no-op intent approved. Its current footprint remains reserved
+            # during the one-step gap before delivery state advances.
+            if target & other["current"] and (
+                not other["approved"] or not other["target"]
+            ):
                 conflict_kind = "traffic_reservation_conflict"
                 blockers.append(other_robot.robot_id)
                 break
@@ -4643,31 +4682,6 @@ def run_simulation(
         )
         robots.append(robot)
 
-    # DEBUG: check initial planner validity for every robot
-    print("\n--- INITIAL PLANNING DEBUG ---")
-
-    for robot in robots:
-        print(
-            f"Robot {robot.robot_id}: "
-            f"start={robot.position}, "
-            f"goal={robot.goal}, "
-            f"malicious={robot.is_malicious}, "
-            f"start_blocked={robot.belief_map.is_blocked_for_planning(robot.position)}, "
-            f"goal_blocked={robot.belief_map.is_blocked_for_planning(robot.goal)}"
-        )
-
-        try:
-            path, stats = robot.planner.plan(
-                robot.belief_map,
-                robot.position,
-                robot.goal,
-            )
-            print(f"  initial path length={len(path)}, stats={stats}")
-        except RuntimeError as e:
-            print(f"  initial planning failed: {e}")
-
-    print("--- END INITIAL PLANNING DEBUG ---\n")
-
     log = {
         "truth_grid": [],
         "truth_dynamic": [],
@@ -4717,6 +4731,8 @@ def run_simulation(
             for robot in robots
         },
         "reports": [],
+        "report_deliveries": [],
+        "report_processing": [],
         "trust_events": [],
         "malicious_robot_id": malicious_robot_id,
         "goal": goal,
@@ -4957,7 +4973,7 @@ def run_simulation(
                             "last_refresh_step": step,
                             "expires_step": step + MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS,
                         })
-                for cell in event.cells:
+                for cell_index, cell in enumerate(event.cells):
                     reports_by_sender[event.sender_id].append(
                         PeerReport(
                             sender_id=event.sender_id,
@@ -4965,6 +4981,9 @@ def run_simulation(
                             claim=ClaimType(int(event.claim)),
                             timestamp=int(event.observation_step),
                             is_malicious=True,
+                            report_id=event.report_ids[cell_index],
+                            attack_event_id=event.event_id,
+                            attack_type=getattr(event.attack_type, "value", str(event.attack_type)),
                         )
                     )
 
@@ -4977,7 +4996,10 @@ def run_simulation(
                 reports_by_sender[robot.robot_id].extend(
                     robot.drain_outbound_reports(step)
                 )
-            broadcast_reports(robots, reports_by_sender)
+            deliveries = broadcast_reports(robots, reports_by_sender)
+            for delivery in deliveries:
+                delivery["sent_step"] = int(step)
+            log["report_deliveries"].extend(deliveries)
 
             for sender_id, reports in reports_by_sender.items():
                 for report in reports:
@@ -4990,6 +5012,9 @@ def run_simulation(
                             "target_cell": report.target_cell,
                             "claim": int(report.claim),
                             "is_malicious": report.is_malicious,
+                            "report_id": report.report_id,
+                            "attack_event_id": report.attack_event_id,
+                            "attack_type": report.attack_type,
                         }
                     )
 
@@ -4998,6 +5023,21 @@ def run_simulation(
             old_path = list(robot.path)
 
             accepted, rejected = robot.process_inbox()
+
+            for accepted_flag, processed_reports in ((True, accepted), (False, rejected)):
+                for processed_report in processed_reports:
+                    log["report_processing"].append({
+                        "step": step,
+                        "recipient_id": int(robot.robot_id),
+                        "report_id": processed_report.report_id,
+                        "sender_id": int(processed_report.sender_id),
+                        "target_cell": tuple(processed_report.target_cell),
+                        "claim": int(processed_report.claim),
+                        "is_malicious": bool(processed_report.is_malicious),
+                        "accepted": accepted_flag,
+                        "attack_event_id": processed_report.attack_event_id,
+                        "attack_type": processed_report.attack_type,
+                    })
 
             route_affected = robot.reports_affect_remaining_route(accepted)
             path_invalid = robot.should_replan_for_path_state(step)
@@ -5298,6 +5338,27 @@ def compute_experiment_metrics(robots, log):
     benign_robots = [robot for robot in robots if not robot.is_malicious]
     total_completed = sum(robot.completed_tasks for robot in robots)
     benign_completed = sum(robot.completed_tasks for robot in benign_robots)
+
+    attack_event_counts = {}
+    for event in log.get("attack_events", ()):
+        attack_type = event.get("attack_type", "unknown")
+        attack_event_counts[attack_type] = attack_event_counts.get(attack_type, 0) + 1
+    attack_report_counts = {}
+    for report in log.get("reports", ()):
+        if report.get("is_malicious"):
+            attack_type = report.get("attack_type") or "unknown"
+            attack_report_counts[attack_type] = attack_report_counts.get(attack_type, 0) + 1
+    attack_delivery_counts = {}
+    for delivery in log.get("report_deliveries", ()):
+        if delivery.get("is_malicious"):
+            attack_type = delivery.get("attack_type") or "unknown"
+            attack_delivery_counts[attack_type] = attack_delivery_counts.get(attack_type, 0) + 1
+    attack_processed_counts = {}
+    for processed in log.get("report_processing", ()):
+        if processed.get("is_malicious"):
+            attack_type = processed.get("attack_type") or "unknown"
+            bucket = attack_processed_counts.setdefault(attack_type, {"accepted": 0, "rejected": 0})
+            bucket["accepted" if processed.get("accepted") else "rejected"] += 1
     total_possible = max(1, len(robots) * tasks_per_robot)
     benign_possible = max(1, len(benign_robots) * tasks_per_robot)
 
@@ -5331,10 +5392,21 @@ def compute_experiment_metrics(robots, log):
     false_trust_events = [event for event in log.get("trust_events", []) if event["truth_matches"] is False]
     true_trust_events = [event for event in log.get("trust_events", []) if event["truth_matches"] is True]
     malicious_trust_events = [event for event in log.get("trust_events", []) if event["sender_id"] == malicious_robot_id]
-    malicious_false_events = [event for event in malicious_trust_events if event["truth_matches"] is False]
+    malicious_attack_events = [
+        event for event in malicious_trust_events
+        if event.get("is_malicious") is True
+    ]
+    malicious_false_events = [
+        event for event in malicious_attack_events
+        if event["truth_matches"] is False
+    ]
+    attack_verified_false_counts = {}
+    for event in malicious_false_events:
+        attack_type = event.get("attack_type") or "unknown"
+        attack_verified_false_counts[attack_type] = attack_verified_false_counts.get(attack_type, 0) + 1
 
     time_to_distrust = None
-    for event in malicious_trust_events:
+    for event in malicious_attack_events:
         if event["new_trust"] < TRUST_ACCEPT_THRESHOLD:
             time_to_distrust = event["step"]
             break
@@ -5349,7 +5421,7 @@ def compute_experiment_metrics(robots, log):
     for robot in benign_robots:
         rid = robot.robot_id
         distrust_step = None
-        for event in malicious_trust_events:
+        for event in malicious_attack_events:
             if event.get("observer_id") == rid and event["new_trust"] < TRUST_ACCEPT_THRESHOLD:
                 distrust_step = event["step"]
                 break
@@ -5472,8 +5544,9 @@ def compute_experiment_metrics(robots, log):
         "experiment_mode": log.get("experiment_mode", EXPERIMENT_MODE),
         "attack_mode": ATTACK_MODE,
         "configured_deliveries_per_robot": tasks_per_robot,
-        "simulation_steps": len(log.get("truth_grid", [])),
+        "total_completed": total_completed,
         "all_robot_delivery_success_rate": total_completed / total_possible,
+        "simulation_steps": len(log.get("truth_grid", [])),
         "benign_delivery_success_rate": benign_completed / benign_possible,
         "benign_mission_complete": all(robot.completed for robot in benign_robots),
         "completed_tasks_per_robot": completed_tasks,
@@ -5544,6 +5617,11 @@ def compute_experiment_metrics(robots, log):
         "robot_overlap_violations": int(log.get("robot_overlap_violations", 0)),
         "recovery_start_step": recovery_start,
         "recovery_metrics_per_robot": recovery_metrics,
+        "attack_event_counts": attack_event_counts,
+        "attack_report_counts": attack_report_counts,
+        "attack_delivery_counts": attack_delivery_counts,
+        "attack_processed_counts": attack_processed_counts,
+        "attack_verified_false_counts": attack_verified_false_counts,
     }
 
 def print_summary(world, robots, log):

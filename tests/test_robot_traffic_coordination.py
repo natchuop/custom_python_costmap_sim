@@ -118,6 +118,24 @@ def test_world_blockage_cancels_frozen_commit_without_substitution():
     assert robot.position == (5, 4)
 
 
+def test_stationary_task_boundary_cell_remains_reserved():
+    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
+    stationary = _robot(0, (5, 5), (5, 6))
+    stationary.path = [(5, 5)]
+    moving = _robot(1, (5, 4), (5, 5))
+
+    approved, events = sim2.coordinate_robot_intents(
+        [stationary, moving], world, 0, {}
+    )
+
+    assert approved[stationary.robot_id] is True
+    assert approved[moving.robot_id] is False
+    assert any(
+        event["event_type"] == "traffic_reservation_conflict"
+        for event in events
+    )
+
+
 def test_perceived_blockage_does_not_override_physical_commit():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     robot = _robot(0, (5, 4), (5, 5))

@@ -135,6 +135,21 @@ def collect_rollout_metrics(
             method=method,
             **{key: value for key, value in report.items() if key != "step"},
         )
+    for delivery in log.get("report_deliveries", []):
+        collector.event(
+            delivery.get("sent_step", 0),
+            "report_received",
+            method=method,
+            **{key: value for key, value in delivery.items()
+               if key not in {"step", "sent_step"}},
+        )
+    for processed in log.get("report_processing", []):
+        collector.event(
+            processed.get("step", 0),
+            "report_processed",
+            method=method,
+            **{key: value for key, value in processed.items() if key != "step"},
+        )
     for event in log.get("trust_events", []):
         collector.event(
             event["step"],
@@ -203,6 +218,9 @@ def collect_rollout_metrics(
         "seed": config.seed,
         "steps_completed": len(log["truth_grid"]),
         "attack_actions": sum(bool(report.get("is_malicious")) for report in log["reports"]),
+        "configured_tasks_per_robot": config.deliveries_per_robot,
+        "all_robot_total_deliveries_completed": calculated["total_completed"],
+        "all_robot_delivery_success_rate": calculated["all_robot_delivery_success_rate"],
         "benign_total_deliveries_completed": calculated["benign_total_completed_deliveries"],
         "benign_success_rate": calculated["benign_delivery_success_rate"],
         "benign_deliveries_after_attack": calculated["benign_deliveries_after_attack"],
@@ -246,6 +264,11 @@ def collect_rollout_metrics(
         "recovery_trust_gain_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("recovery_trust_gain"),
         "retrust_latency_r1": calculated.get("recovery_metrics_per_robot", {}).get(1, {}).get("retrust_latency_steps"),
         "retrust_latency_r2": calculated.get("recovery_metrics_per_robot", {}).get(2, {}).get("retrust_latency_steps"),
+        "attack_event_counts": calculated.get("attack_event_counts", {}),
+        "attack_report_counts": calculated.get("attack_report_counts", {}),
+        "attack_delivery_counts": calculated.get("attack_delivery_counts", {}),
+        "attack_processed_counts": calculated.get("attack_processed_counts", {}),
+        "attack_verified_false_counts": calculated.get("attack_verified_false_counts", {}),
     }
     return summary, collector
 
