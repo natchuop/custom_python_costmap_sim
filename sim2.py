@@ -6007,8 +6007,8 @@ def animate(world, robots, log, map_view=None):
     trust_ax = fig.add_subplot(layout[1, 2])
     legend_ax = fig.add_subplot(layout[2, 0:2])
     sharing_ax = fig.add_subplot(layout[3, 0:2])
-    controls_ax = fig.add_subplot(layout[2:4, 2])
-    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, controls_ax):
+    latest_attack_ax = fig.add_subplot(layout[2:4, 2])
+    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, latest_attack_ax):
         panel.set_axis_off()
         panel.set_frame_on(True)
         panel.patch.set_visible(True)
@@ -6157,9 +6157,9 @@ def animate(world, robots, log, map_view=None):
         ax.set_xlabel("")
         ax.tick_params(labelbottom=False)
 
-    # Keep status, trust, legend, sharing guidance, and controls in separate
-    # panels so long text cannot collide with map titles or other widgets.
-    status_ax.set_title("Simulation status", fontsize=10, loc="left", pad=3)
+    # Keep status/playback, trust, legend, sharing guidance, and latest attack
+    # information in separate panels so long text cannot collide with maps.
+    status_ax.set_title("Simulation status | Playback", fontsize=10, loc="left", pad=3)
     defense_method = str(log.get("defense_method") or "unknown")
     trust_ax.set_title(
         f"Robot trust level | {defense_method}",
@@ -6169,7 +6169,8 @@ def animate(world, robots, log, map_view=None):
     )
     legend_ax.set_title("Map legend", fontsize=10, loc="left", pad=2)
     sharing_ax.set_title("Peer observations", fontsize=10, loc="left", pad=1)
-    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, controls_ax):
+    latest_attack_ax.set_title("Latest attack", fontsize=10, loc="left", pad=3)
+    for panel in (status_ax, trust_ax, legend_ax, sharing_ax, latest_attack_ax):
         for spine in panel.spines.values():
             spine.set_visible(False)
 
@@ -6177,9 +6178,9 @@ def animate(world, robots, log, map_view=None):
         0.03,
         0.94,
         "",
-        fontsize=8.3,
+        fontsize=7.6,
         va="top",
-        linespacing=1.25,
+        linespacing=1.1,
         family="DejaVu Sans Mono",
         transform=status_ax.transAxes,
     )
@@ -6192,6 +6193,16 @@ def animate(world, robots, log, map_view=None):
         linespacing=1.5,
         family="DejaVu Sans Mono",
         transform=trust_ax.transAxes,
+    )
+    latest_attack_text = latest_attack_ax.text(
+        0.05,
+        0.90,
+        "",
+        fontsize=10,
+        va="top",
+        linespacing=1.45,
+        family="DejaVu Sans Mono",
+        transform=latest_attack_ax.transAxes,
     )
     sharing_ax.text(
         0.01,
@@ -6206,25 +6217,22 @@ def animate(world, robots, log, map_view=None):
     max_frames = len(log["truth_grid"])
     display_index = 0
     first_tick = True
-    controls_ax.set_title("Playback controls", fontsize=10, loc="left", pad=3)
-    controls_ax.set_xticks([])
-    controls_ax.set_yticks([])
-    controls_position = controls_ax.get_position()
+    controls_position = status_ax.get_position()
     speed_ax = fig.add_axes((
         controls_position.x0 + controls_position.width * 0.06,
-        controls_position.y0 + controls_position.height * 0.18,
+        controls_position.y0 + controls_position.height * 0.04,
         controls_position.width * 0.40,
-        controls_position.height * 0.62,
+        controls_position.height * 0.30,
     ))
-    speed_ax.set_title("Speed", fontsize=10, loc="left", pad=2)
+    speed_ax.set_title("Speed", fontsize=8, loc="left", pad=1)
     speed = RadioButtons(speed_ax, ("0.5x", "1x", "2x", "5x"), active=1)
     for label in speed.labels:
-        label.set_fontsize(10)
+        label.set_fontsize(8)
     pause_ax = fig.add_axes((
         controls_position.x0 + controls_position.width * 0.56,
-        controls_position.y0 + controls_position.height * 0.31,
+        controls_position.y0 + controls_position.height * 0.10,
         controls_position.width * 0.36,
-        controls_position.height * 0.38,
+        controls_position.height * 0.22,
     ))
     pause_button = Button(pause_ax, "Pause", color="#eeeeee", hovercolor="#d0d0d0")
     pause_button.label.set_fontsize(10)
@@ -6434,7 +6442,6 @@ def animate(world, robots, log, map_view=None):
                 if latest is None or int(event["step"]) >= int(latest["step"]):
                     latest = event
         friendly = {"fake_obstacle": "Fake Obstacle", "false_clearance": "False Clearance", "stale_reassertion": "Stale Reassertion"}
-        latest_text = "None" if latest is None else f"{friendly.get(latest.get('attack_type'), latest.get('attack_type'))} - Step {latest['step']}"
         overlay_count = sum(
             len(item.get("cells", ()))
             for item in log.get("attack_overlays", [[]])[frame]
@@ -6448,23 +6455,69 @@ def animate(world, robots, log, map_view=None):
             f"Malicious reports: {malicious_report_count}",
             f"Attack overlays: {overlay_count}",
             f"Malicious robot: R{malicious_robot_id}",
-            f"Latest attack: {latest_text}",
         ]
 
-        trust_lines = [f"Threshold: {TRUST_ACCEPT_THRESHOLD:.2f}"]
-
-        for victim in robots:
-            if victim.is_malicious:
-                continue
-            trust_frame = log["robots"][victim.robot_id].get("trust", [])
-            snapshot = trust_frame[frame] if frame < len(trust_frame) else {}
-            value = snapshot.get(malicious_robot_id, snapshot.get(str(malicious_robot_id), TRUST_ACCEPT_THRESHOLD)) if isinstance(snapshot, dict) else TRUST_ACCEPT_THRESHOLD
-            trust = float(value.get("score", TRUST_ACCEPT_THRESHOLD) if isinstance(value, dict) else value)
-            state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
-            trust_lines.append(
-                f"R{victim.robot_id} -> R{malicious_robot_id}:\n"
-                f"  {trust:.2f}  {state}"
+        if latest is None:
+            latest_attack_lines = [
+                "No attack has occurred yet.",
+                f"Attack phase starts: {attack_start_text}",
+            ]
+        else:
+            latest_event_id = latest.get("event_id")
+            matching_reports = [
+                report
+                for report in log.get("reports", ())
+                if report.get("attack_event_id") == latest_event_id
+            ]
+            reported_cells = {
+                tuple(report["target_cell"])
+                for report in matching_reports
+                if report.get("target_cell") is not None
+            }
+            attacker_id = (
+                matching_reports[0].get("sender_id")
+                if matching_reports
+                else malicious_robot_id
             )
+            latest_attack_lines = [
+                f"Type: {friendly.get(latest.get('attack_type'), latest.get('attack_type'))}",
+                f"Step: {latest.get('step', 'unknown')}",
+                f"Attacker: R{attacker_id}",
+                f"Event: {latest_event_id or 'unknown'}",
+                f"Reported cells: {len(reported_cells)}",
+                f"Reports sent: {len(matching_reports)}",
+            ]
+
+        trust_lines = [
+            f"Threshold: {TRUST_ACCEPT_THRESHOLD:.2f}",
+            "",
+            "Observer -> Sender   Score   State",
+        ]
+
+        for observer in robots:
+            trust_frame = log["robots"][observer.robot_id].get("trust", [])
+            snapshot = trust_frame[frame] if frame < len(trust_frame) else {}
+            for sender in robots:
+                if sender.robot_id == observer.robot_id:
+                    continue
+                value = (
+                    snapshot.get(
+                        sender.robot_id,
+                        snapshot.get(str(sender.robot_id), TRUST_ACCEPT_THRESHOLD),
+                    )
+                    if isinstance(snapshot, dict)
+                    else TRUST_ACCEPT_THRESHOLD
+                )
+                trust = float(
+                    value.get("score", TRUST_ACCEPT_THRESHOLD)
+                    if isinstance(value, dict)
+                    else value
+                )
+                state = "TRUSTED" if trust >= TRUST_ACCEPT_THRESHOLD else "DISTRUSTED"
+                trust_lines.append(
+                    f"R{observer.robot_id} -> R{sender.robot_id}:  "
+                    f"{trust:.2f}  {state}"
+                )
 
         for robot in robots:
             rid = robot.robot_id
@@ -6477,16 +6530,15 @@ def animate(world, robots, log, map_view=None):
             completed_tasks = log["robots"][rid]["completed_tasks"][frame]    
 
             status_lines.append(
-                f"R{rid}: tasks={completed_tasks}, carrying={carrying}"
-            )
-            status_lines.append(
-                f"  accepted={accepted}, rejected={rejected}, "
-                f"replans={replans}, done={completed}"
+                f"R{rid}: tasks={completed_tasks} carry={'Y' if carrying else 'N'} "
+                f"accepted={accepted} rejected={rejected} "
+                f"replans={replans} done={'Y' if completed else 'N'}"
             )
 
         status_text.set_text("\n".join(status_lines))
         trust_text.set_text("\n".join(trust_lines))
-        artists.extend((status_text, trust_text))
+        latest_attack_text.set_text("\n".join(latest_attack_lines))
+        artists.extend((status_text, trust_text, latest_attack_text))
 
         return artists
 

@@ -49,9 +49,27 @@ def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
         assert sum("Robot 1" in title for title in titles) == 1
         assert sum("Robot 2" in title for title in titles) == 1
         assert any(
+            axis.get_title(loc="left") == "Simulation status | Playback"
+            for axis in figure.axes
+        )
+        assert any(
             axis.get_title(loc="left") == "Robot trust level | trust_threshold"
             for axis in figure.axes
         )
+        assert any(
+            axis.get_title(loc="left") == "Latest attack"
+            for axis in figure.axes
+        )
+        trust_axis = next(
+            axis
+            for axis in figure.axes
+            if axis.get_title(loc="left") == "Robot trust level | trust_threshold"
+        )
+        trust_text = "\n".join(item.get_text() for item in trust_axis.texts)
+        for observer_id, sender_id in (
+            (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)
+        ):
+            assert f"R{observer_id} -> R{sender_id}" in trust_text
         for robot_id in (0, 1, 2):
             map_axis = next(
                 axis
