@@ -13,7 +13,7 @@ def parser():
     p.add_argument("--output-directory",default="outputs/simulation_results")
     p.add_argument("--seed",type=int,default=12); p.add_argument("--defense-method",choices=ALL_METHODS,default="trust_threshold")
     p.add_argument("--comparison-methods",default="trust_fused",help="comma-separated methods used with --compare")
-    p.add_argument("--trust-model",choices=("bayesian","scalar"),default="scalar"); p.add_argument("--trust-threshold",type=float,default=0.55); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
+    p.add_argument("--trust-model",choices=("bayesian","scalar"),default="scalar"); p.add_argument("--trust-threshold",type=float,default=0.55)
     p.add_argument("--attacks",default="fake_obstacle,false_clearance,stale_reassertion",help="comma separated, or 'none'")
     p.add_argument("--recon-steps",type=int,default=450); p.add_argument("--attack-steps",type=int,default=1200); p.add_argument("--recovery-steps",type=int,default=750); p.add_argument("--max-steps",type=int)
     p.add_argument("--deliveries-per-robot",type=int,default=100)
@@ -25,4 +25,4 @@ def parser():
 def config_from_args(args):
     enabled=() if args.attacks == "none" else tuple(x for x in args.attacks.split(",") if x)
     comparison_methods = tuple(item.strip() for item in args.comparison_methods.split(",") if item.strip())
-    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model, threshold=args.trust_threshold),fusion=FusionConfig(method=args.defense_method,admission_policy=args.admission_policy),logging=LoggingConfig(args.output_directory),visualization=VisualizationConfig(not args.no_animation, args.map_view),comparison_methods=comparison_methods,manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot,temporary_blockage_change_period_steps=args.temp_obstacle_interval)
+    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model, threshold=args.trust_threshold),fusion=FusionConfig(method=args.defense_method),logging=LoggingConfig(args.output_directory),visualization=VisualizationConfig(not args.no_animation, args.map_view),comparison_methods=comparison_methods,manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot,temporary_blockage_change_period_steps=args.temp_obstacle_interval)

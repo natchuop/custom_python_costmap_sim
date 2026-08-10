@@ -23,7 +23,6 @@ def launch(args) -> None:
         "seed": tk.StringVar(value=str(args.seed)),
         "trust_model": tk.StringVar(value=args.trust_model),
         "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.55))),
-        "admission_policy": tk.StringVar(value=args.admission_policy),
         "output": tk.StringVar(value=args.output_directory),
         "manifest": tk.StringVar(value=args.manifest_path or ""),
         "recon": tk.StringVar(value=str(args.recon_steps)),
@@ -113,9 +112,6 @@ def launch(args) -> None:
     entry("Temporary obstacle movement interval", "temp_interval", 20)
     dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 21)
     entry("Trust threshold", "trust_threshold", 22)
-    dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 23
-    )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
     attacks_frame.grid(row=24, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
@@ -156,7 +152,6 @@ def launch(args) -> None:
             args.temp_obstacle_interval = int(values["temp_interval"].get())
             args.trust_model = values["trust_model"].get()
             args.trust_threshold = float(values["trust_threshold"].get())
-            args.admission_policy = values["admission_policy"].get()
             enabled = [name for name, variable in attack_enabled.items() if variable.get()]
             args.attacks = ",".join(enabled) if enabled else "none"
 
