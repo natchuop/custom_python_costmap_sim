@@ -26,7 +26,7 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
     grid=load_npy(config.map_npy) if config.map_npy else load_movingai(config.map_movingai) if config.map_movingai else default_warehouse_map()
     if config.manifest_path:
         manifest=load_manifest(config.manifest_path)
-    elif not config.map_npy and not config.map_movingai:
+    elif not config.map_npy and not config.map_movingai and not config.scenario_preset:
         manifest=author_warehouse_manifest(config, grid)
     else:
         manifest=author_manifest(config, grid)

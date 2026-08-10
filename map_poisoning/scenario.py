@@ -11,6 +11,7 @@ from .rng import derived_seed, named_rng
 from .temp_obstacles import export_temp_episodes
 from .world import demo_grid
 from .planning import astar
+from .scenario_presets import preset_for_id, validate_fixed_preset
 
 SCHEMA_VERSION = 2
 
@@ -37,6 +38,7 @@ class ScenarioManifest:
     candidate_metadata: tuple[dict, ...] = ()
     authoring_warnings: tuple[str, ...] = ()
     reconnaissance_heatmap: tuple[tuple[int, ...], ...] | None = None
+    scenario_preset: str | None = None
     def to_dict(self): return asdict(self)
 
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
@@ -56,11 +58,11 @@ def _temporary_footprint(grid, rng, preferred):
     return ((preferred[0], preferred[1]), (preferred[0] + 1, preferred[1]),
             (preferred[0], preferred[1] + 1), (preferred[0] + 1, preferred[1] + 1))
 
-def _nominal_route_cells(grid) -> list[tuple[int, int]]:
+def _nominal_route_cells(grid, starts=None, targets=None) -> list[tuple[int, int]]:
     """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
     rows, cols=grid.shape
-    starts=((2,2),(rows-3,cols-3),(2,cols-3))
-    targets=((rows-3,2),(2,cols-3),(rows-3,cols-3),(2,2))
+    starts=tuple(starts or ((2,2),(rows-3,cols-3),(2,cols-3)))
+    targets=tuple(targets or ((rows-3,2),(2,cols-3),(rows-3,cols-3),(2,2)))
     routes=[]
     for index,start in enumerate(starts):
         for offset in (0,1,2):
@@ -72,12 +74,17 @@ def _nominal_route_cells(grid) -> list[tuple[int, int]]:
 
 def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     config.validate(); grid = demo_grid() if grid is None else grid
+    preset = preset_for_id(config.scenario_preset) if config.scenario_preset else None
+    if preset is not None:
+        validate_fixed_preset(grid, preset)
     phases = config.phases
     rng = named_rng(config.seed, "attack_scheduler")
     enabled = [AttackType(x) for x in config.attacks.enabled]
     benign = (1, 2); sender = 0; events=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
     free = [(r,c) for r in range(1,grid.shape[0]-1) for c in range(1,grid.shape[1]-1) if not grid[r,c]]
-    route_cells=_nominal_route_cells(grid) or free
+    starts = dict(preset.robot_starts) if preset is not None else {0:(2,2),1:(grid.shape[0]-3,grid.shape[1]-3),2:(2,grid.shape[1]-3)}
+    targets = tuple(preset.delivery_points) if preset is not None else ((grid.shape[0]-3,2),(2,grid.shape[1]-3),(grid.shape[0]-3,grid.shape[1]-3),(2,2))
+    route_cells=_nominal_route_cells(grid, tuple(starts.values()), targets) or free
     # Temporary obstacles are part of the fixed scenario and deliberately sit
     # on nominal traffic corridors so clearance/stale ablations affect behavior.
     episodes=[]
@@ -129,8 +136,6 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
-    starts={0:(2,2),1:(grid.shape[0]-3,grid.shape[1]-3),2:(2,grid.shape[1]-3)}
-    targets=((grid.shape[0]-3,2),(2,grid.shape[1]-3),(grid.shape[0]-3,grid.shape[1]-3),(2,2))
     queues={rid:tuple(DeliveryTask(f"r{rid}-task-{i}",targets[(rid+i)%4],targets[(rid+i+2)%4]) for i in range(config.deliveries_per_robot)) for rid in (sender,) + benign}
     warnings=() if len(set(selected)) >= min(config.attacks.min_unique_footprints,len(selected)) else ("concentrated_attack_manifest",)
     # Script the attacker independently of defense-dependent benign routes.
@@ -140,7 +145,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         return ClaimType.BLOCKED if any(cell in episode.cells and episode.appearance_step <= step < episode.clearance_step for episode in episodes) else ClaimType.FREE
     honest=tuple(ClaimReport(f"attacker-honest-{step:05}",sender,positions[step],truth(positions[step],step),step,step,step) for step in range(0,phases.total_steps,config.communication_period_steps))
     labels=tuple(ReportAuditLabel(report_id,True,event.attack_type,event.obstacle_episode_id,ClaimType.BLOCKED if event.attack_type == AttackType.FALSE_CLEARANCE else ClaimType.FREE) for event in events for report_id in event.report_ids)
-    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, {"reconnaissance_end":phases.recon_steps, "attack_end":phases.recon_steps+phases.attack_steps, "total":phases.total_steps}, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="original_legacy_cli", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings)
+    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, {"reconnaissance_end":phases.recon_steps, "attack_end":phases.recon_steps+phases.attack_steps, "total":phases.total_steps}, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="original_legacy_cli", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings, scenario_preset=config.scenario_preset)
 
 def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     """Author the default warehouse manifest from a clean recon rollout and heatmap candidates."""
@@ -392,7 +397,14 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 min(config.phases.recon_steps, len(log["traffic_heatmap"]) - 1)
             ]
         ),
+        scenario_preset=config.scenario_preset,
     )
+
+
+def scenario_manifest_hash(manifest: ScenarioManifest) -> str:
+    """Hash the complete authored scenario, not only its static map."""
+    payload = json.dumps(manifest.to_dict(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 def save_manifest(manifest: ScenarioManifest, path: str | Path) -> None:
     Path(path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
@@ -407,4 +419,4 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     reports=tuple(ClaimReport(item["report_id"],item["sender_id"],tuple(item["target_cell"]),ClaimType(item["claim"]),item["observation_step"],item["sent_step"],item["received_step"],item.get("confidence",1.),item.get("scenario_event_id")) for item in raw.get("honest_attacker_reports",()))
     labels=tuple(ReportAuditLabel(item["report_id"],item["is_malicious"],AttackType(item["attack_type"]) if item.get("attack_type") else None,item.get("obstacle_episode_id"),ClaimType(item["actual_state_at_observation"]),item.get("original_obstacle_appearance_step"),item.get("original_obstacle_clearance_step")) for item in raw.get("report_audit_labels",()))
     heatmap = raw.get("reconnaissance_heatmap")
-    return ScenarioManifest(raw["schema_version"],raw["master_seed"],raw["derived_seeds"],raw["map_hash"],tuple(raw["map_shape"]),tuple(tuple(row) for row in raw["static_grid"]),raw["phase_boundaries"],raw["malicious_robot_id"],tuple(raw["benign_robot_ids"]),episodes,events,raw.get("scenario_id",""),raw.get("protocol_id","custom"),starts,queues,tuple(map(tuple,raw.get("attacker_positions",()))),reports,labels,tuple(raw.get("candidate_metadata",())),tuple(raw.get("authoring_warnings",())),tuple(tuple(int(value) for value in row) for row in heatmap) if heatmap else None)
+    return ScenarioManifest(raw["schema_version"],raw["master_seed"],raw["derived_seeds"],raw["map_hash"],tuple(raw["map_shape"]),tuple(tuple(row) for row in raw["static_grid"]),raw["phase_boundaries"],raw["malicious_robot_id"],tuple(raw["benign_robot_ids"]),episodes,events,raw.get("scenario_id",""),raw.get("protocol_id","custom"),starts,queues,tuple(map(tuple,raw.get("attacker_positions",()))),reports,labels,tuple(raw.get("candidate_metadata",())),tuple(raw.get("authoring_warnings",())),tuple(tuple(int(value) for value in row) for row in heatmap) if heatmap else None,raw.get("scenario_preset"))
