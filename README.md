@@ -129,9 +129,11 @@ Manifests are especially useful for fair comparisons. To compare defense methods
 
 When animation is enabled, the reconnaissance heatmap opens first, followed by the live playback window. The playback shows the ground-truth map and one map per robot. Robot source colors are purple for robot 0, orange for robot 1, and blue for robot 2. On combined maps, an occupied shared cell uses the source robot’s color; if several trusted robots support it, the highest-trust source color is shown. Yellow marks goals/checkpoints, red marks attack overlays, and light red marks false-clearance overlays.
 
-Playback includes `0.5x`, `1x`, `2x`, and `5x` speed controls plus a compact
-pause/resume button. Playback uses the completed log, so changing speed or
-pausing does not change the simulation results.
+The playback window keeps the four maps, simulation status, robot trust levels,
+peer-observation notes, legend, and controls in separate panels. It includes
+`0.5x`, `1x`, `2x`, and `5x` speed controls plus pause/resume. Playback uses
+the completed log, so changing speed or pausing does not change the simulation
+results.
 
 ## Defense methods
 
