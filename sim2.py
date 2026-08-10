@@ -6070,6 +6070,8 @@ def animate(world, robots, log, map_view=None):
 
     belief_imgs = {}
     belief_path_lines = {}
+    belief_lidar_lines = {}
+    belief_lidar_range_patches = {}
     belief_robot_patches = {}
     belief_attack_outline_patches = {}
 
@@ -6081,9 +6083,10 @@ def animate(world, robots, log, map_view=None):
         selected_view = map_view or log.get("map_view", "combined")
         view_label = "Combined Belief Map" if selected_view == "combined" else "Local Observation Map"
         ax.set_title(
-            f"Robot {rid}\n{view_label}\n({role})",
-            fontsize=13,
-            pad=6,
+            f"Robot {rid} | {view_label}\n"
+            f"({role}) - LiDAR {LIDAR_RANGE_CELLS:g} cells",
+            fontsize=11,
+            pad=5,
             color=ROBOT_COLORS.get(rid, "#555555"),
         )
         ax.set_xlabel("col", fontsize=11)
@@ -6117,6 +6120,22 @@ def animate(world, robots, log, map_view=None):
 
         edge_color = ROBOT_COLORS.get(rid, "#555555")
 
+        belief_lidar_lines[rid] = []
+        if SHOW_LIDAR_RAYS:
+            start_row, start_col = anchor_cell
+            lidar_range = plt.Circle(
+                (start_col, start_row),
+                LIDAR_RANGE_CELLS,
+                fill=False,
+                edgecolor=edge_color,
+                linestyle="--",
+                linewidth=0.8,
+                alpha=0.45,
+                zorder=2,
+            )
+            ax.add_patch(lidar_range)
+            belief_lidar_range_patches[rid] = lidar_range
+
         patch = draw_robot_footprint(
             ax,
             anchor_cell,
@@ -6128,6 +6147,9 @@ def animate(world, robots, log, map_view=None):
         belief_attack_outline_patches[rid] = []
 
         belief_path_lines[rid] = []
+        ax.set_xlim(-0.5, first_belief.shape[1] - 0.5)
+        ax.set_ylim(first_belief.shape[0] - 0.5, -0.5)
+        ax.set_autoscale_on(False)
 
     # The lower-row titles use three lines. Keep the upper-row x tick labels
     # out of that title area; the bottom row still carries the shared col axes.
@@ -6138,7 +6160,13 @@ def animate(world, robots, log, map_view=None):
     # Keep status, trust, legend, sharing guidance, and controls in separate
     # panels so long text cannot collide with map titles or other widgets.
     status_ax.set_title("Simulation status", fontsize=10, loc="left", pad=3)
-    trust_ax.set_title("Robot trust level", fontsize=10, loc="left", pad=3)
+    defense_method = str(log.get("defense_method") or "unknown")
+    trust_ax.set_title(
+        f"Robot trust level | {defense_method}",
+        fontsize=10,
+        loc="left",
+        pad=3,
+    )
     legend_ax.set_title("Map legend", fontsize=10, loc="left", pad=2)
     sharing_ax.set_title("Peer observations", fontsize=10, loc="left", pad=1)
     for panel in (status_ax, trust_ax, legend_ax, sharing_ax, controls_ax):
@@ -6332,6 +6360,22 @@ def animate(world, robots, log, map_view=None):
             artists.append(belief_imgs[rid])
 
             r, c = log["robots"][rid]["position"][frame]
+
+            if SHOW_LIDAR_RAYS:
+                lidar_range = belief_lidar_range_patches[rid]
+                lidar_range.center = (c, r)
+                artists.append(lidar_range)
+
+                for line in belief_lidar_lines[rid]:
+                    line.remove()
+                belief_lidar_lines[rid] = draw_lidar_rays(
+                    belief_axes[rid],
+                    log["robots"][rid]["lidar_rays"][frame],
+                    color=ROBOT_COLORS.get(rid, "#00bcd4"),
+                    linewidth=0.45,
+                    alpha=0.28,
+                )
+                artists.extend(belief_lidar_lines[rid])
 
             belief_robot_patches[rid].set_xy((c - 0.5, r - 0.5))
 

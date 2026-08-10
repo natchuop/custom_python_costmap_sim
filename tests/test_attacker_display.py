@@ -48,6 +48,26 @@ def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
         assert sum("Robot 0" in title for title in titles) == 1
         assert sum("Robot 1" in title for title in titles) == 1
         assert sum("Robot 2" in title for title in titles) == 1
+        assert any(
+            axis.get_title(loc="left") == "Robot trust level | trust_threshold"
+            for axis in figure.axes
+        )
+        for robot_id in (0, 1, 2):
+            map_axis = next(
+                axis
+                for axis in figure.axes
+                if axis.get_title().startswith(f"Robot {robot_id} |")
+            )
+            own_ray_lines = [
+                line
+                for line in map_axis.lines
+                if line.get_color() == sim2.ROBOT_COLORS[robot_id]
+            ]
+            assert len(own_ray_lines) >= sim2.LIDAR_NUM_RAYS
+            assert any(
+                patch.get_radius() == sim2.LIDAR_RANGE_CELLS
+                for patch in map_axis.patches
+            )
         assert len(figure.axes) >= 8
     finally:
         animation.event_source.stop()
