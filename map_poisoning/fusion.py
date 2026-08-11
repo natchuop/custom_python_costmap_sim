@@ -121,6 +121,10 @@ class FusionEngine:
         self.set_time(step)
         return int(self._runner.evidence(cell, step))
 
+    def selected_claim(self, cell: tuple[int, int], step: int) -> int | None:
+        self.set_time(step)
+        return self._runner.selected_claim(cell, step)
+
     def footprint_hard_blocked(self, cells, step: int) -> bool:
         self.set_time(step)
         return self._runner.footprint_is_hard_blocked(cells, step)

@@ -27,7 +27,7 @@ def test_primary_weighting_contracts_and_active_replacement():
     before = {name: engine.evidence((2, 2), 1) for name, engine in engines.items()}
     trust[0] = .1
     assert engines["full_trust"].evidence((2, 2), 1) == before["full_trust"]
-    assert engines["trust_fused"].evidence((2, 2), 1) == before["trust_fused"]
+    assert engines["trust_fused"].evidence((2, 2), 1) < before["trust_fused"]
     assert engines["source_linked"].evidence((2, 2), 1) < before["source_linked"]
     assert before["full_trust"] >= before["trust_fused"]
 
@@ -65,6 +65,34 @@ def test_direct_free_and_blocked_override_peer_evidence():
     assert belief.traversal_cost((2, 2), 1, fusion) == 1
     belief.observe(DirectObservation(1, (2, 2), ClaimType.BLOCKED, 2))
     assert math.isinf(belief.traversal_cost((2, 2), 2, fusion))
+
+
+def test_trust_fused_self_free_observation_overrides_peer_block_claim():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8))
+    fusion = FusionEngine("trust_fused", lambda _: 1.0)
+    fusion.add(report("peer-block", 0, ClaimType.BLOCKED))
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 1))
+    assert not belief.is_blocked_for_planning((2, 2), fusion, 1)
+    assert belief.traversal_cost((2, 2), 1, fusion) == 1.0
+
+
+def test_trust_fused_selected_free_claim_has_normal_traversal_cost():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8))
+    fusion = FusionEngine("trust_fused", lambda _: 1.0)
+    fusion.add(report("peer-free", 0, ClaimType.FREE))
+    assert fusion.selected_claim((2, 2), 0) == ClaimType.FREE
+    assert belief.traversal_cost((2, 2), 0, fusion) == 1.0
+
+
+def test_modular_stale_direct_free_allows_trusted_peer_block():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8))
+    fusion = FusionEngine("trust_fused", lambda _: 1.0)
+    fusion.add(report("peer-block", 0, ClaimType.BLOCKED))
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 1))
+    assert not belief.is_blocked_for_planning((2, 2), fusion, 1)
+    assert belief.is_blocked_for_planning(
+        (2, 2), fusion, belief.DIRECT_FREE_MEMORY_STEPS + 2
+    )
 
 
 def test_manifest_has_exact_three_robot_team():

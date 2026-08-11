@@ -108,8 +108,9 @@ class DefenseMethodRunner:
           Claim influence decays with age, but sender trust is ignored.
 
       trust_fused:
-          Each report is weighted by trust at report time. Later trust changes do
-          not revise old contributions.
+          For each cell, the highest-current-trust eligible report wins. Its
+          influence is reduced by report age, so a newer eligible report can
+          replace an older one even when the older sender was initially trusted.
 
       source_linked:
           Each report is weighted using current sender trust at planning time.
@@ -237,6 +238,17 @@ class DefenseMethodRunner:
     def claims_for(self, cell: Cell) -> Tuple[StoredClaim, ...]:
         return tuple(self.claims_by_cell.get(tuple(cell), ()))
 
+    def selected_claim(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+    ) -> Optional[int]:
+        """Return the operational winner's claim for winner-based methods."""
+        if self.method != "trust_fused":
+            return None
+        winner = self._trust_fused_winner(cell, timestamp)
+        return winner[0].claim if winner is not None else None
+
     def _claim_impact(self, claim: int) -> float:
         if claim == BLOCKED_CLAIM:
             return 1.0
@@ -249,6 +261,51 @@ class DefenseMethodRunner:
     def _age_weight(self, claim: StoredClaim, timestamp: int) -> float:
         age = max(0, int(timestamp) - claim.timestamp)
         return math.exp(-self.config.decay_rate * age)
+
+    def _trust_fused_winner(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+    ) -> Optional[Tuple[StoredClaim, float]]:
+        """Return the highest effective-trust eligible report for one cell.
+
+        Eligibility uses the sender's current trust. Ranking then applies a
+        small age decay, which lets a newer eligible report supersede an old
+        one without making trust itself stop updating normally.
+        """
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        candidates = []
+        for claim in self.claims_by_cell.get(tuple(cell), ()):
+            age = now - claim.timestamp
+            if age < 0 or age > self.config.max_claim_age:
+                continue
+            current_trust = min(1.0, max(0.0, float(self.trust_score(claim.sender_id))))
+            if current_trust < self.config.trust_threshold:
+                continue
+            effective_trust = (
+                claim.confidence
+                * current_trust
+                * self._age_weight(claim, now)
+            )
+            candidates.append((
+                claim,
+                effective_trust,
+                current_trust,
+            ))
+
+        if not candidates:
+            return None
+
+        winner, effective_trust, current_trust = max(
+            candidates,
+            key=lambda item: (
+                item[1],
+                item[2],
+                item[0].timestamp,
+                -item[0].sender_id,
+            ),
+        )
+        return winner, effective_trust
 
     def _method_weight(
         self,
@@ -265,7 +322,11 @@ class DefenseMethodRunner:
             return claim.confidence * self._age_weight(claim, timestamp)
 
         if method == "trust_fused":
-            return claim.confidence * claim.trust_at_report
+            current_trust = min(
+                1.0,
+                max(0.0, float(self.trust_score(claim.sender_id))),
+            )
+            return claim.confidence * current_trust * self._age_weight(claim, timestamp)
 
         if method in ("source_linked", "trust_threshold"):
             trust_value = (
@@ -286,6 +347,12 @@ class DefenseMethodRunner:
 
     def evidence(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "trust_fused":
+            winner = self._trust_fused_winner(cell, now)
+            if winner is None:
+                return 0.0
+            claim, effective_trust = winner
+            return effective_trust * self._claim_impact(claim.claim)
         if self.method == "majority_vote":
             votes = 0
             for claim in self.claims_by_cell.get(tuple(cell), ()):
@@ -354,6 +421,17 @@ class DefenseMethodRunner:
         if not claims:
             return 0.0
 
+        if self.method == "trust_fused":
+            winner = self._trust_fused_winner(cell, timestamp)
+            if winner is None:
+                return 0.0
+            claim, effective_trust = winner
+            if claim.claim == BLOCKED_CLAIM:
+                return 1.0
+            if claim.claim == FREE_CLAIM:
+                return 0.0
+            return 1.0 / (1.0 + math.exp(-effective_trust * self.config.congested_impact))
+
         value = self.evidence(cell, timestamp)
         return 1.0 / (1.0 + math.exp(-value))
 
@@ -368,6 +446,12 @@ class DefenseMethodRunner:
 
     def blocked_support(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         """Bounded current support for occupancy, excluding FREE claims."""
+        if self.method == "trust_fused":
+            winner = self._trust_fused_winner(cell, timestamp)
+            if winner is None or winner[0].claim != BLOCKED_CLAIM:
+                return 0.0
+            return min(1.0, winner[1])
+
         now = self.current_timestamp if timestamp is None else int(timestamp)
         support = 0.0
         for claim in self.claims_for(cell):
@@ -378,6 +462,18 @@ class DefenseMethodRunner:
 
     def routing_cost(self, cell: Cell, timestamp: Optional[int] = None) -> float:
         """Return peer-derived traversal cost for a cell."""
+        if self.method == "trust_fused":
+            winner = self._trust_fused_winner(cell, timestamp)
+            if winner is None:
+                return 1.0
+            claim, effective_trust = winner
+            if claim.claim == BLOCKED_CLAIM:
+                return math.inf
+            if claim.claim == FREE_CLAIM:
+                return 1.0
+            risk = min(1.0, max(0.0, effective_trust * self.config.congested_impact))
+            return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
+
         if self.method == "hard_threshold":
             return math.inf if self.is_hard_blocked(cell, timestamp) else 1.0
         if self.method == "majority_vote":
@@ -390,6 +486,9 @@ class DefenseMethodRunner:
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
     def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None) -> bool:
+        if self.method == "trust_fused":
+            winner = self._trust_fused_winner(cell, timestamp)
+            return winner is not None and winner[0].claim == BLOCKED_CLAIM
         if self.method == "majority_vote":
             return self.evidence(cell, timestamp) > 0.0
         if self.method not in ("hard_threshold", "trust_threshold"):
@@ -426,6 +525,24 @@ class DefenseMethodRunner:
             active = [claim for claim in claims if now - claim.timestamp <= self.config.max_claim_age]
             if not active:
                 continue
+
+            if self.method == "trust_fused":
+                winner = self._trust_fused_winner(cell, now)
+                if winner is None:
+                    continue
+                winning_claim, effective_trust = winner
+                result[cell] = EffectivePeerCell(
+                    claim=winning_claim.claim,
+                    has_active_evidence=True,
+                    hard_blocked=winning_claim.claim == BLOCKED_CLAIM,
+                    routing_cost=self.routing_cost(cell, now),
+                    evidence=effective_trust * self._claim_impact(winning_claim.claim),
+                    dominant_source=winning_claim.sender_id,
+                    supporting_sources=(winning_claim.sender_id,)
+                    if winning_claim.claim == BLOCKED_CLAIM else (),
+                )
+                continue
+
             evidence = self.evidence(cell, now)
             effective_blocked = [
                 claim for claim in active

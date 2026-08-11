@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import RadioButtons, Button
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Patch
 
 from defense_method_runner import DEFENSE_METHODS, build_defense_runner
@@ -166,9 +167,11 @@ ATTACK_MIN_DISTANCE_FROM_ANY_BENIGN_ROBOT = int(math.ceil(LIDAR_RANGE_CELLS)) + 
 ATTACK_MIN_DISTANCE_FROM_VICTIM = int(math.ceil(LIDAR_RANGE_CELLS)) + 2
 ATTACK_MAX_DISTANCE_FROM_VICTIM = 45
 
-# Keep red fake-object display visible briefly, but do not accumulate forever.
+# Keep the ground-truth attack overlay visible briefly, but retain the claim
+# perimeter longer so victims can inspect what was asserted after the fill
+# disappears.
 MALICIOUS_FAKE_OBJECT_DISPLAY_TTL = 50
-MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS = 50
+MALICIOUS_FAKE_OUTLINE_HISTORY_TTL_STEPS = 100
 
 # Topology-aware diagnostics help place legitimate temporary objects in useful
 # warehouse regions. Attack candidate ranking remains route/traffic driven.
@@ -1959,8 +1962,12 @@ class RobotBeliefMap:
         if self.defense_runner is not None:
             self.defense_runner.set_time(timestamp)
 
-    def _direct_free_observation(self, cell):
+    def _direct_free_observation(self, cell, timestamp=None):
         r, c = tuple(cell)
+        now = self.current_timestamp if timestamp is None else int(timestamp)
+        last_updated = int(self.last_updated[r, c])
+        if last_updated < 0 or now - last_updated > FREE_MEMORY_STEPS:
+            return False
         return (
             self.source[r, c] == "self_sensor"
             and CellState(int(self.belief[r, c])) in (
@@ -1972,7 +1979,7 @@ class RobotBeliefMap:
         )
 
     def direct_free_strength(self, cell, timestamp=None):
-        if not self._direct_free_observation(cell):
+        if not self._direct_free_observation(cell, timestamp):
             return 0.0
         r, c = tuple(cell)
         now = self.current_timestamp if timestamp is None else int(timestamp)
@@ -3054,15 +3061,9 @@ class GridRobot:
         return moved, event
 
     def _cell_has_direct_free_observation(self, cell):
-        r, c = tuple(cell)
-        return (
-            self.belief_map.source[r, c] == "self_sensor"
-            and CellState(int(self.belief_map.belief[r, c])) in (
-                CellState.FREE,
-                CellState.PICKUP,
-                CellState.DROPOFF,
-                CellState.CHARGING,
-            )
+        return self.belief_map._direct_free_observation(
+            cell,
+            self.current_step,
         )
 
     def should_replan_for_path_state(self, timestamp=None):
@@ -4972,16 +4973,19 @@ def run_simulation(
                     active_attack_overlays[(event.attack_type.value, tuple(cell))] = (step, event.attack_type.value)
                 if (
                     getattr(event.attack_type, "value", event.attack_type)
-                    in {"fake_obstacle", "stale_reassertion"}
+                    in {"fake_obstacle", "false_clearance", "stale_reassertion"}
                     and int(event.sender_id) == 0
-                    and int(event.claim) == int(ClaimType.BLOCKED)
                 ):
                     for victim_id in fake_obstacle_history:
                         fake_obstacle_history[victim_id].append({
                             "attack_event_id": event.event_id,
                             "attacker_id": int(event.sender_id),
                             "victim_id": int(victim_id),
-                            "attack_type": "fake_obstacle",
+                            "attack_type": getattr(
+                                event.attack_type,
+                                "value",
+                                str(event.attack_type),
+                            ),
                             "cells": tuple(tuple(cell) for cell in event.cells),
                             "received_step": step,
                             "last_refresh_step": step,
@@ -5770,20 +5774,27 @@ def fake_obstacle_history_cells(history, victim_id, step):
     return sorted(cells)
 
 
-def recent_malicious_blocked_claim_cells(history, victim_id, step):
-    """Return recent R0 fake/stale blocked-claim cells for a victim map.
-
-    ``attack_overlays`` are drawn on the ground-truth panel for every attack
-    type, but the victim-map outline is intentionally limited to malicious
-    BLOCKED claims.  False-clearance claims are FREE claims and therefore do
-    not represent an alleged obstacle to outline.
-    """
+def recent_malicious_attack_cells(history, victim_id, step):
+    """Return recent R0 cells belonging to any attack event."""
     cells = set()
-    blocked_attack_types = {"fake_obstacle", "stale_reassertion"}
+    attack_types = {"fake_obstacle", "false_clearance", "stale_reassertion"}
     for record in history.get(int(victim_id), ()):
         if int(record.get("attacker_id", -1)) != 0:
             continue
-        if record.get("attack_type") not in blocked_attack_types:
+        if record.get("attack_type") not in attack_types:
+            continue
+        if int(step) < int(record.get("expires_step", -1)):
+            cells.update(tuple(cell) for cell in record.get("cells", ()))
+    return sorted(cells)
+
+
+def recent_malicious_blocked_claim_cells(history, victim_id, step):
+    """Return only recent fake-obstacle cells for legacy callers."""
+    cells = set()
+    for record in history.get(int(victim_id), ()):
+        if int(record.get("attacker_id", -1)) != 0:
+            continue
+        if record.get("attack_type") != "fake_obstacle":
             continue
         if int(step) < int(record.get("expires_step", -1)):
             cells.update(tuple(cell) for cell in record.get("cells", ()))
@@ -5921,22 +5932,55 @@ def make_belief_display_array(
 
 
 def draw_attack_outlines(ax, cells, color="#d32f2f"):
-    """Draw explicit recent R0 fake-obstacle history, never generic provenance."""
-    patches = []
-    for r, c in cells:
-        patch = plt.Rectangle(
-            (c - 0.5, r - 0.5),
-            1,
-            1,
-            fill=False,
-            edgecolor=color,
-            linewidth=1.8,
-            linestyle=":",
+    """Draw one dotted perimeter per connected attack footprint.
+
+    Interior cell edges are omitted, so a rectangular claim appears as one
+    obstacle outline instead of a grid of individually outlined cells.
+    """
+    cell_set = {tuple(cell) for cell in cells}
+    components = []
+    remaining = set(cell_set)
+    while remaining:
+        start = remaining.pop()
+        component = {start}
+        frontier = [start]
+        while frontier:
+            row, col = frontier.pop()
+            for neighbor in (
+                (row - 1, col),
+                (row + 1, col),
+                (row, col - 1),
+                (row, col + 1),
+            ):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    component.add(neighbor)
+                    frontier.append(neighbor)
+        components.append(component)
+
+    outlines = []
+    for component in components:
+        segments = []
+        for row, col in component:
+            edges = (
+                ((col - 0.5, row - 0.5), (col + 0.5, row - 0.5), (row - 1, col)),
+                ((col - 0.5, row + 0.5), (col + 0.5, row + 0.5), (row + 1, col)),
+                ((col - 0.5, row - 0.5), (col - 0.5, row + 0.5), (row, col - 1)),
+                ((col + 0.5, row - 0.5), (col + 0.5, row + 0.5), (row, col + 1)),
+            )
+            for start, end, neighbor in edges:
+                if neighbor not in component:
+                    segments.append((start, end))
+        outline = LineCollection(
+            segments,
+            colors=color,
+            linewidths=1.8,
+            linestyles=":",
             zorder=12,
         )
-        ax.add_patch(patch)
-        patches.append(patch)
-    return patches
+        ax.add_collection(outline)
+        outlines.append(outline)
+    return outlines
 
 
 def draw_path(ax, path, color="black", linewidth=1.8, alpha=0.8):
@@ -6406,7 +6450,7 @@ def animate(world, robots, log, map_view=None):
             Patch(facecolor="#ffeb3b", label="Goal/checkpoint"),
             Patch(facecolor="#e53935", label="Attack claim overlay (not physical)"),
             Patch(facecolor="#ef9a9a", label="False clearance"),
-            Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 blocked claim"),
+            Patch(facecolor="none", edgecolor="#d32f2f", linestyle=":", linewidth=1.8, label="Recent R0 attack perimeter"),
         ],
         loc="upper left",
         ncol=4,
@@ -6507,7 +6551,7 @@ def animate(world, robots, log, map_view=None):
             if selected_view == "combined" and not robot.is_malicious:
                 history_frames = log.get("fake_obstacle_history", [])
                 history_at_frame = history_frames[frame] if frame < len(history_frames) else {}
-                malicious_cells = recent_malicious_blocked_claim_cells(
+                malicious_cells = recent_malicious_attack_cells(
                     history_at_frame,
                     rid,
                     frame,

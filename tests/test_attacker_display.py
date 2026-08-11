@@ -24,7 +24,7 @@ def test_fake_history_ttl_boundary():
     assert sim2.fake_obstacle_history_cells(history, 1, 50) == []
 
 
-def test_recent_blocked_claim_outline_includes_stale_reassertion_only_for_r0():
+def test_recent_attack_outline_includes_all_attack_types_only_for_r0():
     history = {
         1: [
             {"attacker_id": 0, "attack_type": "stale_reassertion", "cells": [(4, 4)], "expires_step": 50},
@@ -32,15 +32,20 @@ def test_recent_blocked_claim_outline_includes_stale_reassertion_only_for_r0():
             {"attacker_id": 2, "attack_type": "fake_obstacle", "cells": [(6, 6)], "expires_step": 50},
         ]
     }
-    assert sim2.recent_malicious_blocked_claim_cells(history, 1, 10) == [(4, 4)]
+    assert sim2.recent_malicious_attack_cells(history, 1, 10) == [(4, 4), (5, 5)]
 
 
 def test_fake_outline_is_dotted_red():
     fig, ax = plt.subplots()
     try:
-        patches = sim2.draw_attack_outlines(ax, [(4, 4)])
-        assert patches[0].get_linestyle() == ":"
-        edge = tuple(patches[0].get_edgecolor()[:3])
+        outlines = sim2.draw_attack_outlines(
+            ax,
+            [(4, 4), (4, 5), (5, 4), (5, 5)],
+        )
+        assert len(outlines) == 1
+        assert len(outlines[0].get_segments()) == 8
+        assert len(outlines[0].get_linestyles()) > 0
+        edge = tuple(outlines[0].get_colors()[0][:3])
         assert edge[0] > edge[1] and edge[0] > edge[2]
     finally:
         plt.close(fig)

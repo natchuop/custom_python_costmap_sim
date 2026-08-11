@@ -1,6 +1,7 @@
 from dataclasses import replace
 import contextlib
 import io
+import math
 from collections import Counter
 from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, VisualizationConfig
 from map_poisoning.fusion import FusionEngine
@@ -149,14 +150,14 @@ def test_attack_labels_and_peer_delivery_provenance_cover_all_attack_types():
         for event in robot.replan_events
     )
 
-def test_source_linked_is_retroactive_and_trust_fused_is_not():
+def test_source_linked_and_trust_fused_use_current_trust():
     trust={0:.7}; score=lambda sender: trust[sender]
     report=ClaimReport("r",0,(1,1),ClaimType.BLOCKED,0,0)
     linked=FusionEngine("source_linked",score); fused=FusionEngine("trust_fused",score)
     linked.add(report); fused.add(report); before_linked=linked.evidence((1,1),0); before_fused=fused.evidence((1,1),0)
     trust[0]=.1
     assert linked.evidence((1,1),0) < before_linked
-    assert fused.evidence((1,1),0) == before_fused
+    assert fused.evidence((1,1),0) < before_fused
 
 def test_fusion_effect_delta_can_be_collected():
     trust={0:.7}; score=lambda sender: trust[sender]
@@ -166,7 +167,21 @@ def test_fusion_effect_delta_can_be_collected():
     linked_before, fused_before = linked.evidence((1,1),0), fused.evidence((1,1),0)
     trust[0]=.1
     assert linked.evidence((1,1),0) - linked_before < 0
-    assert fused.evidence((1,1),0) - fused_before == 0
+    assert fused.evidence((1,1),0) - fused_before < 0
+
+
+def test_trust_fused_selects_highest_effective_trust_claim_and_hard_blocks():
+    trust = {1: 0.80, 2: 0.70}
+    engine = FusionEngine("trust_fused", lambda sender: trust[sender], decay_rate=0.10)
+    engine.add(ClaimReport("blocked-old", 1, (2, 2), ClaimType.BLOCKED, 0, 0, 0))
+    engine.add(ClaimReport("free-new", 2, (2, 2), ClaimType.FREE, 9, 9, 9))
+
+    assert engine.probability((2, 2), 10) == 0.0
+    assert engine.routing_cost((2, 2), 10) == 1.0
+
+    trust[2] = 0.40
+    assert engine.probability((2, 2), 10) == 1.0
+    assert math.isinf(engine.routing_cost((2, 2), 10))
 
 def test_recipients_keep_independent_belief_and_trust_state():
     grid=np.zeros((8,8),dtype=np.uint8)

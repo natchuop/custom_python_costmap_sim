@@ -129,7 +129,7 @@ class ModularRobot:
         cells: list[tuple[int, int]] = []
         seen: set[tuple[int, int]] = set()
         for anchor in anchors:
-            if self.belief.has_direct_free(anchor):
+            if self.belief.has_direct_free(anchor, step):
                 continue
             if anchor not in seen:
                 seen.add(anchor)
@@ -140,13 +140,14 @@ class ModularRobot:
         self,
         reports: Iterable[tuple[ClaimReport, object]],
         malicious_ids: FrozenSet[str],
+        step: int | None = None,
     ) -> bool:
         if not self.path:
             return False
         remaining = list(self.path)
         for report, _ in reports:
             target = tuple(report.target_cell)
-            if self.belief.has_direct_free(target):
+            if self.belief.has_direct_free(target, step):
                 continue
             is_malicious = report.report_id in malicious_ids
             if (
@@ -189,14 +190,19 @@ class ModularRobot:
                 self.pending.pop(previous.report.report_id, None)
             self.pending[report.report_id] = report
             accepted.append((report, policy))
-            if self._report_affects_route(report, malicious_ids):
+            if self._report_affects_route(report, malicious_ids, step):
                 route_affected = True
         self.inbox.clear()
         return accepted, route_affected
 
-    def _report_affects_route(self, report: ClaimReport, malicious_ids: FrozenSet[str]) -> bool:
+    def _report_affects_route(
+        self,
+        report: ClaimReport,
+        malicious_ids: FrozenSet[str],
+        step: int | None = None,
+    ) -> bool:
         target = tuple(report.target_cell)
-        if self.belief.has_direct_free(target):
+        if self.belief.has_direct_free(target, step):
             return False
         is_malicious = report.report_id in malicious_ids
         if report.claim == ClaimType.FREE and not is_malicious and self.fusion.method != "majority_vote":
