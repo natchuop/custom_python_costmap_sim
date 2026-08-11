@@ -4015,6 +4015,7 @@ def build_robot_specs_and_goals(
     world,
     num_robots=DEFAULT_NUM_ROBOTS,
     prior_grid=None,
+    validate_start_connectivity=True,
 ):
     """
     Builds valid robot starts and action points from the actual map.
@@ -4111,64 +4112,67 @@ def build_robot_specs_and_goals(
     goals = action_points.copy()
     display_goals = action_points.copy()
 
-    # A smaller footprint can expose connectivity that was hidden by the old
-    # 2x2 start placement. Move any isolated robot to the nearest safe cell
-    # that can reach at least two action points, preserving the robot count.
-    routing_grid = world.grid if prior_grid is None else prior_grid
-    action_point_set = set(action_points)
+    if validate_start_connectivity:
+        # A smaller footprint can expose connectivity that was hidden by the
+        # old 2x2 start placement. Move any isolated robot to the nearest safe
+        # cell that can reach at least two action points, preserving the robot
+        # count. Manifest replays already have validated fixed starts, so they
+        # can skip this discarded candidate search.
+        routing_grid = world.grid if prior_grid is None else prior_grid
+        action_point_set = set(action_points)
 
-    for spec in robot_specs:
-        start = tuple(spec["start"])
-        reachable_count = sum(
-            route_exists_for_prior(routing_grid, start, point)
-            for point in action_points
-        )
-
-        if reachable_count >= 2:
-            continue
-
-        old_start = start
-        used_starts.discard(old_start)
-        replacement = None
-
-        candidates = sorted(
-            free_cells,
-            key=lambda cell: manhattan(tuple(cell), old_start),
-        )
-
-        for candidate in candidates:
-            try:
-                safe_candidate = nearest_safe_start_cell(
-                    world,
-                    candidate,
-                    forbidden=used_starts.union(action_point_set),
-                )
-            except ValueError:
-                continue
-
-            if safe_candidate in used_starts:
-                continue
-
-            candidate_reachability = sum(
-                route_exists_for_prior(routing_grid, safe_candidate, point)
+        for spec in robot_specs:
+            start = tuple(spec["start"])
+            reachable_count = sum(
+                route_exists_for_prior(routing_grid, start, point)
                 for point in action_points
             )
-            if candidate_reachability >= 2:
-                replacement = safe_candidate
-                break
 
-        if replacement is None:
-            raise RuntimeError(
-                f"Robot {spec['robot_id']} has no start with access to "
-                "at least two action points"
+            if reachable_count >= 2:
+                continue
+
+            old_start = start
+            used_starts.discard(old_start)
+            replacement = None
+
+            candidates = sorted(
+                free_cells,
+                key=lambda cell: manhattan(tuple(cell), old_start),
             )
 
-        spec["start"] = replacement
-        used_starts.add(replacement)
-        print(
-            f"Robot {spec['robot_id']} start relocated for footprint: "
-            f"{old_start} -> {replacement}"
-        )
+            for candidate in candidates:
+                try:
+                    safe_candidate = nearest_safe_start_cell(
+                        world,
+                        candidate,
+                        forbidden=used_starts.union(action_point_set),
+                    )
+                except ValueError:
+                    continue
+
+                if safe_candidate in used_starts:
+                    continue
+
+                candidate_reachability = sum(
+                    route_exists_for_prior(routing_grid, safe_candidate, point)
+                    for point in action_points
+                )
+                if candidate_reachability >= 2:
+                    replacement = safe_candidate
+                    break
+
+            if replacement is None:
+                raise RuntimeError(
+                    f"Robot {spec['robot_id']} has no start with access to "
+                    "at least two action points"
+                )
+
+            spec["start"] = replacement
+            used_starts.add(replacement)
+            print(
+                f"Robot {spec['robot_id']} start relocated for footprint: "
+                f"{old_start} -> {replacement}"
+            )
 
     return robot_specs, goals, display_goals
 
@@ -4604,13 +4608,17 @@ def run_simulation(
                 for cell in episode.cells:
                     world.grid[cell] = CellState.TEMPORARILY_BLOCKED
 
+    manifest_replay = bool(manifest_robot_starts and manifest_task_queues)
     robot_specs, goals, display_goals = build_robot_specs_and_goals(
         world,
         num_robots=DEFAULT_NUM_ROBOTS,
         prior_grid=prior_grid,
+        # The manifest branch replaces these generated starts and tasks below;
+        # avoid validating discarded candidates during a fixed replay.
+        validate_start_connectivity=not manifest_replay,
     )
 
-    if manifest_robot_starts and manifest_task_queues:
+    if manifest_replay:
         robot_specs = [
             {"robot_id": robot_id, "start": tuple(manifest_robot_starts[robot_id])}
             for robot_id in range(DEFAULT_NUM_ROBOTS)

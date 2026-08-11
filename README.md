@@ -27,10 +27,10 @@ file access, project files, and small package smoke tests.
 
 ## Code overview
 
-The project has two cooperating layers:
+The project has one simulation engine with an experiment/UI layer around it:
 
-- `sim2.py` contains the validated simulation engine. It owns the grid world, robot motion, LiDAR observations, temporary obstacles, attack behavior, belief maps, route planning, trust state, collision coordination, logging, and optional playback.
-- `map_poisoning/` provides the modular experiment layer. It converts command line or GUI settings into a configuration, authors or loads a scenario manifest, replays the manifest with different defense methods, and writes metrics and reports. Its rollout adapter uses the simulator engine for the actual robot run.
+- `sim2.py` is the sole simulation engine. It owns the grid world, robot motion, LiDAR observations, temporary obstacles, attack behavior, belief maps, route planning, trust state, collision coordination, logging, and optional playback.
+- `map_poisoning/` provides the experiment/UI layer. It converts command line or GUI settings into a configuration, authors or loads a scenario manifest, asks `sim2.py` to replay it with different defense methods, and writes metrics and reports.
 
 The main files are:
 
@@ -43,8 +43,7 @@ The main files are:
 | `map_poisoning/application.py`, `simulation.py`, and `rollout.py`                     | Load maps, replay methods, collect results, and coordinate output folders.                          |
 | `map_poisoning/map_io.py`, `world.py`, `temp_obstacles.py`, and `scenario_presets.py` | Load supported map formats and define reusable warehouse and obstacle setup.                        |
 | `map_poisoning/models.py`                                                             | Shared data types for claims, attacks, observations, tasks, and events.                             |
-| `map_poisoning/robot.py`                                                              | Modular robot state, sensing, report handling, verification, and replanning.                        |
-| `map_poisoning/sensing.py`, `planning.py`, `belief.py`, `fusion.py`, and `trust.py`   | Implement LiDAR conversion, A* planning, local beliefs, peer evidence, and trust updates.           |
+| `map_poisoning/sensing.py`, `planning.py`, and `world.py`                              | Shared map and planning helpers used while authoring and validating scenarios.                      |
 | `defense_method_runner.py`                                                            | Applies the selected defense policy to stored peer claims and produces route influence.             |
 | `map_poisoning/reporting.py`, `metrics.py`, and `batch.py`                            | Write CSV/JSON results, plots, comparisons, and multi-seed summaries.                               |
 | `map_poisoning/ui.py`                                                                 | Provides the configuration form used by the non-headless entry point.                               |
@@ -67,7 +66,7 @@ The normal data flow is:
 2. A scenario manifest fixes the map, robot roles, starts, delivery queues,
   temporary-obstacle episodes, attack events, and random seeds.
 3. The rollout restores the manifest and calls `sim2.run_simulation` with the
-  selected defense configuration.
+  selected defense configuration. This is the only simulation loop.
 4. On each step, temporary obstacles and scheduled attacks update the truth
   state. Robots use ray-cast LiDAR to make direct free/blocked observations.
 5. Robots queue observations for communication. Broadcast reports are placed

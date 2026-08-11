@@ -1,4 +1,4 @@
-"""Shared manifest rollout for modular simulation replay."""
+"""Shared manifest rollout for the sim2 simulation engine."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -214,7 +214,7 @@ def collect_rollout_metrics(
 
     summary = {
         "method": method,
-        "engine": "modular",
+        "engine": "sim2",
         "seed": config.seed,
         "steps_completed": len(log["truth_grid"]),
         "attack_actions": sum(bool(report.get("is_malicious")) for report in log["reports"]),

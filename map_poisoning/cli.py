@@ -4,7 +4,7 @@ import argparse
 from .config import ALL_METHODS, MAP_VIEWS, AttackConfig, FusionConfig, LoggingConfig, PhaseConfig, SimulationConfig, TrustConfig, VisualizationConfig
 
 def parser():
-    p=argparse.ArgumentParser(description="Modular multi-robot map-poisoning simulator")
+    p=argparse.ArgumentParser(description="Multi-robot map-poisoning simulator")
     p.add_argument("--headless",action="store_true",help="Run without importing Tkinter")
     p.add_argument("--compare",action="store_true",help="Replay one manifest across --comparison-methods")
     p.add_argument("--seeds", help="multi-seed specification such as 1-3,7")

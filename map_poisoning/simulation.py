@@ -1,4 +1,4 @@
-"""Headless manifest replay for the modular simulator."""
+"""Headless manifest replay for the sim2 simulation engine."""
 from __future__ import annotations
 
 from dataclasses import dataclass
