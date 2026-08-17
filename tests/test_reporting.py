@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 
 import matplotlib
 matplotlib.use("Agg")
@@ -13,6 +14,9 @@ from map_poisoning.reporting import (
     parse_tuple,
     _replan_category,
     REPLAN_REASON_BIN_STEPS,
+    RunReportData,
+    _valid_attack_metrics,
+    _recovery_trust_metrics,
 )
 
 
@@ -168,3 +172,31 @@ def test_unsampled_trust_event_is_retained_in_report(tmp_path):
         writer.writeheader(); writer.writerows(rows)
     result = generate_run_report(run)
     assert "01_attacker_trust_over_time.png" in result["generated"]
+
+
+def test_multiseed_attack_metrics_use_only_benign_attack_samples():
+    rows = []
+    for rid, fake, cost, affected in ((0, 99, 9, "True"), (1, 2, 0.4, "True"), (2, 0, 0.2, "False")):
+        rows.append({"robot_id": str(rid), "step": "5", "phase": "ATTACK",
+                     "influential_fake_claim_count": str(fake),
+                     "attacker_attributable_cost_on_route": str(cost),
+                     "preferred_route_affected_by_attacker": affected})
+    data = RunReportData(None, {"malicious_robot_id": "0"}, rows, [], {}, [])
+    metrics = _valid_attack_metrics(data)
+    assert metrics["attack_mean_influential_fake_cells"] == 1
+    assert metrics["attack_fraction_samples_influenced"] == .5
+    assert math.isclose(metrics["attack_mean_attacker_route_cost"], .3)
+    assert metrics["attack_fraction_route_affected"] == .5
+
+
+def test_recovery_trust_gain_is_benign_recovery_delta():
+    rows = []
+    for rid, start, final in ((1, .2, .7), (2, .4, .8)):
+        rows.extend([
+            {"robot_id": str(rid), "step": "10", "phase": "RECOVERY", "attacker_trust": str(start)},
+            {"robot_id": str(rid), "step": "20", "phase": "RECOVERY", "attacker_trust": str(final)},
+        ])
+    data = RunReportData(None, {"malicious_robot_id": "0"}, rows, [], {}, [])
+    metrics = _recovery_trust_metrics(data)
+    assert math.isclose(metrics["recovery_start_attacker_trust_mean"], .3)
+    assert math.isclose(metrics["recovery_trust_gain"], .45)

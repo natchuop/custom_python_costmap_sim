@@ -4526,7 +4526,7 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
                 # A may enter only after the occupant has an approved, distinct
                 # destination. This also rejects head-on swaps.
                 swap = bool(other["target"] & item["current"])
-                if (swap and other["approved"]) or (not swap and not other["approved"]) or target & other["target"]:
+                if swap or not other["target"] or target & other["target"]:
                     conflict_kind = "traffic_swap_conflict" if swap else "traffic_reservation_conflict"
                     conflict_with.append(other["robot"].robot_id)
                     break
@@ -4568,6 +4568,62 @@ def coordinate_robot_intents(robots, world, step, traffic_state=None):
                 })
                 robot.traffic_deadlock_active = False
                 robot.active_deadlock_id = None
+
+    # Validate the final projected occupancy after every approval has been
+    # decided.  In particular, a robot with no target is stationary and its
+    # current footprint remains occupied; it must not be treated as an
+    # approved vacating robot.  Recompute after each downgrade so chained
+    # dependencies cannot allow a robot to enter a cell whose occupant was
+    # subsequently denied.
+    priority = {item["robot"].robot_id: index for index, item in enumerate(ordered)}
+    by_id = {item["robot"].robot_id: item for item in intents.values()}
+    while True:
+        projected = {}
+        for robot_id, item in by_id.items():
+            if approved.get(robot_id, False) and item["target"]:
+                projected[robot_id] = set(item["target"])
+            else:
+                projected[robot_id] = set(item["current"])
+        conflict = None
+        ids = sorted(projected)
+        for index, left_id in enumerate(ids):
+            for right_id in ids[index + 1:]:
+                if projected[left_id] & projected[right_id]:
+                    conflict = (left_id, right_id)
+                    break
+            if conflict:
+                break
+        if conflict is None:
+            break
+        left_id, right_id = conflict
+        left = by_id[left_id]; right = by_id[right_id]
+        left_moves = bool(left["target"]) and approved.get(left_id, False)
+        right_moves = bool(right["target"]) and approved.get(right_id, False)
+        if left_moves and not right_moves:
+            loser_id = left_id
+        elif right_moves and not left_moves:
+            loser_id = right_id
+        else:
+            loser_id = max((left_id, right_id), key=lambda robot_id: priority.get(robot_id, robot_id))
+        loser = by_id[loser_id]["robot"]
+        if not approved.get(loser_id, False):
+            # A stationary overlap should be impossible before this pass; if
+            # one is found, fail closed rather than permitting movement.
+            other_id = right_id if loser_id == left_id else left_id
+            raise RuntimeError(f"unresolvable projected robot occupancy: {loser_id} and {other_id}")
+        approved[loser_id] = False
+        by_id[loser_id]["approved"] = False
+        loser.consecutive_traffic_waits += 1
+        loser.total_traffic_waits += 1
+        loser.traffic_wait_steps.append(step)
+        other_id = right_id if loser_id == left_id else left_id
+        loser.traffic_blocked_by = other_id
+        events.append({
+            "step": step, "event_type": "traffic_projected_occupancy_conflict",
+            "robot_id": loser_id, "other_robot_ids": (other_id,),
+            "requested_cell": by_id[loser_id]["target_anchor"],
+            "wait_age": loser.consecutive_traffic_waits,
+        })
 
     deadlock_candidates = [
         robot for robot in robots
@@ -5184,6 +5240,7 @@ def run_simulation(
                     pass
 
             log["robots"][robot.robot_id]["events"].append(event)
+
 
         actual_occupancy = {}
         for robot in robots:

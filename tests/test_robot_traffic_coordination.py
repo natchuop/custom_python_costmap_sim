@@ -149,3 +149,52 @@ def test_perceived_blockage_does_not_override_physical_traffic_commit():
     intent = robot.propose_move_intent()
     moved, event = robot.commit_move_intent(intent, world, True)
     assert moved and event == "moved_cell"
+
+
+def test_stationary_occupant_is_not_treated_as_vacating():
+    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
+    occupant = _robot(0, (5, 5), (5, 6))
+    occupant.completed = True
+    occupant.traffic_mode = "YIELDING_PARKED"
+    entrant = _robot(1, (5, 4), (5, 5))
+    approved, events = sim2.coordinate_robot_intents([occupant, entrant], world, 1803, {})
+    assert approved[entrant.robot_id] is False
+    assert any(event["event_type"] in {"traffic_reservation_conflict", "traffic_projected_occupancy_conflict"} for event in events)
+    for robot in (occupant, entrant):
+        robot.commit_move_intent(robot._traffic_intent, world, approved[robot.robot_id])
+    assert occupant.position != entrant.position
+
+
+def test_safe_occupant_leaving_move_is_order_independent():
+    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
+    first = _robot(0, (5, 4), (5, 5))
+    second = _robot(1, (5, 5), (4, 5))
+    intents = [first, second]
+    approved, _ = sim2.coordinate_robot_intents(intents, world, 0, {})
+    assert all(approved.values())
+    for order in ((first, second), (second, first)):
+        first.position = (5, 4)
+        second.position = (5, 5)
+        first.path = [(5, 4), (5, 5)]
+        second.path = [(5, 5), (4, 5)]
+        first.path_index = second.path_index = 0
+        first.motion_target_cell = second.motion_target_cell = None
+        approved, _ = sim2.coordinate_robot_intents([first, second], world, 1, {})
+        for robot in order:
+            robot.commit_move_intent(robot._traffic_intent, world, approved[robot.robot_id])
+        assert first.position != second.position
+
+
+def test_three_robot_dependency_chain_fails_closed():
+    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
+    first = _robot(0, (5, 4), (5, 5))
+    second = _robot(1, (5, 5), (5, 6))
+    blocker = _robot(2, (5, 6), (5, 6))
+    blocker.completed = True
+    blocker.traffic_mode = "YIELDING_PARKED"
+    approved, _ = sim2.coordinate_robot_intents([first, second, blocker], world, 0, {})
+    assert approved[first.robot_id] is False
+    assert approved[second.robot_id] is False
+    for robot in (first, second, blocker):
+        robot.commit_move_intent(robot._traffic_intent, world, approved[robot.robot_id])
+    assert len({robot.position for robot in (first, second, blocker)}) == 3
