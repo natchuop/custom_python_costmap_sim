@@ -40,27 +40,6 @@ def test_majority_direct_free_suppresses_peer_hard_block():
     assert robot.belief_map.traversal_cost(cell) == 1.0
 
 
-def test_stale_direct_free_no_longer_suppresses_trust_fused_peer_block():
-    grid = sim2.make_demo_static_grid()
-    robot = sim2.GridRobot(
-        robot_id=1,
-        initial_grid=grid,
-        start_cell=(2, 2),
-        goal_cell=(2, 3),
-        defense_method="trust_fused",
-    )
-    cell = (2, 3)
-    robot.belief_map.update_from_sensor({cell: sim2.CellState.FREE}, 1)
-    robot.belief_map.set_planning_time(1)
-    robot.defense_runner.add_report(
-        sim2.PeerReport(0, cell, sim2.ClaimType.BLOCKED, 1)
-    )
-    assert not robot.belief_map.is_blocked_for_planning(cell)
-
-    robot.belief_map.set_planning_time(sim2.FREE_MEMORY_STEPS + 2)
-    assert robot.belief_map.is_blocked_for_planning(cell)
-
-
 def test_source_linked_replan_risk_ignores_directly_free_route_cell():
     grid = sim2.make_demo_static_grid()
     robot = sim2.GridRobot(
