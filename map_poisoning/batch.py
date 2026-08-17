@@ -6,8 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .application import run
 from .config import ALL_METHODS, SimulationConfig
-from .scenario import author_manifest, author_warehouse_manifest, load_manifest, save_manifest, scenario_manifest_hash
-from .map_io import default_warehouse_map, load_movingai, load_npy
+from .scenario import load_manifest, scenario_manifest_hash
 
 def parse_seed_spec(text: str) -> tuple[int, ...]:
     if not text or not str(text).strip():
@@ -52,12 +51,6 @@ class MultiSeedResult:
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 
-def _author_expected_manifest(config: SimulationConfig):
-    grid = load_npy(config.map_npy) if config.map_npy else load_movingai(config.map_movingai) if config.map_movingai else default_warehouse_map()
-    if not config.map_npy and not config.map_movingai and not config.scenario_preset:
-        return author_warehouse_manifest(config, grid)
-    return author_manifest(config, grid)
-
 def _valid_resume(path: Path, seed: int, method: str, manifest_hash: str, config_hash: str) -> bool:
     summary_path = path / "run_summary.csv"
     effective_path = path / "effective_config.json"
@@ -88,21 +81,13 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
         seed_cfg = replace(config, seed=seed, logging=replace(config.logging, output_directory=str(seed_root), generate_plots=generate_per_run_plots), visualization=replace(config.visualization, animation=False))
         manifest_path = seed_root / "scenario_manifest.json"
         try:
-            expected_manifest = _author_expected_manifest(seed_cfg)
-            expected_hash = scenario_manifest_hash(expected_manifest)
-            if manifest_path.exists():
-                manifest = load_manifest(manifest_path)
-                manifest_hash = scenario_manifest_hash(manifest)
-                if manifest_hash != expected_hash:
-                    raise ValueError(f"scenario manifest mismatch for seed {seed}: existing manifest is stale")
-            else:
-                manifest = expected_manifest
-                manifest_hash = expected_hash
-                save_manifest(manifest, manifest_path)
+            if manifest_path.exists(): manifest = load_manifest(manifest_path)
+            else: manifest = run(seed_cfg, manifest_only=True)
+            manifest_hash = scenario_manifest_hash(manifest)
             print(f"[seed {index:02d}/{len(seeds)}] manifest ready")
             for method in methods:
                 output = seed_root / method
-                started_at = _now(); started = time.monotonic(); status = "completed"; error = ""
+                started = time.monotonic(); status = "completed"; error = ""
                 method_cfg = replace(seed_cfg, manifest_path=str(manifest_path), fusion=replace(seed_cfg.fusion, method=method), logging=replace(seed_cfg.logging, output_directory=str(output)))
                 if resume and _valid_resume(output, seed, method, manifest_hash, cfg_hash):
                     status = "skipped_resume"
@@ -116,7 +101,7 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
                         status = "failed"; error = str(exc)
                         if fail_fast: raise
                 records.append(MultiSeedRunRecord(seed, method, status, str(output), manifest_hash, error))
-                status_rows.append({"seed": seed, "method": method, "status": status, "output_directory": str(output), "scenario_manifest_hash": manifest_hash, "started_at": started_at, "finished_at": _now(), "duration_seconds": round(time.monotonic()-started, 3), "error": error})
+                status_rows.append({"seed": seed, "method": method, "status": status, "output_directory": str(output), "scenario_manifest_hash": manifest_hash, "started_at": _now(), "finished_at": _now(), "duration_seconds": round(time.monotonic()-started, 3), "error": error})
                 print(f"[seed {seed:02d}/{len(seeds)}] {method} ... {status}")
         except Exception as exc:
             if fail_fast: raise

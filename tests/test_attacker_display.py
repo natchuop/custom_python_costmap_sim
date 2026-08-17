@@ -1,117 +1,160 @@
-import matplotlib
-
-matplotlib.use("Agg")
+import numpy as np
 import matplotlib.pyplot as plt
-import pytest
 
 import sim2
 
 
-def test_fake_history_ignores_honest_and_other_attack_provenance():
-    history = {
-        1: [
-            {"attacker_id": 1, "attack_type": "fake_obstacle", "cells": [(2, 2)], "expires_step": 50},
-            {"attacker_id": 0, "attack_type": "false_clearance", "cells": [(3, 3)], "expires_step": 50},
-            {"attacker_id": 0, "attack_type": "fake_obstacle", "cells": [(4, 4)], "expires_step": 50},
-        ]
-    }
-    assert sim2.fake_obstacle_history_cells(history, 1, 10) == [(4, 4)]
+def _victim(method="source_linked"):
+    grid = np.zeros((11, 11), dtype=np.uint8)
+    return sim2.GridRobot(
+        robot_id=1,
+        initial_grid=grid,
+        start_cell=(5, 2),
+        goal_cell=(5, 8),
+        task_queue=[],
+        is_malicious=False,
+        defense_method=method,
+    )
 
 
-def test_fake_history_ttl_boundary():
-    history = {1: [{"attacker_id": 0, "attack_type": "fake_obstacle", "cells": [(4, 4)], "expires_step": 50}]}
-    assert sim2.fake_obstacle_history_cells(history, 1, 49) == [(4, 4)]
-    assert sim2.fake_obstacle_history_cells(history, 1, 50) == []
+def _fake_claim(victim, cell=(5, 6)):
+    report = sim2.PeerReport(
+        sender_id=0,
+        target_cell=cell,
+        claim=sim2.ClaimType.BLOCKED,
+        timestamp=0,
+        is_malicious=True,
+    )
+    assert victim.defense_runner.add_report(report)
+    victim.belief_map.set_planning_time(0)
 
 
-def test_recent_attack_outline_includes_all_attack_types_only_for_r0():
-    history = {
-        1: [
-            {"attacker_id": 0, "attack_type": "stale_reassertion", "cells": [(4, 4)], "expires_step": 50},
-            {"attacker_id": 0, "attack_type": "false_clearance", "cells": [(5, 5)], "expires_step": 50},
-            {"attacker_id": 2, "attack_type": "fake_obstacle", "cells": [(6, 6)], "expires_step": 50},
-        ]
-    }
-    assert sim2.recent_malicious_attack_cells(history, 1, 10) == [(4, 4), (5, 5)]
+def _claim(victim, sender_id, cell, *, malicious, claim=sim2.ClaimType.BLOCKED):
+    report = sim2.PeerReport(
+        sender_id=sender_id,
+        target_cell=cell,
+        claim=claim,
+        timestamp=0,
+        is_malicious=malicious,
+    )
+    assert victim.defense_runner.add_report(report)
+    victim.belief_map.set_planning_time(0)
 
 
-def test_fake_outline_is_dotted_red():
-    fig, ax = plt.subplots()
-    try:
-        outlines = sim2.draw_attack_outlines(
-            ax,
-            [(4, 4), (4, 5), (5, 4), (5, 5)],
+def test_influential_fake_cell_uses_planner_cost_boundary():
+    victim = _victim()
+    _fake_claim(victim)
+
+    assert sim2.count_influential_fake_claim_cells(victim, {(5, 6)}, threshold=0.10) == 1
+    assert sim2.count_influential_fake_claim_cells(victim, {(5, 6)}, threshold=100.0) == 0
+
+
+def test_source_linked_influence_tracks_current_trust_not_report_trust():
+    victim = _victim("source_linked")
+    _fake_claim(victim)
+
+    assert sim2.count_influential_fake_claim_cells(victim, {(5, 6)}) == 1
+    victim.trust_model.values[0] = 0.0
+    assert sim2.count_influential_fake_claim_cells(victim, {(5, 6)}) == 0
+
+
+def test_honest_overlap_does_not_create_attacker_attribution():
+    victim = _victim()
+    _claim(victim, 0, (5, 6), malicious=True)
+    _claim(victim, 2, (5, 6), malicious=False)
+    victim.trust_model.values[0] = 0.0
+    victim.trust_model.values[2] = 1.0
+
+    assert victim.belief_map.traversal_cost((5, 6)) > 1.0
+    assert sim2.attacker_cell_cost_delta(victim, (5, 6), 0) == 0.0
+    assert sim2.count_influential_fake_claim_cells(
+        victim, {(5, 6)}, attacker_id=0
+    ) == 0
+
+
+def test_unknown_and_physical_costs_do_not_create_attacker_attribution():
+    victim = _victim()
+    _claim(victim, 0, (5, 6), malicious=True)
+    victim.trust_model.values[0] = 0.0
+    victim.belief_map.belief[5, 6] = sim2.CellState.UNKNOWN
+    victim.belief_map.source[5, 6] = "unknown"
+    assert victim.belief_map.traversal_cost((5, 6)) >= 3.0
+    assert sim2.attacker_cell_cost_delta(victim, (5, 6), 0) == 0.0
+
+    physical = _victim()
+    physical.belief_map.initial_prior[5, 6] = sim2.CellState.OCCUPIED_STATIC
+    physical.belief_map.belief[5, 6] = sim2.CellState.OCCUPIED_STATIC
+    _claim(physical, 0, (5, 6), malicious=True)
+    physical.trust_model.values[0] = 0.0
+    assert sim2.attacker_cell_cost_delta(physical, (5, 6), 0) == 0.0
+
+
+def test_route_metrics_do_not_credit_suboptimal_route_without_attack():
+    victim = _victim()
+    victim.path = [(5, 2), (5, 3), (5, 4), (4, 4), (4, 5), (5, 5), (5, 6), (5, 7), (5, 8)]
+    stored_delta, preferred = sim2.route_impact_from_fake_claims(victim, attacker_id=0)
+    assert stored_delta == 0.0
+    assert preferred is False
+
+
+def test_source_linked_exact_zero_clears_repeated_fake_attribution():
+    victim = _victim()
+    for timestamp in range(5):
+        report = sim2.PeerReport(
+            sender_id=0,
+            target_cell=(5, 6),
+            claim=sim2.ClaimType.BLOCKED,
+            timestamp=timestamp,
+            is_malicious=True,
         )
-        assert len(outlines) == 1
-        assert len(outlines[0].get_segments()) == 8
-        assert len(outlines[0].get_linestyles()) > 0
-        edge = tuple(outlines[0].get_colors()[0][:3])
-        assert edge[0] > edge[1] and edge[0] > edge[2]
-    finally:
-        plt.close(fig)
+        assert victim.defense_runner.add_report(report)
+    victim.trust_model.values[0] = 0.0
+    victim.belief_map.set_planning_time(5)
+    assert sim2.attacker_cell_cost_delta(victim, (5, 6), 0) == 0.0
+    assert sim2.count_influential_fake_claim_cells(
+        victim, {(5, 6)}, attacker_id=0
+    ) == 0
+    victim.path = [(5, 2), (5, 3), (5, 4), (5, 5), (5, 6), (5, 7), (5, 8)]
+    assert sim2.route_impact_from_fake_claims(victim, attacker_id=0) == (0.0, False)
 
 
-@pytest.mark.filterwarnings("ignore:Animation was deleted without rendering anything")
-def test_animation_uses_four_map_axes_and_dedicated_status_regions(monkeypatch):
+def test_active_fake_claim_ground_truth_is_separate_from_belief():
+    log = {
+        "reports": [
+            {"step": 2, "sender_id": 0, "target_cell": (4, 4), "claim": int(sim2.ClaimType.BLOCKED), "is_malicious": True},
+            {"step": 2, "sender_id": 0, "target_cell": (4, 5), "claim": int(sim2.ClaimType.FREE), "is_malicious": True},
+        ]
+    }
+    assert sim2.active_fake_claim_cells(log, 0, 2, max_claim_age=10) == {(4, 4)}
+    assert sim2.active_fake_claim_cells(log, 0, 20, max_claim_age=10) == set()
+
+
+def test_newer_attacker_free_claim_replaces_old_fake_block():
+    log = {
+        "reports": [
+            {"step": 2, "sender_id": 0, "target_cell": (4, 4), "claim": int(sim2.ClaimType.BLOCKED), "is_malicious": True},
+            {"step": 3, "sender_id": 0, "target_cell": (4, 4), "claim": int(sim2.ClaimType.FREE), "is_malicious": True},
+        ]
+    }
+    assert sim2.active_fake_claim_cells(log, 0, 3, max_claim_age=10) == set()
+
+
+def test_animation_trust_panel_has_dedicated_grid_row(monkeypatch):
     monkeypatch.setattr(plt, "show", lambda: None)
-    _, robots, log = sim2.run_simulation(max_steps=1, tasks_per_robot=1, random_seed=15, experiment_mode="clean")
-    animation = sim2.animate(sim2.GridWorld(log["truth_grid"][0]), robots, log)
+    world, robots, log = sim2.run_simulation(
+        max_steps=1,
+        tasks_per_robot=1,
+        random_seed=15,
+    )
+    animation = sim2.animate(world, robots, log)
     figure = animation._fig
     try:
         animation._func(0)
-        titles = [axis.get_title() for axis in figure.axes]
-        assert sum("Ground Truth Map" in title for title in titles) == 1
-        assert sum("Robot 0" in title for title in titles) == 1
-        assert sum("Robot 1" in title for title in titles) == 1
-        assert sum("Robot 2" in title for title in titles) == 1
-        assert any(
-            axis.get_title(loc="left") == "Simulation status | Playback"
-            for axis in figure.axes
-        )
-        assert any(
-            axis.get_title(loc="left") == "Robot trust level | trust_threshold"
-            for axis in figure.axes
-        )
-        assert any(
-            axis.get_title(loc="left") == "Latest attack"
-            for axis in figure.axes
-        )
-        trust_axis = next(
-            axis
-            for axis in figure.axes
-            if axis.get_title(loc="left") == "Robot trust level | trust_threshold"
-        )
-        trust_table = next(iter(trust_axis.tables))
-        trust_text = "\n".join(
-            cell.get_text().get_text() for cell in trust_table.get_celld().values()
-        )
-        assert all(label in trust_text for label in ("Observer", "Sender", "Score", "State"))
-        for observer_id, sender_id in (
-            (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)
-        ):
-            assert f"R{observer_id}" in trust_text
-            assert f"R{sender_id}" in trust_text
-        speed_axis = next(
-            axis for axis in figure.axes if axis.get_title(loc="left") == "Speed"
-        )
-        assert "20x" in {label.get_text() for label in speed_axis.texts}
-        for robot_id in (0, 1, 2):
-            map_axis = next(
-                axis
-                for axis in figure.axes
-                if axis.get_title().startswith(f"Robot {robot_id} |")
-            )
-            own_ray_lines = [
-                line
-                for line in map_axis.lines
-                if line.get_color() == sim2.ROBOT_COLORS[robot_id]
-            ]
-            assert len(own_ray_lines) >= sim2.LIDAR_NUM_RAYS
-            assert any(
-                patch.get_radius() == sim2.LIDAR_RANGE_CELLS
-                for patch in map_axis.patches
-            )
-        assert len(figure.axes) >= 8
+        assert len(figure.axes) == 2 + len(robots)
+        trust_axis = figure.axes[0]
+        map_axes = figure.axes[1:]
+        assert not trust_axis.axison
+        assert trust_axis.get_position().y0 > max(axis.get_position().y1 for axis in map_axes)
+        assert any(text.get_text().startswith("ATTACKER") for text in trust_axis.texts)
     finally:
-        animation.event_source.stop()
         plt.close(figure)

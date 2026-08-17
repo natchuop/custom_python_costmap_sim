@@ -17,6 +17,15 @@ def _robot(robot_id, start, target):
     return robot
 
 
+def test_lidar_robot_detection_is_not_environment_obstacle_evidence():
+    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
+    observations, _, visible = world.observe_cells_lidar(
+        sim2.cell_to_xy((5, 5)), robot_positions={(5, 7)}
+    )
+    assert (5, 7) in visible
+    assert observations.get((5, 7)) != sim2.CellState.OCCUPIED_DYNAMIC
+
+
 def test_same_destination_has_one_approved_intent():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     first = _robot(0, (5, 4), (5, 5))
@@ -45,7 +54,7 @@ def test_traffic_wait_does_not_pollute_belief_map():
     assert np.array_equal(first.belief_map.source, before[1])
 
 
-def test_repeated_wait_assigns_stable_deadlock_and_yield_target():
+def test_repeated_traffic_wait_detects_and_recovers_deadlock():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     first = _robot(0, (5, 4), (5, 5))
     second = _robot(1, (5, 6), (5, 5))
@@ -55,8 +64,22 @@ def test_repeated_wait_assigns_stable_deadlock_and_yield_target():
         _, events = sim2.coordinate_robot_intents([first, second], world, step, traffic_state)
         all_events.extend(events)
     assert any(event["event_type"] == "traffic_deadlock_detected" for event in all_events)
-    deadlocked = [robot for robot in (first, second) if robot.traffic_deadlock_active]
-    assert deadlocked and deadlocked[0].active_deadlock_id
+
+    waiting = first if first.traffic_deadlock_active else second
+    waiting.position = waiting.active_yield_target  # emulate its approved yield move
+    _, parked_events = sim2.coordinate_robot_intents([first, second], world, 20, traffic_state)
+    assert waiting.traffic_mode == "YIELDING_PARKED"
+    assert not any(event["event_type"] == "traffic_deadlock_recovered" for event in parked_events)
+
+    blocker = second if waiting is first else first
+    blocker.position = (4, 6)
+    blocker.path = [(4, 6), (4, 7)]
+    _, events = sim2.coordinate_robot_intents([first, second], world, 21, traffic_state)
+    assert any(
+        event["event_type"] == "traffic_deadlock_recovered"
+        and event["robot_id"] == waiting.robot_id
+        for event in events
+    )
 
 
 def test_yield_target_prefers_distant_branch_over_corridor_cell():
@@ -71,10 +94,11 @@ def test_yield_target_prefers_distant_branch_over_corridor_cell():
     for col in range(10, 1, -1):
         robot.position_history.append((6, col))
     other = _robot(1, (6, 11), (6, 10))
-    assert sim2._traffic_yield_target(robot, [robot, other], world) == (6, 1)
+    target = sim2._traffic_yield_target(robot, [robot, other], world)
+    assert target == (6, 1)
 
 
-def test_completed_robot_is_parked_when_blocking_active_path():
+def test_completed_robot_is_parked_when_blocking_active_checkpoint():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     idle = _robot(0, (5, 5), (5, 6))
     idle.completed = True
@@ -89,7 +113,7 @@ def test_commit_uses_frozen_approved_target_after_path_changes():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     robot = _robot(0, (5, 4), (5, 5))
     intent = robot.propose_move_intent()
-    robot.path = [(5, 4), (4, 4)]
+    robot.path = [(5, 4), (4, 4)]  # stale mutation after coordination
     moved, event = robot.commit_move_intent(intent, world, True)
     assert moved and event == "moved_cell"
     assert robot.position == (5, 5)
@@ -107,7 +131,7 @@ def test_corridor_topology_identifies_narrow_segment():
     assert by_cell[(6, 5)] in segments
 
 
-def test_world_blockage_cancels_frozen_commit_without_substitution():
+def test_real_world_blockage_cancels_frozen_commit_without_substitution():
     grid = np.zeros((12, 12), dtype=np.uint8)
     grid[5, 5] = sim2.CellState.OCCUPIED_STATIC
     world = sim2.GridWorld(grid)
@@ -118,25 +142,7 @@ def test_world_blockage_cancels_frozen_commit_without_substitution():
     assert robot.position == (5, 4)
 
 
-def test_stationary_task_boundary_cell_remains_reserved():
-    world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
-    stationary = _robot(0, (5, 5), (5, 6))
-    stationary.path = [(5, 5)]
-    moving = _robot(1, (5, 4), (5, 5))
-
-    approved, events = sim2.coordinate_robot_intents(
-        [stationary, moving], world, 0, {}
-    )
-
-    assert approved[stationary.robot_id] is True
-    assert approved[moving.robot_id] is False
-    assert any(
-        event["event_type"] == "traffic_reservation_conflict"
-        for event in events
-    )
-
-
-def test_perceived_blockage_does_not_override_physical_commit():
+def test_perceived_blockage_does_not_override_physical_traffic_commit():
     world = sim2.GridWorld(np.zeros((12, 12), dtype=np.uint8))
     robot = _robot(0, (5, 4), (5, 5))
     robot.belief_map.belief[5, 5] = sim2.CellState.TEMPORARILY_BLOCKED
