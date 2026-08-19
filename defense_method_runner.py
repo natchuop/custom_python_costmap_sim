@@ -32,6 +32,7 @@ DEFENSE_METHODS = (
     "time_decay",
     "trust_fused",
     "source_linked",
+    "trust_threshold",
 )
 
 
@@ -53,6 +54,7 @@ class DefenseConfig:
     """Shared parameters for the five occupancy-defense policies."""
 
     method: str = "source_linked"
+    trust_threshold: float = 0.55
     decay_rate: float = 0.01
     cost_scale: float = 8.0
     cost_exponent: float = 2.0
@@ -77,6 +79,8 @@ class DefenseConfig:
             raise ValueError("blocked_probability_threshold must be in [0, 1]")
         if self.max_claim_age < 1:
             raise ValueError("max_claim_age must be at least 1")
+        if not 0.0 <= self.trust_threshold <= 1.0:
+            raise ValueError("trust_threshold must be in [0, 1]")
 
 
 class DefenseMethodRunner:
@@ -100,6 +104,11 @@ class DefenseMethodRunner:
       source_linked:
           Each report is weighted using current sender trust at planning time.
           Later trust changes therefore revise the influence of old claims.
+
+      trust_threshold:
+          Reports remain stored and verifiable, but current trust below the
+          configured threshold gives them zero operational influence. Occupancy
+          above the blocked-probability cutoff becomes a hard wall.
     """
 
     def __init__(
@@ -249,13 +258,15 @@ class DefenseMethodRunner:
         if method == "trust_fused":
             return claim.confidence * claim.trust_at_report
 
-        if method == "source_linked":
+        if method in ("source_linked", "trust_threshold"):
             trust_value = (
                 self.trust_score(claim.sender_id)
                 if trust_override is None
                 else trust_override
             )
             current_trust = min(1.0, max(0.0, float(trust_value)))
+            if method == "trust_threshold" and current_trust < self.config.trust_threshold:
+                return 0.0
             return (
                 claim.confidence
                 * current_trust
@@ -442,7 +453,7 @@ class DefenseMethodRunner:
                 excluded_sender_id=excluded_sender_id,
                 excluded_claim_predicate=excluded_claim_predicate,
             ) > 0.0
-        if self.method != "hard_threshold":
+        if self.method not in ("hard_threshold", "trust_threshold"):
             return False
         probability = self.occupancy_probability(
             cell,

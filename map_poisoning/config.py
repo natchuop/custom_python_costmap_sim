@@ -8,8 +8,9 @@ from typing import Any
 from .models import AttackType
 
 PRIMARY_METHODS = ("full_trust", "majority_vote", "trust_fused", "source_linked")
-ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay")
+ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay", "trust_threshold")
 ALL_METHODS = PRIMARY_METHODS + ADDITIONAL_METHODS
+MAP_VIEWS = ("combined", "local")
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class VisualizationConfig:
     animation: bool = False
+    map_view: str = "combined"
     fake_influence_min_cost_delta: float = 0.10
     route_impact_min_cost_delta: float = 0.10
     route_impact_eval_period_steps: int = 10
@@ -87,7 +89,7 @@ class SimulationConfig:
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     comparison_methods: tuple[str, ...] = PRIMARY_METHODS
     communication_period_steps: int = 4
-    temporary_blockage_change_period_steps: int = 400
+    temporary_blockage_change_period_steps: int = 150
     map_npy: str | None = None
     map_movingai: str | None = None
     scenario_preset: str | None = None
@@ -117,6 +119,7 @@ class SimulationConfig:
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
         if self.direct_memory_steps < 0: raise ValueError("direct_memory_steps must be nonnegative")
+        if self.visualization.map_view not in MAP_VIEWS: raise ValueError("map_view must be combined or local")
         if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:
             raise ValueError("visualization metric thresholds must be non-negative")
         if self.visualization.route_impact_eval_period_steps < 1:

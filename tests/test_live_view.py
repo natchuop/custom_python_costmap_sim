@@ -16,13 +16,20 @@ def test_live_recording_builds_heatmap_and_four_map_axes():
     live = log["live"]
     assert len(live["truth"]) == config.total_steps
     assert set(live["beliefs"]) == {robot.robot_id for robot in robots}
+    assert set(live["combined_beliefs"]) == set(live["beliefs"])
+    assert set(live["local_beliefs"]) == set(live["beliefs"])
     assert live["heatmap"].sum() > 0
+    assert live["threshold"] == config.trust.threshold
     heat = show_traffic_heatmap(log, show=False)
     maps = show_belief_maps(log, world, robots, show=False, interval_ms=1)
     assert heat is not None
     fig, anim = maps
-    map_axes = [ax for ax in fig.axes if ax.get_xlabel() == "col"]
-    assert len(map_axes) == 1 + len(robots)
+    titled = [ax.get_title() for ax in fig.axes]
+    assert any("Ground Truth Map" in title for title in titled)
+    assert "seed 1" in heat.axes[0].get_title()
+    assert "seed 1" in (fig.get_suptitle() or "")
+    assert any(ax.get_title(loc="left") == "Robot trust level | full_trust" for ax in fig.axes)
+    assert any("Threshold:" in (text.get_text() or "") for ax in fig.axes for text in ax.texts)
     anim._func(0)
     heat.clf()
     fig.clf()

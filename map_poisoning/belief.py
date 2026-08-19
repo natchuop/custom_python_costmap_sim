@@ -36,6 +36,8 @@ class RobotBeliefMap:
         item = self.direct.get(cell)
         if item is None:
             return None, "unknown"
+        if step is not None and item.step > step:
+            return None, "unknown"
         if step is None or step - item.step <= self.memory_steps:
             return item.claim, "fresh"
         return item.claim, "stale"

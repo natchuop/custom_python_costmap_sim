@@ -16,6 +16,16 @@ def report(report_id, sender, claim, step=0):
     return ClaimReport(report_id, sender, (2, 2), claim, step, step, step)
 
 
+def test_trust_threshold_method_zeros_untrusted_influence():
+    trust = {0: 0.80}
+    engine = FusionEngine("trust_threshold", lambda sender: trust[sender], trust_threshold=0.55)
+    engine.add(report("blocked", 0, ClaimType.BLOCKED))
+    high = engine.evidence((2, 2), 0)
+    assert high > 0
+    trust[0] = 0.20
+    assert engine.evidence((2, 2), 0) == 0
+
+
 def test_primary_weighting_contracts_and_active_replacement():
     trust = {0: .7}
     score = lambda sender: trust[sender]
@@ -42,6 +52,13 @@ def test_majority_is_one_vote_per_sender_and_discrete():
     engine.add(report("d", 2, ClaimType.BLOCKED, 1))
     assert engine.blocked((2, 2), 1)
     assert math.isinf(engine.routing_cost((2, 2), 1))
+
+
+def test_direct_observations_ignore_future_steps():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8))
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 5))
+    assert belief.observation_status((2, 2), 2) == (None, "unknown")
+    assert belief.observation_status((2, 2), 5) == (ClaimType.FREE, "fresh")
 
 
 def test_direct_free_and_blocked_override_peer_evidence():

@@ -17,6 +17,7 @@ class RunResult:
     summary: dict
     world: object | None = None
     log: dict | None = None
+    robots: object | None = None
 
 
 def replay(
@@ -39,4 +40,5 @@ def replay(
         result.summary,
         result.world,
         result.log,
+        result.robots,
     )

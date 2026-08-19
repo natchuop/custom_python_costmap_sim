@@ -21,6 +21,7 @@ from .planning import astar
 from .robot import ModularRobot, TRAFFIC_REROUTE_AFTER_WAITS
 from .scenario import ScenarioManifest, scenario_manifest_hash
 from .trust import make_trust_model
+from .traffic import TrafficState, coordinate_robot_intents, summarize_traffic_events
 from .world import World
 
 
@@ -51,6 +52,7 @@ def _make_robots(config: SimulationConfig, manifest: ScenarioManifest, method: s
             blocked_probability_threshold=config.fusion.blocked_probability_threshold,
             congested_impact=config.fusion.congested_impact,
             duplicate_window_steps=config.fusion.duplicate_window_steps,
+            trust_threshold=config.trust.threshold,
         )
         robots.append(
             ModularRobot(
@@ -190,13 +192,15 @@ def run_manifest_rollout(
         "false_acceptance_count": 0,
         "malicious_report_deliveries": 0,
         "malicious_reports_accepted": 0,
+        "traffic_events": [],
     }
+    traffic_state = TrafficState()
     if config.visualization.animation:
         from .live_view import init_live_log
         init_live_log(log, world, robots, config, manifest)
     max_steps = config.total_steps
     serial = 0
-    live_note = "live maps after the run" if config.visualization.animation else "no live animation"
+    live_note = "heatmap then live maps" if config.visualization.animation else "no live animation"
     print(f"Simulating {max_steps} steps with {method} ({live_note})...", flush=True)
 
     for step in range(max_steps):
@@ -210,35 +214,43 @@ def run_manifest_rollout(
         # Direct sensing and verification are independent for each robot.
         verification_replan: dict[int, bool] = {}
         observations_by_robot = {}
+
+        def apply_verification(targets=None) -> None:
+            for robot in targets or robots:
+                for result in robot.verify(observations_by_robot[robot.robot_id], step):
+                    report, outcome, old, new, evidence_before, evidence_after, probability_before, probability_after = result
+                    trust_event = {
+                        "step": step, "kind": "trust_update", "method": method,
+                        "report_id": report.report_id, "sender_id": report.sender_id,
+                        "recipient_id": robot.robot_id, "outcome": outcome.value,
+                        "old_trust": old, "new_trust": new,
+                    }
+                    log["events"].append(trust_event)
+                    log["trust_events"].append(trust_event)
+                    log["events"].append({
+                        "step": step, "kind": "fusion_effect", "method": method,
+                        "report_id": report.report_id, "sender_id": report.sender_id,
+                        "recipient_id": robot.robot_id, "target_cell": report.target_cell,
+                        "evidence_before": evidence_before, "evidence_after": evidence_after,
+                        "probability_before": probability_before, "probability_after": probability_after,
+                        "outcome": outcome.value, "phase": phase,
+                        "observation_age": step - report.observation_step,
+                        "scenario_event_id": report.scenario_event_id,
+                    })
+                    if outcome.value == "contradicted_fresh":
+                        verification_replan[robot.robot_id] = True
+
         for robot in robots:
             other_positions = [position for rid, position in positions.items() if rid != robot.robot_id]
             observations_by_robot[robot.robot_id] = robot.sense(world, step, other_positions)
-            for result in robot.verify(observations_by_robot[robot.robot_id], step):
-                report, outcome, old, new, evidence_before, evidence_after, probability_before, probability_after = result
-                trust_event = {
-                    "step": step, "kind": "trust_update", "method": method,
-                    "report_id": report.report_id, "sender_id": report.sender_id,
-                    "recipient_id": robot.robot_id, "outcome": outcome.value,
-                    "old_trust": old, "new_trust": new,
-                }
-                log["events"].append(trust_event)
-                log["trust_events"].append(trust_event)
-                log["events"].append({
-                    "step": step, "kind": "fusion_effect", "method": method,
-                    "report_id": report.report_id, "sender_id": report.sender_id,
-                    "recipient_id": robot.robot_id, "target_cell": report.target_cell,
-                    "evidence_before": evidence_before, "evidence_after": evidence_after,
-                    "probability_before": probability_before, "probability_after": probability_after,
-                    "outcome": outcome.value, "phase": phase,
-                    "observation_age": step - report.observation_step,
-                    "scenario_event_id": report.scenario_event_id,
-                })
-                if outcome.value == "contradicted_fresh":
-                    verification_replan[robot.robot_id] = True
+        apply_verification()
 
         deliveries: dict[int, list[ClaimReport]] = {robot.robot_id: [] for robot in robots}
-        # Every robot shares its own recent physical observation with every peer.
+        # Benign robots share local observations. The attacker only injects the
+        # authored malicious reports, so honest lidar from R0 cannot inflate trust.
         for robot in robots:
+            if robot.robot_id == attacker:
+                continue
             for observation in observations_by_robot[robot.robot_id]:
                 if not robot.should_share_observation(observation.cell, observation.claim, step):
                     continue
@@ -300,6 +312,7 @@ def run_manifest_rollout(
                     if accepted_here and evidence is not None and abs(evidence) > 1e-12:
                         log["false_acceptance_count"] += 1
 
+            apply_verification((robot,))
             route_affected = robot.reports_affect_remaining_route(accepted, malicious_ids, step)
             if robot.should_replan_for_path_state(step) or route_affected or robot.defense_replan_needed or verification_replan.get(robot.robot_id, False):
                 reasons = []
@@ -316,20 +329,39 @@ def run_manifest_rollout(
                 robot.defense_replan_needed = False
                 robot.source_linked_replan_context = None
 
-        # A small deterministic traffic rule prevents simultaneous occupancy.
+        # Multi-robot traffic uses frozen intents before any robot moves.
+        approved, traffic_events = coordinate_robot_intents(robots, world, step, traffic_state)
+        log["traffic_events"].extend(traffic_events)
+        recovered = {
+            event["robot_id"]
+            for event in traffic_events
+            if event.get("event_type") == "traffic_deadlock_recovered"
+        }
         occupied = {robot.position for robot in robots}
+        for robot in robots:
+            if robot.robot_id in recovered:
+                robot.replan(step, "traffic_deadlock_recovered")
+                _log_replan(log, method, robot, step)
         for robot in sorted(robots, key=lambda item: item.robot_id):
             before = robot.position
-            action = robot.move(world, step, occupied - {before})
-            if action == "move":
-                occupied.discard(before)
-                occupied.add(robot.position)
-            elif action == "blocked_move" or (action == "task_transition" and not robot.completed):
+            others = [other for other in robots if other is not robot]
+            other_cells = {other.position for other in others}
+            other_reserved = set().union(*(other.reserved_cells() for other in others)) if others else set()
+            if not approved.get(robot.robot_id, True):
+                robot.traffic_wait_steps += 1
+                action = "traffic_wait"
+            else:
+                action = robot.move(world, step, occupied - {before})
+                if action == "move":
+                    occupied.discard(before)
+                    occupied.add(robot.position)
+                    robot.consecutive_traffic_waits = 0
+            robot.record_position()
+            if action == "blocked_move" or (action == "task_transition" and not robot.completed):
                 robot.replan(step, action)
                 _log_replan(log, method, robot, step)
             elif action == "traffic_wait" and robot.consecutive_traffic_waits >= TRAFFIC_REROUTE_AFTER_WAITS:
-                robot.replan(step, "traffic_wait_reroute", occupied - {before})
-                robot.consecutive_traffic_waits = 0
+                robot.replan(step, "traffic_wait_reroute", other_reserved | other_cells)
                 _log_replan(log, method, robot, step)
             log["events"].append({
                 "step": step, "kind": "robot_action", "method": method,
@@ -426,6 +458,7 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
                 recovery = step - last_injection
                 break
     trust_events = log["trust_events"]
+    traffic_counts = summarize_traffic_events(log.get("traffic_events", []))
     distrust = next((event["step"] for event in trust_events if event["sender_id"] == manifest.malicious_robot_id and event["new_trust"] < config.trust.threshold), None)
     delivery_after_attack = sum(robot.deliveries_completed for robot in benign)
     delivery_durations = [duration for robot in benign for duration in robot.delivery_durations]
@@ -446,13 +479,20 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "benign_productive_replans": sum(robot.productive_replans for robot in benign),
         "benign_blocked_world": sum(robot.blocked_moves for robot in benign),
         "benign_blocked_moves": sum(robot.blocked_moves for robot in benign),
-        "benign_traffic_wait_steps": sum(robot.traffic_wait_steps for robot in benign), "traffic_event_counts": {}, "vertex_conflicts_detected": 0,
-        "head_on_swap_conflicts_detected": 0, "reservation_conflicts_detected": 0,
+        "benign_traffic_wait_steps": sum(robot.traffic_wait_steps for robot in benign),
+        "traffic_event_counts": traffic_counts,
+        **traffic_counts,
         "traffic_replans": sum(robot.traffic_replans for robot in benign),
-        "intent_commit_mismatches": 0, "corridor_entry_denied": 0, "corridor_reservations_started": 0,
-        "corridor_reservations_released": 0, "traffic_replans_suppressed": 0, "traffic_yield_events": 0,
-        "idle_parking_events": 0, "per_robot_idle_steps": {}, "deadlocks_detected": 0,
-        "deadlocks_recovered": 0, "robot_overlap_violations": 0, "prevented_robot_conflicts": 0,
+        "intent_commit_mismatches": 0,
+        "corridor_entry_denied": traffic_counts.get("corridor_entry_denied", 0),
+        "corridor_reservations_started": 0,
+        "corridor_reservations_released": 0,
+        "traffic_replans_suppressed": 0,
+        "idle_parking_events": 0,
+        "per_robot_idle_steps": {},
+        "prevented_robot_conflicts": traffic_counts["vertex_conflicts_detected"]
+        + traffic_counts["head_on_swap_conflicts_detected"]
+        + traffic_counts["reservation_conflicts_detected"],
         "time_to_distrust_malicious_robot": distrust,
         "malicious_verified_false_reports": sum(1 for event in trust_events if event["sender_id"] == manifest.malicious_robot_id and event["outcome"] == "contradicted_fresh"),
         "fresh_contradictions": sum(event["outcome"] == "contradicted_fresh" for event in trust_events),
@@ -485,7 +525,7 @@ def replay_manifest(config: SimulationConfig, manifest: ScenarioManifest, method
             print(warning)
             (output_directory / "plot_generation_error.txt").write_text(warning + "\n", encoding="utf-8")
     if show_animation:
-        print("Opening traffic heatmap and live belief-map windows...", flush=True)
+        print("Opening reconnaissance heatmap, then live belief-map windows...", flush=True)
         from .live_view import show_live_windows
         show_live_windows(log, world, robots, block=True)
     effective = config.to_dict() | {"effective_method": method, "engine": "modular_native"}

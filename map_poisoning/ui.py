@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 
 from .application import run
 from .cli import config_from_args, result_location_message, suggested_output_directory
-from .config import ALL_METHODS
+from .config import ALL_METHODS, PRIMARY_METHODS
 from .map_io import load_npy
 from .models import AttackType
 from .scenario_presets import PRESETS, preset_for_hash, preset_for_id, validate_fixed_preset
@@ -59,13 +59,37 @@ def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None
 
 
 def launch(args) -> None:
-    """Show the interactive run configuration window in one compact view."""
+    """Show the interactive run configuration window."""
     root = tk.Tk()
     root.title("Modular Map-Poisoning Simulator")
-    root.geometry("760x780")
-    root.minsize(680, 710)
-    form = ttk.Frame(root, padding=14)
-    form.pack(fill="both", expand=True)
+    root.geometry("820x900")
+    root.minsize(700, 620)
+
+    shell = ttk.Frame(root, padding=8)
+    shell.pack(fill="both", expand=True)
+    body = ttk.Frame(shell)
+    body.pack(fill="both", expand=True)
+    canvas = tk.Canvas(body, highlightthickness=0, borderwidth=0)
+    scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    form = ttk.Frame(canvas, padding=14)
+    form_window = canvas.create_window((0, 0), window=form, anchor="nw")
+
+    def update_scroll_region(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def resize_form(event):
+        canvas.itemconfigure(form_window, width=event.width)
+
+    form.bind("<Configure>", update_scroll_region)
+    canvas.bind("<Configure>", resize_form)
+
+    def scroll_with_mouse(event):
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    canvas.bind_all("<MouseWheel>", scroll_with_mouse)
 
     initial_preset = args.scenario_preset or _preset_for_map_path(args.map_npy) or ""
     values = {
@@ -73,8 +97,8 @@ def launch(args) -> None:
         "map_path": tk.StringVar(value=args.map_npy or ""),
         "scenario_preset": tk.StringVar(value=initial_preset),
         "seed": tk.StringVar(value=str(args.seed)),
-        "method": tk.StringVar(value=args.defense_method),
         "trust_model": tk.StringVar(value=args.trust_model),
+        "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.55))),
         "admission_policy": tk.StringVar(value=args.admission_policy),
         "output": tk.StringVar(value=args.output_directory or ""),
         "manifest": tk.StringVar(value=args.manifest_path or ""),
@@ -85,10 +109,23 @@ def launch(args) -> None:
         "max_steps": tk.StringVar(value="" if args.max_steps is None else str(args.max_steps)),
         "interval_min": tk.StringVar(value=str(args.attack_interval_min)),
         "interval_max": tk.StringVar(value=str(args.attack_interval_max)),
-        "compare": tk.BooleanVar(value=args.compare),
+        "temp_interval": tk.StringVar(value=str(getattr(args, "temp_obstacle_interval", 150))),
+        "map_view": tk.StringVar(
+            value=("Combined observations" if getattr(args, "map_view", "combined") == "combined" else "Local observations")
+        ),
         "multi_seed": tk.BooleanVar(value=bool(getattr(args, "seeds", None))),
         "seeds": tk.StringVar(value=getattr(args, "seeds", None) or "1-3"),
         "live_view": tk.BooleanVar(value=False),
+    }
+    initial_methods = {args.defense_method}
+    extra = getattr(args, "comparison_methods", None)
+    if extra:
+        initial_methods.update(item.strip() for item in str(extra).split(",") if item.strip())
+    if args.compare:
+        initial_methods.update(PRIMARY_METHODS)
+    method_enabled = {
+        method: tk.BooleanVar(value=method in initial_methods)
+        for method in ALL_METHODS
     }
     selected_attacks = set() if args.attacks == "none" else set(args.attacks.split(","))
     attack_enabled = {
@@ -116,39 +153,64 @@ def launch(args) -> None:
     dropdown("Scenario preset", "scenario_preset", ("",) + tuple(PRESETS), 3)
     map_status = ttk.Label(form)
     map_status.grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 4))
-    dropdown("Defense method", "method", ALL_METHODS, 5)
+    methods_frame = ttk.LabelFrame(form, text="Defense methods to run", padding=7)
+    methods_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 4))
+    ttk.Label(
+        methods_frame,
+        text=(
+            "Select one or more methods. One selection shows the full live playback "
+            "for that method. Multiple selections replay the same manifest and save "
+            "each method under the output folder."
+        ),
+        wraplength=620,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    for index, method in enumerate(ALL_METHODS):
+        ttk.Checkbutton(
+            methods_frame,
+            text=method,
+            variable=method_enabled[method],
+        ).grid(row=1 + index // 2, column=index % 2, sticky="w", padx=(0, 24), pady=1)
     entry("Seed", "seed", 6)
     entry("Output directory (auto-named)", "output", 7)
     entry("Fixed manifest (optional)", "manifest", 8)
-    ttk.Checkbutton(form, text="Compare all primary defenses", variable=values["compare"]).grid(
-        row=9, column=0, columnspan=3, sticky="w", pady=(7, 2)
-    )
     ttk.Checkbutton(form, text="Multi-seed experiment", variable=values["multi_seed"]).grid(row=10, column=0, sticky="w", pady=2)
     ttk.Entry(form, textvariable=values["seeds"], width=18).grid(row=10, column=1, sticky="w", pady=2)
     seed_preview = ttk.Label(form); seed_preview.grid(row=10, column=2, sticky="w", pady=2)
     ttk.Checkbutton(
         form,
-        text="Show live maps (traffic heatmap + 4 belief windows)",
+        text="Show live maps (recon heatmap first, then 4 belief windows)",
         variable=values["live_view"],
     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=2)
+    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 12)
+    ttk.Label(
+        form,
+        text=(
+            "Live maps open the reconnaissance heatmap first. Close that window "
+            "to start ground-truth and per-robot belief playback with the trust panel."
+        ),
+        wraplength=650,
+        justify="left",
+    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
 
-    ttk.Separator(form).grid(row=12, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Separator(form).grid(row=14, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
-        row=13, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        row=15, column=0, columnspan=3, sticky="w", pady=(0, 4)
     )
-    entry("Reconnaissance steps", "recon", 14)
-    entry("Poisoning steps", "attack", 15)
-    entry("Recovery steps", "recovery", 16)
-    entry("Deliveries per robot", "deliveries", 17)
-    entry("Maximum steps (optional)", "max_steps", 18)
-    entry("Attack interval: minimum steps", "interval_min", 19)
-    entry("Attack interval: maximum steps", "interval_max", 20)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 21)
+    entry("Reconnaissance steps", "recon", 16)
+    entry("Poisoning steps", "attack", 17)
+    entry("Recovery steps", "recovery", 18)
+    entry("Deliveries per robot", "deliveries", 19)
+    entry("Maximum steps (optional)", "max_steps", 20)
+    entry("Attack interval: minimum steps", "interval_min", 21)
+    entry("Attack interval: maximum steps", "interval_max", 22)
+    entry("Temporary obstacle movement interval", "temp_interval", 23)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 24)
+    entry("Trust threshold", "trust_threshold", 25)
     dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 22
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 26
     )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=23, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=27, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame, text=attack.value.replace("_", " ").title(),
@@ -172,12 +234,17 @@ def launch(args) -> None:
             args.scenario_preset = values["scenario_preset"].get() or None
             validate_gui_map_preset(args.map_npy, args.scenario_preset)
             args.seed = int(values["seed"].get())
-            args.defense_method = values["method"].get()
+            selected_methods = tuple(method for method in ALL_METHODS if method_enabled[method].get())
+            if not selected_methods:
+                raise ValueError("Select at least one defense method to run.")
+            args.defense_method = selected_methods[0]
+            args.comparison_methods = ",".join(selected_methods)
+            args.compare = len(selected_methods) > 1
             args.output_directory = values["output"].get().strip() or None
             args.manifest_path = values["manifest"].get().strip() or None
-            args.compare = values["compare"].get()
             args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
-            args.no_animation = not values["live_view"].get()
+            args.no_animation = (not values["live_view"].get()) or args.compare
+            args.map_view = "combined" if values["map_view"].get() == "Combined observations" else "local"
             args.recon_steps = int(values["recon"].get())
             args.attack_steps = int(values["attack"].get())
             args.recovery_steps = int(values["recovery"].get())
@@ -186,7 +253,9 @@ def launch(args) -> None:
             args.max_steps = int(max_steps) if max_steps else None
             args.attack_interval_min = int(values["interval_min"].get())
             args.attack_interval_max = int(values["interval_max"].get())
+            args.temp_obstacle_interval = int(values["temp_interval"].get())
             args.trust_model = values["trust_model"].get()
+            args.trust_threshold = float(values["trust_threshold"].get())
             args.admission_policy = values["admission_policy"].get()
             enabled = [name for name, variable in attack_enabled.items() if variable.get()]
             args.attacks = ",".join(enabled) if enabled else "none"
@@ -196,11 +265,11 @@ def launch(args) -> None:
             messagebox.showerror("Unable to run", str(exc))
             return
         print(f"Writing results to {config.logging.output_directory}", flush=True)
-        live = bool(values["live_view"].get()) and not args.seeds
-        if values["live_view"].get() and args.seeds:
-            print("Live maps are skipped for multi-seed runs.", flush=True)
+        live = bool(values["live_view"].get()) and not args.seeds and not args.compare
+        if values["live_view"].get() and (args.seeds or args.compare):
+            print("Live maps play only for a single-method, single-seed run.", flush=True)
         if live:
-            print("Live heatmap and belief-map windows will open after the run.", flush=True)
+            print("Reconnaissance heatmap opens first; close it to play the four belief maps.", flush=True)
         else:
             print("Progress prints in this terminal. PNG diagrams are written when the run finishes.", flush=True)
         run_button.configure(state="disabled")
@@ -243,9 +312,12 @@ def launch(args) -> None:
                 root.after(0, lambda: finish(error))
             threading.Thread(target=background, daemon=True).start()
 
-    footer = ttk.Frame(form)
-    footer.grid(row=26, column=0, columnspan=3, sticky="ew", pady=(16, 0))
-    status_label = ttk.Label(footer, text="PNG diagrams are saved in a plots folder inside the output directory.")
+    footer = ttk.Frame(shell, padding=(6, 8, 6, 0))
+    footer.pack(side="bottom", fill="x")
+    status_label = ttk.Label(
+        footer,
+        text="Close the heatmap window to start live playback. PNG diagrams are saved in plots/.",
+    )
     status_label.pack(side="left")
     run_button = ttk.Button(footer, text="Run", command=execute)
     run_button.pack(side="right")
@@ -258,10 +330,10 @@ def launch(args) -> None:
             seed = 15
         seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
         return suggested_output_directory(
-            method=values["method"].get() or "source_linked",
+            method=next((method for method in ALL_METHODS if method_enabled[method].get()), "source_linked"),
             seed=seed,
             seeds=seeds or None,
-            compare=bool(values["compare"].get()),
+            compare=sum(1 for variable in method_enabled.values() if variable.get()) > 1,
             map_npy=values["map_path"].get().strip() or None,
             scenario_preset=values["scenario_preset"].get().strip() or None,
             enabled_attacks=tuple(name for name, variable in attack_enabled.items() if variable.get()),
@@ -280,22 +352,23 @@ def launch(args) -> None:
             values["output"].set(path)
 
     values["map"].trace_add("write", select_map)
-    for key in ("map", "map_path", "scenario_preset", "method", "seed", "seeds", "compare", "multi_seed"):
+    for key in ("map", "map_path", "scenario_preset", "seed", "seeds", "multi_seed"):
         values[key].trace_add("write", refresh_output)
-    for variable in attack_enabled.values():
+    for variable in list(attack_enabled.values()) + list(method_enabled.values()):
         variable.trace_add("write", refresh_output)
     refresh_output()
     def update_preview(*_):
         try:
             from .batch import parse_seed_spec
             count = len(parse_seed_spec(values["seeds"].get()))
-            methods = 4 if values["compare"].get() else 1
+            methods = sum(1 for variable in method_enabled.values() if variable.get()) or 1
             seed_preview.configure(text=f"{count} seeds x {methods} methods = {count * methods} simulations" if values["multi_seed"].get() else "")
         except Exception:
             seed_preview.configure(text="")
     values["seeds"].trace_add("write", update_preview)
     values["multi_seed"].trace_add("write", update_preview)
-    values["compare"].trace_add("write", update_preview)
+    for variable in method_enabled.values():
+        variable.trace_add("write", update_preview)
     select_map()
     update_preview()
     root.mainloop()

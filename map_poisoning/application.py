@@ -5,9 +5,11 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import numpy as np
 from .config import SimulationConfig
 from .metrics import CsvMetrics
 from .scenario import author_manifest, load_manifest, save_manifest, scenario_manifest_hash
+from .recon_authoring import author_warehouse_manifest, save_traffic_heatmap_artifacts
 from .simulation import replay
 from .map_io import default_warehouse_map, load_movingai, load_npy
 from .audit import audit_manifest
@@ -17,6 +19,8 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
     grid=load_npy(config.map_npy) if config.map_npy else load_movingai(config.map_movingai) if config.map_movingai else default_warehouse_map()
     if config.manifest_path:
         manifest=load_manifest(config.manifest_path)
+    elif not config.map_npy and not config.map_movingai and not config.scenario_preset:
+        manifest=author_warehouse_manifest(config, grid)
     else:
         manifest=author_manifest(config, grid)
     root.mkdir(parents=True,exist_ok=True); save_manifest(manifest,root/"scenario_manifest.json")
@@ -38,6 +42,13 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
         if comparison and config.visualization.animation and index > 0:
             replay_config = replace(config, visualization=replace(config.visualization, animation=False))
         results.append(replay(replay_config, manifest, method, root / method if comparison else root))
+    if comparison:
+        heatmap = manifest.reconnaissance_heatmap
+        if heatmap is None and results:
+            live = (results[0].log or {}).get("live") or {}
+            heatmap = live.get("recon_heatmap") or live.get("heatmap")
+        if heatmap is not None:
+            save_traffic_heatmap_artifacts(root, np.asarray(heatmap))
     if comparison and config.logging.generate_plots:
         try:
             from .reporting import generate_comparison_report

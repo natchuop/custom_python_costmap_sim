@@ -27,6 +27,32 @@ def test_suggested_paths_separate_run_compare_and_multiseed():
     assert Path(multi) == Path("outputs") / "multiseed" / "full_trust_seeds1,2_default_warehouse_all_attacks"
 
 
+def test_cli_ports_main_visualization_and_trust_controls():
+    config = config_from_args(parser().parse_args([
+        "--headless",
+        "--defense-method", "trust_threshold",
+        "--trust-threshold", "0.62",
+        "--map-view", "local",
+        "--temp-obstacle-interval", "150",
+        "--no-animation",
+    ]))
+    assert config.fusion.method == "trust_threshold"
+    assert config.trust.threshold == 0.62
+    assert config.visualization.map_view == "local"
+    assert config.temporary_blockage_change_period_steps == 150
+    assert config.visualization.animation is False
+
+
+def test_cli_comparison_methods_are_selectable():
+    config = config_from_args(parser().parse_args([
+        "--headless",
+        "--comparison-methods", "trust_threshold,full_trust",
+        "--no-animation",
+    ]))
+    assert config.comparison_methods == ("trust_threshold", "full_trust")
+    assert config.fusion.method == "source_linked"
+
+
 def test_cli_default_output_is_named_unless_overridden():
     auto = config_from_args(parser().parse_args(["--headless", "--defense-method", "full_trust", "--seed", "15"]))
     assert Path(auto.logging.output_directory) == Path("outputs") / "runs" / "full_trust_seed15_default_warehouse_all_attacks"

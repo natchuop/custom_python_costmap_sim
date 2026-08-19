@@ -92,9 +92,39 @@ class ModularRobot:
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
     defense_replan_needed: bool = False
     source_linked_replan_context: dict | None = None
+    accepted_reports: int = 0
+    rejected_reports: int = 0
+    # Traffic coordination (sim2 parity, single-cell robots).
+    traffic_mode: str = "NORMAL"
+    traffic_blocked_by: int | None = None
+    active_yield_target: tuple[int, int] | None = None
+    yield_blocked_cell: tuple[int, int] | None = None
+    yield_conflict_cells: frozenset[tuple[int, int]] = field(default_factory=frozenset)
+    saved_yield_path: list[tuple[int, int]] | None = None
+    saved_yield_goal: tuple[int, int] | None = None
+    traffic_deadlock_active: bool = False
+    active_deadlock_id: str | None = None
+    position_history: list[tuple[int, int]] = field(default_factory=list)
+    traffic_yield_count: int = 0
 
     def __post_init__(self):
         self.position = self.start
+        self.position_history.append(tuple(self.start))
+
+    def proposed_next_cell(self) -> tuple[int, int] | None:
+        return tuple(self.path[0]) if self.path else None
+
+    def reserved_cells(self) -> set[tuple[int, int]]:
+        """Current body plus the cell this robot intends to step into."""
+        cells = {tuple(self.position)}
+        nxt = self.proposed_next_cell()
+        if nxt is not None:
+            cells.add(tuple(nxt))
+        return cells
+
+    def record_position(self) -> None:
+        if not self.position_history or self.position_history[-1] != self.position:
+            self.position_history.append(tuple(self.position))
 
     @property
     def goal(self) -> tuple[int, int]:
@@ -180,6 +210,7 @@ class ModularRobot:
         for report in self.inbox:
             policy = decide(self.admission_policy, self.trust.score(report.sender_id), self.trust_threshold)
             if not policy.accepted:
+                self.rejected_reports += 1
                 continue
             is_malicious = report.report_id in malicious_ids
             previous = self.fusion.add(report, policy.influence, is_malicious=is_malicious)
@@ -187,6 +218,7 @@ class ModularRobot:
                 self.pending.pop(previous.report.report_id, None)
             self.pending[report.report_id] = report
             accepted.append((report, policy))
+            self.accepted_reports += 1
             if self._report_affects_route(report, malicious_ids, step):
                 route_affected = True
         self.inbox.clear()
@@ -222,7 +254,10 @@ class ModularRobot:
         for report_id, report in list(self.pending.items()):
             observed = by_cell.get(report.target_cell)
             if observed is None:
-                continue
+                claim, freshness = self.belief.observation_status(report.target_cell, step)
+                if freshness != "fresh" or claim is None:
+                    continue
+                observed = DirectObservation(self.robot_id, report.target_cell, claim, step)
             truth_matches = observed.claim == report.claim
             sender_id = report.sender_id
             if sender_id not in old_trust_by_sender:
@@ -288,6 +323,12 @@ class ModularRobot:
                 }
                 self.last_source_linked_replan_step = step
                 break
+
+        if self.fusion.method == "trust_threshold" and verified_by_sender:
+            for sender_id in verified_by_sender:
+                if old_trust_by_sender[sender_id] >= self.trust_threshold > self.trust.score(sender_id):
+                    self.defense_replan_needed = True
+                    break
 
         return results
 

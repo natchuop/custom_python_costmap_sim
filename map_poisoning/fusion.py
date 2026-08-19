@@ -42,6 +42,7 @@ class FusionEngine:
         blocked_probability_threshold: float = 0.70,
         congested_impact: float = 0.50,
         duplicate_window_steps: int = 0,
+        trust_threshold: float = 0.55,
     ):
         self._runner: DefenseMethodRunner = build_defense_runner(
             method,
@@ -53,6 +54,7 @@ class FusionEngine:
             blocked_probability_threshold=blocked_probability_threshold,
             congested_impact=congested_impact,
             duplicate_window_steps=duplicate_window_steps,
+            trust_threshold=trust_threshold,
         )
         self.decay_rate = decay_rate
         self.max_claim_age = max_claim_age

@@ -37,9 +37,5 @@ class World:
     def cleared(self, step: int): return [e for e in self.episodes if e.clearance_step <= step]
 
 def make_episodes(grid: np.ndarray, seed: int, total_steps: int, period: int = 150) -> tuple[TemporaryObstacleEpisode, ...]:
-    rng = named_rng(seed, "temporary_obstacles")
-    free = [(r,c) for r in range(2, grid.shape[0]-2) for c in range(2, grid.shape[1]-2) if not grid[r,c]]
-    result=[]
-    for i, start in enumerate(range(period // 2, total_steps, period)):
-        cell = free[rng.randrange(len(free))]; result.append(TemporaryObstacleEpisode(f"obstacle-{i:03}", (cell,), start, min(total_steps, start + period//2)))
-    return tuple(result)
+    from .obstacles import author_temporary_obstacle_episodes
+    return author_temporary_obstacle_episodes(grid, named_rng(seed, "temporary_obstacles"), total_steps, period)
