@@ -1,8 +1,89 @@
 """CLI parser shared with the GUI launcher."""
 from __future__ import annotations
+
 import argparse
-from dataclasses import replace
+from pathlib import Path
+
 from .config import ALL_METHODS, AttackConfig, FusionConfig, LoggingConfig, PhaseConfig, SimulationConfig, TrustConfig, VisualizationConfig
+from .models import AttackType
+
+
+def geometry_slug(map_npy: str | None = None, scenario_preset: str | None = None) -> str:
+    if scenario_preset:
+        return str(scenario_preset)
+    if map_npy:
+        parent = Path(map_npy).parent.name.strip()
+        if parent:
+            return parent
+        stem = Path(map_npy).stem.strip()
+        if stem:
+            return stem
+    return "default_warehouse"
+
+
+def attack_slug(enabled) -> str:
+    selected = {str(item) for item in (enabled or ())}
+    ordered = [kind.value for kind in AttackType if kind.value in selected]
+    if not ordered:
+        return "no_attacks"
+    if ordered == [kind.value for kind in AttackType]:
+        return "all_attacks"
+    return "+".join(ordered)
+
+
+def enabled_attacks_from_args(args) -> tuple[str, ...]:
+    text = getattr(args, "attacks", None)
+    if not text or text == "none":
+        return ()
+    return tuple(item for item in str(text).split(",") if item)
+
+
+def suggested_output_directory(
+    *,
+    method: str = "source_linked",
+    seed: int = 15,
+    seeds: str | None = None,
+    compare: bool = False,
+    map_npy: str | None = None,
+    scenario_preset: str | None = None,
+    enabled_attacks: tuple[str, ...] | None = None,
+) -> str:
+    """Return a descriptive folder under outputs/ so runs are not dumped into a generic directory."""
+    geo = geometry_slug(map_npy, scenario_preset)
+    attacks = attack_slug(enabled_attacks if enabled_attacks is not None else tuple(kind.value for kind in AttackType))
+    seed_spec = str(seeds).replace(" ", "") if seeds else ""
+    if seed_spec:
+        name = f"compare_seeds{seed_spec}_{geo}_{attacks}" if compare else f"{method}_seeds{seed_spec}_{geo}_{attacks}"
+        return str(Path("outputs") / "multiseed" / name)
+    if compare:
+        return str(Path("outputs") / "comparisons" / f"seed{seed}_{geo}_{attacks}")
+    return str(Path("outputs") / "runs" / f"{method}_seed{seed}_{geo}_{attacks}")
+
+
+def suggested_output_directory_from_args(args) -> str:
+    return suggested_output_directory(
+        method=getattr(args, "defense_method", "source_linked"),
+        seed=int(getattr(args, "seed", 15)),
+        seeds=getattr(args, "seeds", None),
+        compare=bool(getattr(args, "compare", False)),
+        map_npy=getattr(args, "map_npy", None),
+        scenario_preset=getattr(args, "scenario_preset", None),
+        enabled_attacks=enabled_attacks_from_args(args),
+    )
+
+
+def result_location_message(output_directory: str, *, compare: bool = False, multi_seed: bool = False) -> str:
+    root = Path(output_directory)
+    if multi_seed:
+        return f"Created results in {root}\n\nAggregate diagrams:\n{root / 'aggregate' / 'plots'}"
+    if compare:
+        return (
+            f"Created results in {root}\n\n"
+            f"Comparison diagrams:\n{root / 'comparison_plots'}\n\n"
+            f"Per-method diagrams:\n{root / '<method>' / 'plots'}"
+        )
+    return f"Created results in {root}\n\nDiagrams:\n{root / 'plots'}"
+
 
 def parser():
     p=argparse.ArgumentParser(description="Modular multi-robot map-poisoning simulator")
@@ -12,7 +93,7 @@ def parser():
     p.add_argument("--manifest",dest="manifest_path")
     p.add_argument("--map-npy"); p.add_argument("--map-movingai")
     p.add_argument("--scenario-preset", choices=("warehouse_002", "warehouse_005", "warehouse_005_rotated"))
-    p.add_argument("--output-directory",default="outputs")
+    p.add_argument("--output-directory", default=None, help="defaults to a named folder under outputs/runs, outputs/comparisons, or outputs/multiseed")
     p.add_argument("--seed",type=int,default=15); p.add_argument("--defense-method",choices=ALL_METHODS,default="source_linked")
     p.add_argument("--seeds", help="multi-seed specification such as 1-30 or 1,5,10")
     p.add_argument("--methods", help="comma-separated methods for multi-seed mode")
@@ -28,4 +109,5 @@ def parser():
 
 def config_from_args(args):
     enabled=() if args.attacks == "none" else tuple(x for x in args.attacks.split(",") if x)
-    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model),fusion=FusionConfig(method=args.defense_method,admission_policy=args.admission_policy),logging=LoggingConfig(args.output_directory, generate_plots=not args.no_plots),visualization=VisualizationConfig(not args.no_animation),manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,scenario_preset=args.scenario_preset,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot)
+    output_directory = args.output_directory or suggested_output_directory_from_args(args)
+    return SimulationConfig(seed=args.seed,phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),trust=TrustConfig(model=args.trust_model),fusion=FusionConfig(method=args.defense_method,admission_policy=args.admission_policy),logging=LoggingConfig(output_directory, generate_plots=not args.no_plots),visualization=VisualizationConfig(animation=not args.no_animation and not args.headless),manifest_path=args.manifest_path,map_npy=args.map_npy,map_movingai=args.map_movingai,scenario_preset=args.scenario_preset,max_steps=args.max_steps,deliveries_per_robot=args.deliveries_per_robot)

@@ -1,4 +1,4 @@
-"""Independent benign robot state and behavior aligned with legacy ``GridRobot``."""
+"""Independent robot state and behavior for modular manifest replay."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,28 +16,31 @@ from .trust import TrustModel
 PATH_INVALID_REPLAN_COOLDOWN_STEPS = 8
 HONEST_REPORT_REFRESH_STEPS = 80
 SOURCE_LINKED_REPLAN_COOLDOWN_STEPS = 25
-SOURCE_LINKED_MIN_TRUST_DELTA = 0.10
+SOURCE_LINKED_MIN_TRUST_DELTA = 0.05
 SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
 SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
 DEFENSE_PRUNE_PERIOD_STEPS = 20
-SPAWN_COLLISION_GRACE_STEPS = 100
+TRAFFIC_REROUTE_AFTER_WAITS = 4
 
 
 class _PlanningBelief:
-    """Adapter so legacy fallback planning can use modular belief + fusion."""
+    """Adapter exposing modular belief and fusion to the A* planner."""
 
-    def __init__(self, belief: RobotBeliefMap, fusion: FusionEngine, step: int):
+    def __init__(self, belief: RobotBeliefMap, fusion: FusionEngine, step: int, temporarily_blocked=()):
         self._belief = belief
         self._fusion = fusion
         self._step = step
+        self._temporarily_blocked = {tuple(cell) for cell in temporarily_blocked}
 
     def in_bounds(self, cell: tuple[int, int]) -> bool:
         return self._belief.in_bounds(cell)
 
     def is_blocked_for_planning(self, cell: tuple[int, int]) -> bool:
-        return self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
+        return cell in self._temporarily_blocked or self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
 
     def traversal_cost(self, cell: tuple[int, int]) -> float:
+        if cell in self._temporarily_blocked:
+            return math.inf
         return self._belief.traversal_cost(cell, self._step, self._fusion)
 
 
@@ -70,11 +73,16 @@ class ModularRobot:
     inbox: list[ClaimReport] = field(default_factory=list)
     pending: dict[str, ClaimReport] = field(default_factory=dict)
     deliveries_completed: int = 0
+    delivery_durations: list[int] = field(default_factory=list)
+    delivery_start_step: int | None = None
     no_path_steps: int = 0
     movement_steps: int = 0
     total_distance: float = 0.0
     total_replans: int = 0
     blocked_moves: int = 0
+    traffic_wait_steps: int = 0
+    consecutive_traffic_waits: int = 0
+    traffic_replans: int = 0
     productive_replans: int = 0
     replan_records: list[ReplanRecord] = field(default_factory=list)
     no_path_causes: dict[str, int] = field(default_factory=dict)
@@ -118,7 +126,7 @@ class ModularRobot:
         cells: list[tuple[int, int]] = []
         seen: set[tuple[int, int]] = set()
         for anchor in anchors:
-            if self.belief.has_direct_free(anchor):
+            if self.belief.has_direct_free(anchor, step):
                 continue
             if anchor not in seen:
                 seen.add(anchor)
@@ -129,13 +137,14 @@ class ModularRobot:
         self,
         reports: Iterable[tuple[ClaimReport, object]],
         malicious_ids: FrozenSet[str],
+        step: int,
     ) -> bool:
         if not self.path:
             return False
         remaining = list(self.path)
         for report, _ in reports:
             target = tuple(report.target_cell)
-            if self.belief.has_direct_free(target):
+            if self.belief.has_direct_free(target, step):
                 continue
             is_malicious = report.report_id in malicious_ids
             if (
@@ -178,14 +187,14 @@ class ModularRobot:
                 self.pending.pop(previous.report.report_id, None)
             self.pending[report.report_id] = report
             accepted.append((report, policy))
-            if self._report_affects_route(report, malicious_ids):
+            if self._report_affects_route(report, malicious_ids, step):
                 route_affected = True
         self.inbox.clear()
         return accepted, route_affected
 
-    def _report_affects_route(self, report: ClaimReport, malicious_ids: FrozenSet[str]) -> bool:
+    def _report_affects_route(self, report: ClaimReport, malicious_ids: FrozenSet[str], step: int) -> bool:
         target = tuple(report.target_cell)
-        if self.belief.has_direct_free(target):
+        if self.belief.has_direct_free(target, step):
             return False
         is_malicious = report.report_id in malicious_ids
         if report.claim == ClaimType.FREE and not is_malicious and self.fusion.method != "majority_vote":
@@ -258,7 +267,14 @@ class ModularRobot:
                 risk_before = self.fusion.sender_route_risk(sender_id, route_cells, step, trust_override=old_trust)
                 risk_after = self.fusion.sender_route_risk(sender_id, route_cells, step, trust_override=new_trust)
                 risk_drop = risk_before - risk_after
-                if risk_drop < SOURCE_LINKED_MIN_ROUTE_RISK_DROP:
+                # A false claim may already have forced the robot onto a detour,
+                # so it is no longer present on the *current* route.  A verified
+                # trust decrease must still release that earlier detour.
+                sender_has_active_blocked_claim = any(
+                    item.report.sender_id == sender_id and item.report.claim == ClaimType.BLOCKED
+                    for items in self.fusion.claims.values() for item in items
+                )
+                if risk_drop < SOURCE_LINKED_MIN_ROUTE_RISK_DROP and not sender_has_active_blocked_claim:
                     continue
                 self.defense_replan_needed = True
                 self.source_linked_replan_context = {
@@ -275,32 +291,23 @@ class ModularRobot:
 
         return results
 
-    def replan(self, step: int, reason: str) -> bool:
+    def replan(self, step: int, reason: str, temporarily_blocked=()) -> bool:
         old = list(self.path or ())
         old_cost = sum(self.fusion.routing_cost(cell, step) for cell in old) if old else None
         self.fusion.set_time(step)
-        adapter = _PlanningBelief(self.belief, self.fusion, step)
+        adapter = _PlanningBelief(self.belief, self.fusion, step, temporarily_blocked)
         self.path = astar(
             self.position,
             self.goal,
             lambda cell: adapter.traversal_cost(cell),
         )
-        if self.path is None:
-            try:
-                import sim2
-
-                if sim2.ENABLE_FALLBACK_EXPLORATION:
-                    self.path, _ = sim2.plan_to_reachable_fallback(
-                        adapter,
-                        self.position,
-                        self.goal,
-                    )
-            except RuntimeError:
-                self.path = None
+        # A missing path is a real no-path condition in the modular engine.
         new = list(self.path or ())
         new_cost = sum(self.fusion.routing_cost(cell, step) for cell in new) if new else None
         changed = old != new
         self.total_replans += 1
+        if reason.startswith("traffic_"):
+            self.traffic_replans += 1
         self.productive_replans += int(changed)
         if "path_invalid" in reason or reason == "path_invalid_or_empty":
             self.last_path_invalid_replan_step = step
@@ -346,6 +353,9 @@ class ModularRobot:
             if self.carrying:
                 self.carrying = False
                 self.deliveries_completed += 1
+                if self.delivery_start_step is not None:
+                    self.delivery_durations.append(step - self.delivery_start_step)
+                self.delivery_start_step = None
                 self.task_index += 1
                 if self.task_index >= len(self.tasks):
                     self.completed = True
@@ -354,20 +364,19 @@ class ModularRobot:
                 self.path = None
                 return "task_transition"
             self.carrying = True
+            self.delivery_start_step = step
             self.path = None
             return "task_transition"
         if not self.path:
             self.no_path_steps += 1
             return "no_path"
         next_cell = self.path[0]
-        if (
-            step >= SPAWN_COLLISION_GRACE_STEPS
-            and next_cell in occupied
-            and next_cell != self.position
-        ):
-            self.blocked_moves += 1
-            self.path = None
-            return "blocked_move"
+        if next_cell in occupied and next_cell != self.position:
+            # Another robot is a transient traffic constraint, not evidence of
+            # a physical obstacle. Preserve the route and record a wait.
+            self.traffic_wait_steps += 1
+            self.consecutive_traffic_waits += 1
+            return "traffic_wait"
         if world.state(next_cell, step) == ClaimType.BLOCKED:
             self.blocked_moves += 1
             self.belief.observe(DirectObservation(self.robot_id, next_cell, ClaimType.BLOCKED, step))
@@ -377,4 +386,5 @@ class ModularRobot:
         self.position = next_cell
         self.movement_steps += 1
         self.total_distance += 1.0
+        self.consecutive_traffic_waits = 0
         return "move"

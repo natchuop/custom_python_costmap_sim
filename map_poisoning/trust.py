@@ -1,4 +1,4 @@
-"""Trust estimators aligned with legacy ``sim2`` scalar magnitudes."""
+"""Trust estimators for source-linked modular report fusion."""
 from __future__ import annotations
 
 from dataclasses import dataclass

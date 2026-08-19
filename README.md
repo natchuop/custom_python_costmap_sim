@@ -52,11 +52,9 @@ Run the dependency check before installation or on a new machine:
 python .\install_dependencies.py --install --include-dev
 ```
 
-The public entry point is the modular package (`main.py` and `map_poisoning/`).  The
-current replay deliberately keeps `sim2.py` and `defense_method_runner.py` as internal
-behavioral components: they provide the validated continuous-motion, warehouse-layout,
-LiDAR, and fusion implementations used by the modular manifest adapter.  They are not
-separate selectable engines.
+The public entry point is the native modular package (`main.py` and
+`map_poisoning/`). It owns manifest authoring, sensing, peer delivery, fusion,
+planning, and metric collection.
 
 The primary comparison methods are `full_trust`, `majority_vote`, `trust_fused`,
 and `source_linked`. Optional additional methods are `hard_threshold`,
@@ -74,11 +72,18 @@ relative to this project.
 
 ## Results and plots
 
-Completed runs write the authoritative `run_summary.csv`, `events.csv`, and
-`robot_timeseries.csv` files. By default they also generate a `plots/` folder,
-`report_summary.txt`, and `plot_manifest.json`. Comparison runs generate those
-individual reports for each method plus `comparison_plots/`,
-`comparison_summary.csv`, and `comparison_report.txt` at the comparison root.
+Unless you pass `--output-directory`, results are written to a named folder:
+
+- single run: `outputs\runs\<method>_seed<N>_<map>\`
+- same-seed method comparison: `outputs\comparisons\seed<N>_<map>\`
+- multi-seed batch: `outputs\multiseed\<method>_seeds<spec>_<map>\`
+
+The GUI fills this path automatically when you change method, seed, or map.
+PNG diagrams are in `plots\` for a single run, `comparison_plots\` plus each
+method's `plots\` for a comparison, and `aggregate\plots\` for multi-seed.
+
+Completed runs also write `run_summary.csv`, `events.csv`, `robot_timeseries.csv`,
+`report_summary.txt`, and `plot_manifest.json`.
 
 Disable report generation with `--no-plots`:
 

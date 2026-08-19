@@ -303,7 +303,11 @@ def _plot_influence(data, path):
             bottom.step([x for x, _ in values], [y for _, y in values], where="post", color=_robot_color(rid), label=f"R{rid} influential")
     _decorate_phases(top, data.timeseries); _decorate_phases(bottom, data.timeseries)
     top.set(title="Stored / unexpired fake claims", ylabel="Stored claims")
-    bottom.set(title="Currently influential fake cells", xlabel="Simulation step", ylabel="Influential cells")
+    bottom.set(
+        title="Currently navigation-relevant fake claims",
+        xlabel="Simulation step",
+        ylabel="Influential claims",
+    )
     for axis in (top, bottom):
         handles, labels = axis.get_legend_handles_labels()
         if handles:
@@ -377,13 +381,14 @@ def _plot_replans(data, path):
 
 
 REPLAN_REASON_CATEGORIES = {
-    "initial/task transition": ("initial_plan", "delivery", "goal", "pre_intent_path_update"),
+    "initial/task transition": ("initial_plan", "delivery", "goal", "pre_intent_path_update", "task_transition"),
     "path invalid / empty": ("path_invalid_or_empty", "path_invalid"),
-    "real/world blockage": ("blocked_world",),
-    "malicious report on route": ("malicious_report_on_route",),
+    "real/world blockage": ("blocked_world", "blocked_move"),
+    "malicious report on route": ("malicious_report_on_route", "peer_report_on_route"),
     "honest report on route": ("honest_report_on_route",),
     "source-linked trust reweight": ("source_linked_trust_reweight",),
-    "traffic replan": ("traffic_replan",),
+    "direct verification": ("direct_verification",),
+    "traffic replan": ("traffic_replan", "traffic_wait_reroute"),
     "traffic yield/recovery": ("traffic_yield", "traffic_deadlock"),
     "fallback retry": ("fallback",),
 }
@@ -395,6 +400,22 @@ def _replan_category(reason):
         if any(token in reason for token in tokens):
             return category
     return "other"
+
+
+def _event_present(event, key):
+    return event.get(key) not in (None, "")
+
+
+def _replan_was_productive(event):
+    if _event_present(event, "next_five_changed"):
+        return parse_bool(event.get("next_five_changed"))
+    return parse_bool(event.get("changed"))
+
+
+def _replan_was_identical(event):
+    if _event_present(event, "identical_path"):
+        return parse_bool(event.get("identical_path"))
+    return not _replan_was_productive(event)
 
 
 def _plot_replan_reasons(data, path):
@@ -449,8 +470,8 @@ def _plot_replan_productivity(data, path):
     for rid in _benign_ids(data):
         selected = [event for event in events if parse_int(event.get("robot_id")) == rid]
         total = len(selected)
-        changed = sum(parse_bool(event.get("next_five_changed")) for event in selected)
-        identical = sum(parse_bool(event.get("identical_path")) for event in selected)
+        changed = sum(_replan_was_productive(event) for event in selected)
+        identical = sum(_replan_was_identical(event) for event in selected)
         labels.append(f"R{rid} benign")
         productive_values.append(changed)
         unchanged_values.append(total - changed)
@@ -662,8 +683,8 @@ def _write_run_summary(data, plot_names):
             category = _replan_category(event.get("reason"))
             reason_counts[category] = reason_counts.get(category, 0) + 1
         reason_diagnostics.append(f"  R{rid} replan reasons: {reason_counts}")
-        productive = sum(parse_bool(event.get("next_five_changed")) for event in reasons)
-        identical = sum(parse_bool(event.get("identical_path")) for event in reasons)
+        productive = sum(_replan_was_productive(event) for event in reasons)
+        identical = sum(_replan_was_identical(event) for event in reasons)
         ratio = productive / len(reasons) if reasons else 0.0
         planning_diagnostics.append(f"  R{rid}: total replans={len(reasons)}, productive={productive} ({ratio:.1%}), exact-identical={identical}")
         waits = _series(data.timeseries, rid, "benign_traffic_wait_steps", parse_int)
@@ -925,7 +946,6 @@ MULTISEED_DIRECTIONS = {
     "time_to_distrust_malicious_robot": ("diagnostic", "steps"),
     "final_attacker_trust_mean": ("diagnostic", "trust"),
     "recovery_start_attacker_trust_mean": ("diagnostic", "trust"),
-    "recovery_start_attacker_trust_mean": ("diagnostic", "trust"),
     "recovery_trust_gain": ("diagnostic", "trust"),
     "deliveries_during_recon": ("higher_better", "deliveries"),
     "deliveries_during_attack": ("higher_better", "deliveries"),
@@ -1043,7 +1063,24 @@ def _seed_metric(data, field):
     if field in phase: return phase[field]
     return None
 
-def _write_multiseed_csvs(root, runs):
+
+def focal_comparison_method(methods) -> str | None:
+    """Choose the method that paired differences are measured against.
+
+    ``source_linked`` remains the default proposed method when it is present.
+    Otherwise the last requested method is the comparison focus, so a two-method
+    batch such as ``full_trust,majority_vote`` still produces paired statistics.
+    """
+    ordered = [method for method in methods if method]
+    if not ordered:
+        return None
+    if "source_linked" in ordered:
+        return "source_linked"
+    unique = list(dict.fromkeys(ordered))
+    return unique[-1] if len(unique) >= 2 else None
+
+
+def _write_multiseed_csvs(root, runs, requested_methods=None):
     aggregate = Path(root) / "aggregate"; aggregate.mkdir(parents=True, exist_ok=True)
     raw = []
     for seed, method, data in runs:
@@ -1063,8 +1100,11 @@ def _write_multiseed_csvs(root, runs):
             summary_rows.append({"method": method, "metric": metric, "direction": direction, "unit": unit, "n": stats["n"], "n_missing": len(method_rows)-stats["n"], **{key: stats[key] for key in ("mean","sample_std","sem","ci95_low","ci95_high","median","min","max")}})
     _write_rows(aggregate / "multiseed_summary.csv", summary_rows)
     paired = []
-    source = {row["seed"]: row for row in raw if row["method"] == "source_linked"}
-    for baseline in sorted({row["method"] for row in raw if row["method"] != "source_linked"}):
+    present = list(dict.fromkeys(requested_methods or [])) or sorted({row["method"] for row in raw})
+    present = [method for method in present if any(row["method"] == method for row in raw)] or sorted({row["method"] for row in raw})
+    focal = focal_comparison_method(present)
+    source = {row["seed"]: row for row in raw if row["method"] == focal} if focal else {}
+    for baseline in [method for method in present if method != focal]:
         base = {row["seed"]: row for row in raw if row["method"] == baseline}
         for metric, (direction, _) in MULTISEED_DIRECTIONS.items():
             seeds = sorted(set(source) & set(base)); differences = [source[seed][metric] - base[seed][metric] for seed in seeds if source[seed].get(metric) is not None and base[seed].get(metric) is not None]
@@ -1073,9 +1113,9 @@ def _write_multiseed_csvs(root, runs):
             improvement = None if direction == "diagnostic" else stats["mean_difference"] * (1 if direction == "higher_better" else -1) if stats["mean_difference"] is not None else None
             raw_low, raw_high = stats["ci95_difference_low"], stats["ci95_difference_high"]
             oriented = None if direction == "diagnostic" else (1 if direction == "higher_better" else -1)
-            paired.append({"baseline_method": baseline, "metric": metric, "direction": direction, "n_pairs": stats["n_pairs"], "mean_difference": stats["mean_difference"], "sample_std_difference": stats["sample_std_difference"], "sem_difference": stats["sem_difference"], "ci95_difference_low": raw_low, "ci95_difference_high": raw_high, "improvement_difference": None if oriented is None or stats["mean_difference"] is None else oriented * stats["mean_difference"], "improvement_ci95_low": None if oriented is None or raw_low is None else (raw_low if oriented == 1 else -raw_high), "improvement_ci95_high": None if oriented is None or raw_high is None else (raw_high if oriented == 1 else -raw_low)})
+            paired.append({"focal_method": focal, "baseline_method": baseline, "metric": metric, "direction": direction, "n_pairs": stats["n_pairs"], "mean_difference": stats["mean_difference"], "sample_std_difference": stats["sample_std_difference"], "sem_difference": stats["sem_difference"], "ci95_difference_low": raw_low, "ci95_difference_high": raw_high, "improvement_difference": None if oriented is None or stats["mean_difference"] is None else oriented * stats["mean_difference"], "improvement_ci95_low": None if oriented is None or raw_low is None else (raw_low if oriented == 1 else -raw_high), "improvement_ci95_high": None if oriented is None or raw_high is None else (raw_high if oriented == 1 else -raw_low)})
     _write_rows(aggregate / "paired_method_differences.csv", paired)
-    return raw, summary_rows, paired
+    return raw, summary_rows, paired, focal
 
 def _multiseed_point_plot(raw, metrics, title, path):
     methods = sorted({row["method"] for row in raw}); fig, axes = plt.subplots(1, len(metrics), figsize=(5*len(metrics), 5), squeeze=False)
@@ -1136,14 +1176,14 @@ def _paired_seed_plot(raw, path):
         if values: ax.errorbar(index, stats["mean"], yerr=None if stats["ci95_low"] is None else [[stats["mean"]-stats["ci95_low"]], [stats["ci95_high"]-stats["mean"]]], fmt="o", capsize=4, color=f"C{index}")
     ax.set(title="Paired same-seed outcomes", ylabel="Deliveries during ATTACK", xticks=range(len(methods)), xticklabels=methods); ax.grid(axis="y", alpha=.25); _save(fig, path)
 
-def _experiment_design_plot(path):
+def _experiment_design_plot(path, methods=None):
     fig, ax = plt.subplots(figsize=(10, 5)); ax.axis("off")
-    methods = "full_trust   majority_vote   trust_fused   source_linked"
+    method_label = "   ".join(methods) if methods else "full_trust   majority_vote   trust_fused   source_linked"
     for index, seed in enumerate(("Seed 1", "Seed 2", "...")):
         y = .8 - index * .28; ax.text(.02, y, seed, fontsize=11, weight="bold", va="center")
         ax.text(.18, y, "one scenario manifest", bbox=dict(boxstyle="round", facecolor="#e8f1fb"), va="center")
         ax.annotate("", (.42, y), (.37, y), arrowprops=dict(arrowstyle="->"))
-        ax.text(.44, y, methods, bbox=dict(boxstyle="round", facecolor="#eef7e8"), va="center", fontsize=9)
+        ax.text(.44, y, method_label, bbox=dict(boxstyle="round", facecolor="#eef7e8"), va="center", fontsize=9)
     ax.text(.5, .08, "Aggregate: per-method mean / sample SD / 95% CI + paired same-seed differences", ha="center", weight="bold")
     ax.set_title("Experiment design — SAME MANIFEST WITHIN EACH SEED"); _save(fig, path)
 
@@ -1166,7 +1206,11 @@ def _batch_completion_plot(root, path):
 def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     root=Path(root); runs=_multiseed_runs(root)
     if not runs: raise ValueError(f"no completed multi-seed runs found under {root}")
-    raw, summary, paired = _write_multiseed_csvs(root, runs); aggregate=root/"aggregate"; plots=aggregate/"plots"; generated=[]; plot_failures=[]
+    config = {}
+    try: config = json.loads((root / "batch_config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError): pass
+    requested_methods = list(config.get("methods") or [])
+    raw, summary, paired, focal = _write_multiseed_csvs(root, runs, requested_methods); aggregate=root/"aggregate"; plots=aggregate/"plots"; generated=[]; plot_failures=[]
     by_seed = {}
     for seed, method, data in runs: by_seed.setdefault(seed, []).append((method, data))
     complete_seeds = [seed for seed, cells in by_seed.items() if len(cells) == len({method for _, method, _ in runs})]
@@ -1187,9 +1231,6 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     if any(value is True for value in dirty): warnings.append("one or more runs were created from a dirty Git worktree")
     if len({value for value in presets if value}) > 1: warnings.append("scenario presets differ across runs")
     warnings.extend([] if fairness_ok else ["scenario_manifest_hash mismatch within a seed"])
-    config = {}
-    try: config = json.loads((root / "batch_config.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError): pass
     requested_seeds = [int(value) for value in config.get("seeds", sorted(by_seed))]
     requested_methods = list(config.get("methods", sorted({row["method"] for row in raw})))
     status = read_csv_rows(root / "batch_status.csv")
@@ -1206,7 +1247,8 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
                   "requested_seeds": requested_seeds, "requested_methods": requested_methods,
                   "requested_cell_count": len(requested_seeds) * len(requested_methods), "completed_cell_count": sum(1 for row in status if row.get("status") in {"completed", "skipped_resume"}), "failed_cell_count": len(failed_cells), "missing_cell_count": len(missing_cells),
                   "complete_seeds": sorted(set(requested_seeds) - set(incomplete)), "incomplete_seeds": incomplete, "failed_cells": failed_cells, "missing_cells": missing_cells,
-                  "per_method_run_counts": {method: sum(row["method"] == method for row in raw) for method in requested_methods}, "paired_seed_count_by_comparison": {method: sum(1 for seed in requested_seeds if (seed, "source_linked") in successful_cells and (seed, method) in successful_cells) for method in requested_methods if method != "source_linked"},
+                  "per_method_run_counts": {method: sum(row["method"] == method for row in raw) for method in requested_methods}, "paired_seed_count_by_comparison": {method: sum(1 for seed in requested_seeds if focal and (seed, focal) in successful_cells and (seed, method) in successful_cells) for method in requested_methods if method != focal},
+                  "focal_method": focal,
                   "map_hashes_observed": sorted(value for value in hashes if value), "scenario_presets_observed": sorted(preset_values), "experiment_config_hashes_observed": sorted(included_configs), "git_commits_observed": sorted(set(commits)), "git_dirty_flags_observed": sorted(set(dirty), key=str), "warnings": warnings}
     if config_mismatch: validation["warnings"].append("experiment_config_hash differs across included cells")
     if map_mismatch: validation["warnings"].append("map hashes differ across the batch")
@@ -1226,7 +1268,12 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     if "png" in formats:
         fig, ax=plt.subplots(figsize=(10,6)); selected=[row for row in paired if row["metric"] in {"benign_deliveries_after_attack","deliveries_per_1000_steps","replans_per_delivery","traffic_waits_per_delivery","attack_mean_influential_fake_cells","attack_fraction_route_affected"} and row["improvement_difference"] is not None]; labels=[f"{row['baseline_method']} / {row['metric']}" for row in selected]; means=[row["improvement_difference"] for row in selected]; lows=[row["improvement_ci95_low"] for row in selected]; highs=[row["improvement_ci95_high"] for row in selected]; y=np.arange(len(labels));
         if labels: ax.errorbar(means,y,xerr=[[m-l if l is not None else 0 for m,l in zip(means,lows)],[h-m if h is not None else 0 for m,h in zip(means,highs)]],fmt="o")
-        ax.axvline(0,color="0.4"); ax.set(yticks=y,yticklabels=labels,title="Source-linked paired improvement",xlabel="Positive means source-linked better"); ax.grid(axis="x",alpha=.25); _save(fig,plots/"09_source_linked_paired_differences.png"); generated.append("09_source_linked_paired_differences.png")
+        focal_label = focal or "focal method"
+        ax.axvline(0,color="0.4"); ax.set(yticks=y,yticklabels=labels or ["(no paired methods)"],title=f"{focal_label} paired improvement",xlabel=f"Positive means {focal_label} better"); ax.grid(axis="x",alpha=.25); _save(fig,plots/"09_paired_method_differences.png"); generated.append("09_paired_method_differences.png")
+        if focal == "source_linked":
+            import shutil
+            shutil.copyfile(plots/"09_paired_method_differences.png", plots/"09_source_linked_paired_differences.png")
+            generated.append("09_source_linked_paired_differences.png")
         from .statistics import summarize
         methods=sorted({row["method"] for row in raw}); fig, ax=plt.subplots(figsize=(8,6))
         for method in methods:
@@ -1237,13 +1284,13 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
         try:
             _paired_seed_plot(raw, plots / "11_paired_seed_outcomes.png"); generated.append("11_paired_seed_outcomes.png")
             _multiseed_point_plot(raw, ["deliveries_during_attack", "deliveries_during_recovery", "traffic_wait_steps_during_attack", "replans_during_attack"], "Phase outcomes by method", plots / "12_phase_outcomes_by_method.png"); generated.append("12_phase_outcomes_by_method.png")
-            _experiment_design_plot(plots / "13_experiment_design.png"); generated.append("13_experiment_design.png")
+            _experiment_design_plot(plots / "13_experiment_design.png", requested_methods or sorted({row["method"] for row in raw})); generated.append("13_experiment_design.png")
         except Exception as exc:
             plot_failures.append({"filename": "11-13 aggregate plots", "error": str(exc)}); print(f"[report] FAILED 11-13 aggregate plots: {exc}")
-    _write_multiseed_report(aggregate, raw, paired)
+    _write_multiseed_report(aggregate, raw, paired, focal)
     manifest={"directory":str(root),"generated":generated,"failed":plot_failures,"warnings":[],"runs":len(runs)}; (aggregate/"aggregate_plot_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8"); return manifest
 
-def _write_multiseed_report(aggregate, raw, paired):
+def _write_multiseed_report(aggregate, raw, paired, focal=None):
     methods=sorted({row["method"] for row in raw})
     try: validation = json.loads((aggregate / "batch_validation.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): validation = {}
@@ -1254,9 +1301,10 @@ def _write_multiseed_report(aggregate, raw, paired):
     from .statistics import summarize
     for method in methods:
         values=[row["benign_total_deliveries_completed"] for row in raw if row["method"]==method and row.get("benign_total_deliveries_completed") is not None]; s=summarize(values); lines.append(f"  {method}: mean deliveries={s['mean']} SD={s['sample_std']} 95% CI=[{s['ci95_low']}, {s['ci95_high']}]")
-    lines += ["", "Paired source_linked comparisons:"]
+    focal_label = focal or validation.get("focal_method") or "source_linked"
+    lines += ["", f"Paired {focal_label} comparisons:"]
     for row in paired:
-        if row["metric"]=="benign_deliveries_after_attack" and row["improvement_difference"] is not None: lines.append(f"  source_linked vs {row['baseline_method']}: mean paired improvement={row['improvement_difference']:.4g}, 95% CI [{row['improvement_ci95_low']}, {row['improvement_ci95_high']}], n={row['n_pairs']} (paired same-seed difference)")
+        if row["metric"]=="benign_deliveries_after_attack" and row["improvement_difference"] is not None: lines.append(f"  {focal_label} vs {row['baseline_method']}: mean paired improvement={row['improvement_difference']:.4g}, 95% CI [{row['improvement_ci95_low']}, {row['improvement_ci95_high']}], n={row['n_pairs']} (paired same-seed difference)")
     (aggregate/"multiseed_report.txt").write_text("\n".join(lines)+"\n",encoding="utf-8")
 
 

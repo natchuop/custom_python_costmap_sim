@@ -17,13 +17,16 @@ class World:
         self.episodes = episodes
 
     def truth_grid(self, step: int) -> np.ndarray:
-        import sim2
+        """Return the binary physical occupancy grid at ``step``.
 
-        grid = np.array(self.static_grid, dtype=np.int16)
+        The modular simulator deliberately has no dependency on the former
+        continuous-motion engine: zero is free and one is physically blocked.
+        """
+        grid = np.array(self.static_grid, dtype=np.uint8)
         for episode in self.episodes:
             if episode.appearance_step <= step < episode.clearance_step:
                 for cell in episode.cells:
-                    grid[cell] = int(sim2.CellState.TEMPORARILY_BLOCKED)
+                    grid[cell] = 1
         return grid
 
     def state(self, cell: tuple[int, int], step: int) -> ClaimType:

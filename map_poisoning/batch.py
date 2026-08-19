@@ -42,8 +42,12 @@ def experiment_config_hash(config: SimulationConfig) -> str:
 def code_revision_metadata() -> dict:
     """Return an auditable revision identity for resume safety."""
     try:
-        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        diff = subprocess.check_output(["git", "diff", "--no-ext-diff", "--ignore-submodules=all"], text=True)
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        diff = subprocess.check_output(
+            ["git", "-c", "core.safecrlf=false", "diff", "--no-ext-diff", "--ignore-submodules=all"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
         dirty = bool(diff.strip())
         payload = (commit + "\n" + diff.replace("\r\n", "\n")).encode("utf-8")
     except (OSError, subprocess.CalledProcessError):
@@ -123,7 +127,7 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
             if manifest_path.exists(): manifest = load_manifest(manifest_path)
             else: manifest = run(seed_cfg, manifest_only=True)
             manifest_hash = scenario_manifest_hash(manifest)
-            print(f"[seed {index:02d}/{len(seeds)}] manifest ready")
+            print(f"[seed {index:02d}/{len(seeds)}] manifest ready", flush=True)
             for method in methods:
                 output = seed_root / method
                 started_at = _now(); started = time.monotonic(); status = "completed"; error = ""
@@ -143,7 +147,7 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
                 status_rows.append({"seed": seed, "method": method, "status": status, "output_directory": str(output), "scenario_manifest_hash": manifest_hash, "experiment_config_hash": cfg_hash, **revision, "started_at": started_at, "finished_at": _now(), "duration_seconds": round(time.monotonic()-started, 3), "error": error})
                 _write_batch_status_atomic(root, status_rows)
                 _write_seed_index(root, records, seeds=seeds, methods=methods, config_hash=cfg_hash)
-                print(f"[seed {seed:02d}/{len(seeds)}] {method} ... {status}")
+                print(f"[seed {index:02d}/{len(seeds)}] {method} ... {status}", flush=True)
         except Exception as exc:
             if fail_fast: raise
             for method in methods:

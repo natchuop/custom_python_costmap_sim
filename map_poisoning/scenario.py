@@ -1,14 +1,13 @@
 """Versioned scenario manifests and defense-independent attack authoring."""
 from __future__ import annotations
 import hashlib, json
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import numpy as np
-import sim2
 from .config import SimulationConfig
 from .models import AttackEvent, AttackType, ClaimReport, ClaimType, DeliveryTask, ReportAuditLabel, TemporaryObstacleEpisode
 from .rng import derived_seed, named_rng
-from .temp_obstacles import export_temp_episodes
 from .world import demo_grid
 from .planning import astar
 from .scenario_presets import preset_for_hash, preset_for_id, validate_fixed_preset
@@ -36,7 +35,7 @@ class ScenarioManifest:
     obstacle_episodes: tuple[TemporaryObstacleEpisode, ...]
     attack_events: tuple[AttackEvent, ...]
     scenario_id: str = ""
-    protocol_id: str = "original_legacy_cli"
+    protocol_id: str = "modular_v1"
     robot_starts: dict[int, tuple[int, int]] | None = None
     task_queues: dict[int, tuple[DeliveryTask, ...]] | None = None
     attacker_positions: tuple[tuple[int, int], ...] = ()
@@ -49,6 +48,47 @@ class ScenarioManifest:
 def _hash(grid) -> str: return hashlib.sha256(grid.tobytes()).hexdigest()
 def _cell_choice(rng, cells): return cells[rng.randrange(min(len(cells), 12))]
 
+def _episode_is_active(episode, step: int) -> bool:
+    return episode.appearance_step <= step < episode.clearance_step
+
+
+def _feasible_attack_types(enabled: list[AttackType], step: int, episodes) -> list[AttackType]:
+    feasible = []
+    for kind in enabled:
+        if kind == AttackType.FAKE_OBSTACLE:
+            feasible.append(kind)
+        elif kind == AttackType.FALSE_CLEARANCE and any(_episode_is_active(episode, step) for episode in episodes):
+            feasible.append(kind)
+        elif kind == AttackType.STALE_REASSERTION and any(episode.clearance_step <= step for episode in episodes):
+            feasible.append(kind)
+    return feasible
+
+
+def _instantiate_attack(kind, *, step, rng, episodes, route_cells, use_count, selected, config):
+    """Place one attack of the requested kind, or return None if it cannot be sited."""
+    if kind == AttackType.FAKE_OBSTACLE:
+        eligible = [
+            cell for cell in route_cells
+            if use_count.get(cell, 0) < config.attacks.max_uses_per_footprint
+            and all(cell == old or abs(cell[0] - old[0]) + abs(cell[1] - old[1]) >= config.attacks.min_center_spacing for old in selected)
+            and not any(cell in episode.cells and _episode_is_active(episode, step) for episode in episodes)
+        ]
+        if not eligible:
+            return None
+        cell = _cell_choice(rng, eligible)
+        return cell, ClaimType.BLOCKED, step, None
+    if kind == AttackType.FALSE_CLEARANCE:
+        active = [episode for episode in episodes if _episode_is_active(episode, step)]
+        if not active:
+            return None
+        episode = _cell_choice(rng, active)
+        return episode.cells[0], ClaimType.FREE, step, episode
+    cleared = [episode for episode in episodes if episode.clearance_step <= step]
+    if not cleared:
+        return None
+    episode = _cell_choice(rng, cleared)
+    return episode.cells[0], ClaimType.BLOCKED, step, episode
+
 def _nominal_route_cells(grid, starts, targets) -> list[tuple[int, int]]:
     """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
     rows, cols=grid.shape
@@ -60,6 +100,44 @@ def _nominal_route_cells(grid, starts, targets) -> list[tuple[int, int]]:
             if route: routes.extend(route)
     excluded=set(starts)|set(targets)
     return [cell for cell in routes if cell not in excluded]
+
+
+def _largest_free_component(grid: np.ndarray) -> list[tuple[int, int]]:
+    """Return the largest four-connected free component in deterministic order."""
+    rows, cols = grid.shape
+    remaining = {
+        (row, col) for row in range(rows) for col in range(cols) if not grid[row, col]
+    }
+    largest: list[tuple[int, int]] = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        queue = deque([start])
+        component = [start]
+        while queue:
+            row, col = queue.popleft()
+            for neighbor in ((row - 1, col), (row, col - 1), (row, col + 1), (row + 1, col)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+                    component.append(neighbor)
+        if len(component) > len(largest):
+            largest = component
+    return sorted(largest)
+
+
+def _spread_free_cells(grid: np.ndarray, count: int) -> tuple[tuple[int, int], ...]:
+    """Choose well-separated reachable cells for maps without a fixed preset."""
+    component = _largest_free_component(grid)
+    if len(component) < count:
+        raise ValueError("map does not contain enough mutually reachable free cells")
+    chosen = [component[len(component) // 2]]
+    while len(chosen) < count:
+        def nearest_distance(cell):
+            return min(abs(cell[0] - old[0]) + abs(cell[1] - old[1]) for old in chosen)
+        candidates = [cell for cell in component if cell not in chosen]
+        chosen.append(max(candidates, key=lambda cell: (nearest_distance(cell), -cell[0], -cell[1])))
+    return tuple(chosen)
 
 
 def build_fixed_task_queues(benign_ids, delivery_points, deliveries_per_robot):
@@ -87,16 +165,19 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         raise ValueError(f"map matches scenario preset {preset.preset_id}; pass --scenario-preset {preset.preset_id} for fixed experiment geometry")
     phases = config.phases
     rng = named_rng(config.seed, "attack_scheduler")
+    type_rng = named_rng(config.seed, "attack_types")
+    place_rng = named_rng(config.seed, "attack_placement")
     enabled = [AttackType(x) for x in config.attacks.enabled]
-    benign = (1, 2); sender = 0; events=[]; bag=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
+    benign = (1, 2); sender = 0; events=[]; preference_bag=[]; step = phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max); index=0
     free = [(r,c) for r in range(1,grid.shape[0]-1) for c in range(1,grid.shape[1]-1) if not grid[r,c]]
     rows, cols = grid.shape
     if preset:
         starts_tuple = tuple(preset.robot_starts[index] for index in sorted(preset.robot_starts))
         targets = preset.delivery_points
     else:
-        starts_tuple = ((2, 2), (rows - 3, cols - 3), (2, cols - 3))
-        targets = ((rows - 3, 2), (2, cols - 3), (rows - 3, cols - 3), (2, 2))
+        layout = _spread_free_cells(grid, 7)
+        starts_tuple = layout[:3]
+        targets = layout[3:]
     route_cells=_nominal_route_cells(grid, starts_tuple, targets) or free
     # Temporary obstacles are part of the fixed scenario and deliberately sit
     # on nominal traffic corridors so clearance/stale ablations affect behavior.
@@ -107,31 +188,34 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     episodes=tuple(episodes)
     candidate_metadata=[]; use_count: dict[tuple[int,int],int]={}; selected=[]
     while step < phases.recon_steps + phases.attack_steps and enabled:
-        if not bag:
-            bag = enabled.copy(); rng.shuffle(bag)
-        feasible = [kind for kind in bag if (kind == AttackType.FAKE_OBSTACLE or (kind == AttackType.FALSE_CLEARANCE and any(e.appearance_step <= step < e.clearance_step for e in episodes)) or (kind == AttackType.STALE_REASSERTION and any(e.clearance_step <= step for e in episodes)))]
-        if feasible:
-            kind = feasible[0]; bag.remove(kind)
-            episode = None
-            if kind == AttackType.FAKE_OBSTACLE:
-                eligible=[cell for cell in route_cells if use_count.get(cell,0) < config.attacks.max_uses_per_footprint and all(cell == old or abs(cell[0]-old[0])+abs(cell[1]-old[1]) >= config.attacks.min_center_spacing for old in selected)]
-                if not eligible: break
-                cell, claim, observation = _cell_choice(rng, eligible), ClaimType.BLOCKED, step
-            elif kind == AttackType.FALSE_CLEARANCE:
-                episode = _cell_choice(rng, [e for e in episodes if e.appearance_step <= step < e.clearance_step]); cell, claim, observation = episode.cells[0], ClaimType.FREE, step
-            else:
-                episode = _cell_choice(rng, [e for e in episodes if e.clearance_step <= step]); cell, claim, observation = episode.cells[0], ClaimType.BLOCKED, step
+        if not preference_bag:
+            preference_bag = list(AttackType)
+            type_rng.shuffle(preference_bag)
+        preferred = preference_bag.pop(0)
+        feasible = set(_feasible_attack_types(enabled, step, episodes))
+        if preferred in feasible:
+            ordered = [preferred, *[kind for kind in enabled if kind != preferred and kind in feasible]]
+        else:
+            ordered = [kind for kind in enabled if kind in feasible]
+        for kind in ordered:
+            placed = _instantiate_attack(
+                kind, step=step, rng=place_rng, episodes=episodes, route_cells=route_cells,
+                use_count=use_count, selected=selected, config=config,
+            )
+            if placed is None:
+                continue
+            cell, claim, observation, episode = placed
             eid=f"attack-{index:04}"; rid=f"report-{index:04}-00"
             events.append(AttackEvent(eid, step, kind, (cell,), claim, observation, sender, benign, (rid,), episode.episode_id if episode else None)); index += 1
             use_count[cell]=use_count.get(cell,0)+1; selected.append(cell)
             candidate_metadata.append({"candidate_id":f"candidate-{index-1:04}","center":cell,"footprint_cells":[cell],"traffic_score":None,"bottleneck_score":None,"estimated_detour_score":None,"rank":None,"selection_weight":None,"prior_use_count":use_count[cell]-1})
+            break
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
-    names=("attack_scheduler", "temporary_obstacles", "robot_routes", "traffic")
+    names=("attack_scheduler", "attack_types", "attack_placement", "temporary_obstacles", "robot_routes", "traffic")
     static_grid=tuple(tuple(int(value) for value in row) for row in grid)
     starts = dict(preset.robot_starts) if preset else {0: starts_tuple[0], 1: starts_tuple[1], 2: starts_tuple[2]}
-    # The legacy rollout requires a navigable task for every robot. Keep the
-    # attacker physically active with the same deterministic repeating queue as
-    # the other robots; only its reporting behavior is malicious.
+    # Keep the attacker physically active with the same deterministic repeating
+    # queue as the other robots; only its reporting behavior is malicious.
     queues=build_fixed_task_queues((sender, *benign), targets, config.deliveries_per_robot)
     if config.deliveries_per_robot < len(targets):
         # Keep the attacker moving through the fixed checkpoint cycle even in
@@ -146,159 +230,17 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     def truth(cell, step):
         return ClaimType.BLOCKED if any(cell in episode.cells and episode.appearance_step <= step < episode.clearance_step for episode in episodes) else ClaimType.FREE
     honest=tuple(ClaimReport(f"attacker-honest-{step:05}",sender,positions[step],truth(positions[step],step),step,step,step) for step in range(0,phases.total_steps,config.communication_period_steps))
-    labels=tuple(ReportAuditLabel(report_id,True,event.attack_type,event.obstacle_episode_id,ClaimType.FREE) for event in events for report_id in event.report_ids)
-    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, {"reconnaissance_end":phases.recon_steps, "attack_end":phases.recon_steps+phases.attack_steps, "total":phases.total_steps}, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="original_legacy_cli", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings)
-
-def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
-    """Author the default warehouse manifest from a clean recon rollout and heatmap candidates."""
-    old_phase = (sim2.MIN_RECON_STEPS, sim2.MAX_RECON_STEPS)
-    sim2.MIN_RECON_STEPS = config.phases.recon_steps
-    sim2.MAX_RECON_STEPS = config.phases.recon_steps
-    try:
-        world, robots, log = sim2.run_simulation(
-            grid=grid,
-            prior_grid=grid,
-            tasks_per_robot=config.deliveries_per_robot,
-            max_steps=config.phases.recon_steps + 1,
-            random_seed=config.seed,
-            experiment_mode="clean",
+    labels=tuple(
+        ReportAuditLabel(
+            report_id,
+            True,
+            event.attack_type,
+            event.obstacle_episode_id,
+            ClaimType.BLOCKED if event.attack_type == AttackType.FALSE_CLEARANCE else ClaimType.FREE,
         )
-    finally:
-        sim2.MIN_RECON_STEPS, sim2.MAX_RECON_STEPS = old_phase
-    candidates = sim2.recon_heatmap_attack_candidates(
-        world, log["goals"], robots, log["traffic_heatmap"][-1]
+        for event in events for report_id in event.report_ids
     )
-    if not candidates:
-        old_overlap = sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP
-        sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = False
-        try:
-            candidates = sim2.recon_heatmap_attack_candidates(
-                world, log["goals"], robots, log["traffic_heatmap"][-1]
-            )
-        finally:
-            sim2.ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = old_overlap
-    if not candidates:
-        raise RuntimeError("clean warehouse rollout produced no manifest attack candidates")
-    attacker = log["malicious_robot_id"]
-    recipients = tuple(r.robot_id for r in robots if not r.is_malicious)
-    rng = named_rng(config.seed, "warehouse_manifest_scheduler")
-    events = []
-    metadata = []
-    warnings = []
-    uses = {}
-    selected_centers = []
-    step = config.phases.recon_steps + rng.randint(
-        config.attacks.interval_min, config.attacks.interval_max
-    )
-    index = 0
-    while step < config.phases.recon_steps + config.phases.attack_steps:
-        pool = candidates[:config.attacks.candidate_top_k]
-        eligible = [
-            candidate
-            for candidate in pool
-            if uses.get(tuple(candidate["center_cell"]), 0) < config.attacks.max_uses_per_footprint
-            and all(
-                tuple(candidate["center_cell"]) == old
-                or abs(candidate["center_cell"][0] - old[0])
-                + abs(candidate["center_cell"][1] - old[1])
-                >= config.attacks.min_center_spacing
-                for old in selected_centers
-            )
-        ]
-        if not eligible:
-            warnings.append("concentrated_attack_manifest: diversity limits exhausted")
-            break
-        candidate = eligible[rng.randrange(len(eligible))]
-        cells = tuple(tuple(cell) for cell in candidate["report_cells"])
-        ids = tuple(f"report-{index:04}-{cell_index:02}" for cell_index in range(len(cells)))
-        events.append(
-            AttackEvent(
-                f"attack-{index:04}",
-                step,
-                AttackType.FAKE_OBSTACLE,
-                cells,
-                ClaimType.BLOCKED,
-                step,
-                attacker,
-                recipients,
-                ids,
-            )
-        )
-        center = tuple(candidate["center_cell"])
-        metadata.append(
-            {
-                "candidate_id": f"warehouse-{index:04}",
-                "center": center,
-                "footprint_cells": cells,
-                "route_overlap": candidate["path_overlap"],
-                "traffic_score": candidate["traffic_score"],
-                "bottleneck_score": candidate["bottleneck_score"],
-                "estimated_detour_score": candidate["path_proximity_score"],
-                "rank": candidates.index(candidate) + 1,
-                "selection_weight": 1 / len(eligible),
-                "prior_use_count": uses.get(center, 0),
-            }
-        )
-        uses[center] = uses.get(center, 0) + 1
-        selected_centers.append(center)
-        index += 1
-        step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
-    if len(set(selected_centers)) < config.attacks.min_unique_footprints:
-        warnings.append("concentrated_attack_manifest: minimum unique footprint count not met")
-    prior = robots[0].belief_map.initial_prior
-    layout_world = sim2.GridWorld(np.asarray(grid if grid is not None else prior, dtype=int))
-    layout_specs, layout_goals, _ = sim2.build_robot_specs_and_goals(
-        layout_world, prior_grid=layout_world.grid
-    )
-    layout_goals = sim2.filter_reachable_action_points(
-        layout_goals, layout_specs, layout_world.grid
-    )
-    sim2.relocate_starts_for_goals(layout_world, layout_specs, layout_goals, layout_world.grid)
-    layout_tasks = sim2.build_delivery_tasks(
-        layout_goals,
-        num_robots=sim2.DEFAULT_NUM_ROBOTS,
-        tasks_per_robot=config.deliveries_per_robot,
-    )
-    layout_tasks = sim2.repair_delivery_tasks(
-        layout_world,
-        layout_tasks,
-        layout_specs,
-        layout_world.grid,
-        action_points=layout_goals,
-    )
-    robot_starts = {spec["robot_id"]: tuple(spec["start"]) for spec in layout_specs}
-    task_queues = {
-        robot_id: tuple(
-            DeliveryTask(f"r{robot_id}-task-{idx}", tuple(task.pickup), tuple(task.dropoff))
-            for idx, task in enumerate(layout_tasks[robot_id])
-        )
-        for robot_id in layout_tasks
-    }
-    static = np.asarray(prior, dtype=np.uint8)
-    episodes = export_temp_episodes(static, config.seed, config.phases.total_steps)
-    return ScenarioManifest(
-        SCHEMA_VERSION,
-        config.seed,
-        {"warehouse_manifest_scheduler": config.seed},
-        hashlib.sha256(prior.tobytes()).hexdigest(),
-        tuple(prior.shape),
-        tuple(tuple(int(v) for v in row) for row in prior),
-        {
-            "reconnaissance_end": config.phases.recon_steps,
-            "attack_end": config.phases.recon_steps + config.phases.attack_steps,
-            "total": config.phases.total_steps,
-        },
-        attacker,
-        recipients,
-        episodes,
-        tuple(events),
-        scenario_id=f"warehouse-{config.seed}",
-        protocol_id="original_legacy_cli",
-        robot_starts=robot_starts,
-        task_queues=task_queues,
-        candidate_metadata=tuple(metadata),
-        authoring_warnings=tuple(dict.fromkeys(warnings)),
-    )
+    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, {"reconnaissance_end":phases.recon_steps, "attack_end":phases.recon_steps+phases.attack_steps, "total":phases.total_steps}, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="modular_v1", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings)
 
 def save_manifest(manifest: ScenarioManifest, path: str | Path) -> None:
     Path(path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True), encoding="utf-8")

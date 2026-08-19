@@ -55,6 +55,16 @@ def test_direct_free_and_blocked_override_peer_evidence():
     assert math.isinf(belief.traversal_cost((2, 2), 2, fusion))
 
 
+def test_stale_direct_free_allows_peer_blocked_cost():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=2)
+    fusion = FusionEngine("source_linked", lambda _: 1.0, cost_scale=40.0)
+    fusion.add(report("r", 0, ClaimType.BLOCKED), is_malicious=True)
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 0))
+    assert belief.traversal_cost((2, 2), 2, fusion) == 1.0
+    assert belief.traversal_cost((2, 2), 3, fusion) > 1.0
+    assert not belief.has_direct_free((2, 2), 3)
+
+
 def test_manifest_has_exact_three_robot_team():
     manifest = author_manifest(SimulationConfig())
     assert manifest.malicious_robot_id == 0

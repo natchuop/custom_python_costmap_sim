@@ -49,7 +49,10 @@ class FusionConfig:
     method: str = "source_linked"
     admission_policy: str = "accept_all"
     decay_rate: float = 0.006
-    cost_scale: float = 14.0
+    # Must dominate the three-unit unknown-cell traversal cost when a highly
+    # trusted blocked claim lies on a planned corridor; otherwise trust changes
+    # cannot change navigation in an otherwise open controlled scenario.
+    cost_scale: float = 40.0
     cost_exponent: float = 1.5
     blocked_probability_threshold: float = 0.70
     max_claim_age: int = 900
@@ -67,7 +70,7 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class VisualizationConfig:
-    animation: bool = True
+    animation: bool = False
     fake_influence_min_cost_delta: float = 0.10
     route_impact_min_cost_delta: float = 0.10
     route_impact_eval_period_steps: int = 10
@@ -91,6 +94,9 @@ class SimulationConfig:
     manifest_path: str | None = None
     deliveries_per_robot: int = 100
     max_steps: int | None = None
+    # Fresh lidar readings override peers.  Older direct memory becomes stale so
+    # a later fake obstacle can still change an unused corridor.
+    direct_memory_steps: int = 12
 
     def validate(self) -> None:
         if self.seed < 0: raise ValueError("seed must be nonnegative")
@@ -110,6 +116,7 @@ class SimulationConfig:
             if self.scenario_preset not in PRESETS: raise ValueError(f"unknown scenario preset: {self.scenario_preset}")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
+        if self.direct_memory_steps < 0: raise ValueError("direct_memory_steps must be nonnegative")
         if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:
             raise ValueError("visualization metric thresholds must be non-negative")
         if self.visualization.route_impact_eval_period_steps < 1:

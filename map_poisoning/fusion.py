@@ -117,6 +117,22 @@ class FusionEngine:
         self.set_time(step)
         return self._runner.routing_cost(cell, step)
 
+    def routing_cost_excluding_sender(
+        self,
+        cell: tuple[int, int],
+        step: int,
+        sender_id: int,
+        predicate=None,
+    ) -> float:
+        """Counterfactual routing cost with selected source claims removed."""
+        self.set_time(step)
+        return self._runner.routing_cost(
+            cell,
+            step,
+            excluded_sender_id=sender_id,
+            excluded_claim_predicate=predicate,
+        )
+
     def vote(self, cell: tuple[int, int], step: int) -> int:
         self.set_time(step)
         return int(self._runner.evidence(cell, step))
