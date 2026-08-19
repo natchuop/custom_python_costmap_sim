@@ -10,7 +10,13 @@ class TrustModel:
     def score(self, sender_id: int) -> float:
         raise NotImplementedError
 
-    def update(self, sender_id: int, outcome: VerificationOutcome) -> tuple[float, float]:
+    def update(
+        self,
+        sender_id: int,
+        outcome: VerificationOutcome,
+        *,
+        severity: float = 1.0,
+    ) -> tuple[float, float]:
         raise NotImplementedError
 
 
@@ -29,13 +35,19 @@ class BayesianTrustModel(TrustModel):
         alpha, beta = self._value(sender_id)
         return alpha / (alpha + beta)
 
-    def update(self, sender_id: int, outcome: VerificationOutcome) -> tuple[float, float]:
+    def update(
+        self,
+        sender_id: int,
+        outcome: VerificationOutcome,
+        *,
+        severity: float = 1.0,
+    ) -> tuple[float, float]:
         before = self.score(sender_id)
         alpha, beta = self._value(sender_id)
         if outcome == VerificationOutcome.CONFIRMED:
-            alpha += 1
+            alpha += max(0.0, severity)
         elif outcome == VerificationOutcome.CONTRADICTED_FRESH:
-            beta += 1
+            beta += max(0.0, severity)
         self.values[sender_id] = [alpha, beta]
         return before, self.score(sender_id)
 
@@ -44,7 +56,7 @@ class BayesianTrustModel(TrustModel):
 class ScalarTrustModel(TrustModel):
     initial: float = 0.70
     reward: float = 0.02
-    penalty: float = 0.06
+    penalty: float = 0.10
 
     def __post_init__(self):
         self.values: dict[int, float] = {}
@@ -52,13 +64,19 @@ class ScalarTrustModel(TrustModel):
     def score(self, sender_id: int) -> float:
         return self.values.get(sender_id, self.initial)
 
-    def update(self, sender_id: int, outcome: VerificationOutcome) -> tuple[float, float]:
+    def update(
+        self,
+        sender_id: int,
+        outcome: VerificationOutcome,
+        *,
+        severity: float = 1.0,
+    ) -> tuple[float, float]:
         before = self.score(sender_id)
         delta = {
             VerificationOutcome.CONFIRMED: self.reward,
             VerificationOutcome.CONTRADICTED_FRESH: -self.penalty,
         }.get(outcome, 0.0)
-        self.values[sender_id] = min(1.0, max(0.0, before + delta))
+        self.values[sender_id] = min(1.0, max(0.0, before + (delta * max(0.0, severity))))
         return before, self.values[sender_id]
 
 

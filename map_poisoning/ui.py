@@ -119,10 +119,11 @@ def launch(args) -> None:
     }
     initial_methods = {args.defense_method}
     extra = getattr(args, "comparison_methods", None)
-    if extra:
-        initial_methods.update(item.strip() for item in str(extra).split(",") if item.strip())
     if args.compare:
-        initial_methods.update(PRIMARY_METHODS)
+        if extra:
+            initial_methods.update(item.strip() for item in str(extra).split(",") if item.strip())
+        else:
+            initial_methods.update(PRIMARY_METHODS)
     method_enabled = {
         method: tk.BooleanVar(value=method in initial_methods)
         for method in ALL_METHODS
@@ -238,8 +239,8 @@ def launch(args) -> None:
             if not selected_methods:
                 raise ValueError("Select at least one defense method to run.")
             args.defense_method = selected_methods[0]
-            args.comparison_methods = ",".join(selected_methods)
             args.compare = len(selected_methods) > 1
+            args.comparison_methods = ",".join(selected_methods) if args.compare else None
             args.output_directory = values["output"].get().strip() or None
             args.manifest_path = values["manifest"].get().strip() or None
             args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
@@ -265,6 +266,12 @@ def launch(args) -> None:
             messagebox.showerror("Unable to run", str(exc))
             return
         print(f"Writing results to {config.logging.output_directory}", flush=True)
+        print(
+            f"Configured steps: recon={config.phases.recon_steps}, "
+            f"attack={config.phases.attack_steps}, recovery={config.phases.recovery_steps}, "
+            f"effective_total={config.total_steps}",
+            flush=True,
+        )
         live = bool(values["live_view"].get()) and not args.seeds and not args.compare
         if values["live_view"].get() and (args.seeds or args.compare):
             print("Live maps play only for a single-method, single-seed run.", flush=True)

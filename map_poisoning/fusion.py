@@ -63,6 +63,7 @@ class FusionEngine:
         self.blocked_probability_threshold = blocked_probability_threshold
         self.report_history: dict[str, StoredClaim] = {}
         self._active: dict[tuple[int, tuple[int, int]], StoredClaim] = {}
+        self._claims_grouped: dict[tuple[int, int], list[StoredClaim]] | None = None
 
     @property
     def method(self) -> str:
@@ -72,14 +73,42 @@ class FusionEngine:
         self._runner.set_time(step)
 
     def prune(self, step: int | None = None) -> int:
-        return self._runner.prune(step)
+        removed = self._runner.prune(step)
+        if removed:
+            active_keys = set(self._runner.active_claims.keys())
+            self._active = {key: item for key, item in self._active.items() if key in active_keys}
+            self._invalidate_claims_cache()
+        return removed
+
+    def _invalidate_claims_cache(self) -> None:
+        self._claims_grouped = None
 
     @property
     def claims(self) -> dict[tuple[int, int], list[StoredClaim]]:
-        grouped: dict[tuple[int, int], list[StoredClaim]] = {}
-        for item in self._active.values():
-            grouped.setdefault(item.report.target_cell, []).append(item)
-        return grouped
+        if self._claims_grouped is None:
+            grouped: dict[tuple[int, int], list[StoredClaim]] = {}
+            for item in self._active.values():
+                grouped.setdefault(item.report.target_cell, []).append(item)
+            self._claims_grouped = grouped
+        return self._claims_grouped
+
+    def claims_at(self, cell: tuple[int, int]) -> tuple[StoredClaim, ...]:
+        """Return stored claims at one cell without rebuilding the grouped map."""
+        cell = tuple(cell)
+        return tuple(
+            self._active[(claim.sender_id, cell)]
+            for claim in self._runner.claims_for(cell)
+            if (claim.sender_id, cell) in self._active
+        )
+
+    def retract(self, report: ClaimReport) -> bool:
+        """Remove a contradicted claim from operational fusion state."""
+        key = (report.sender_id, tuple(report.target_cell))
+        if key not in self._active:
+            return False
+        del self._active[key]
+        self._invalidate_claims_cache()
+        return self._runner.retract_active(report.sender_id, report.target_cell)
 
     def add(self, report: ClaimReport, influence: float = 1.0, is_malicious: bool = False) -> StoredClaim | None:
         if not 0.0 <= report.confidence <= 1.0:
@@ -90,6 +119,7 @@ class FusionEngine:
         previous = self._active.get((report.sender_id, report.target_cell))
         if applied:
             self._active[(report.sender_id, report.target_cell)] = item
+            self._invalidate_claims_cache()
             return previous
         return previous
 
@@ -118,6 +148,14 @@ class FusionEngine:
     def routing_cost(self, cell: tuple[int, int], step: int) -> float:
         self.set_time(step)
         return self._runner.routing_cost(cell, step)
+
+    def soft_routing_cost(self, cell: tuple[int, int], step: int) -> float:
+        """Peer-influence cost without trust-threshold hard blocks."""
+        self.set_time(step)
+        if self.method != "trust_threshold":
+            return self.routing_cost(cell, step)
+        risk = self._runner.normalized_occupied_risk(cell, step)
+        return 1.0 + self.cost_scale * (risk ** self.cost_exponent)
 
     def routing_cost_excluding_sender(
         self,

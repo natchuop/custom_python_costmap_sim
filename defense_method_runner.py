@@ -228,6 +228,20 @@ class DefenseMethodRunner:
     def claims_for(self, cell: Cell) -> Tuple[StoredClaim, ...]:
         return tuple(self.claims_by_cell.get(tuple(cell), ()))
 
+    def retract_active(self, sender_id: int, cell: Cell) -> bool:
+        """Drop the active claim from one sender at one cell."""
+        cell = tuple(cell)
+        key = (int(sender_id), cell)
+        claim = self.active_claims.pop(key, None)
+        if claim is None:
+            return False
+        bucket = self.claims_by_cell.get(cell)
+        if bucket:
+            self.claims_by_cell[cell] = [item for item in bucket if item is not claim]
+            if not self.claims_by_cell[cell]:
+                del self.claims_by_cell[cell]
+        return True
+
     def _claim_impact(self, claim: int) -> float:
         if claim == BLOCKED_CLAIM:
             return 1.0
@@ -453,7 +467,22 @@ class DefenseMethodRunner:
                 excluded_sender_id=excluded_sender_id,
                 excluded_claim_predicate=excluded_claim_predicate,
             ) > 0.0
-        if self.method not in ("hard_threshold", "trust_threshold"):
+        if self.method == "trust_threshold":
+            now = self.current_timestamp if timestamp is None else int(timestamp)
+            for claim in self.claims_for(tuple(cell)):
+                if (
+                    now - claim.timestamp > self.config.max_claim_age
+                    or not self._claim_included(
+                        claim, excluded_sender_id, excluded_claim_predicate
+                    )
+                ):
+                    continue
+                if claim.claim != BLOCKED_CLAIM:
+                    continue
+                if self._method_weight(claim, now) > 0.0:
+                    return True
+            return False
+        if self.method not in ("hard_threshold",):
             return False
         probability = self.occupancy_probability(
             cell,

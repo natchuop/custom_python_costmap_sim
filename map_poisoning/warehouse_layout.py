@@ -180,20 +180,44 @@ def choose_strategic_action_points(grid, count: int, forbidden=None) -> list[tup
     return selected
 
 
-def build_delivery_tasks(action_points, num_robots=DEFAULT_NUM_ROBOTS, tasks_per_robot=100):
+def _robot_action_points(
+    action_points: list[tuple[int, int]],
+    *,
+    start: tuple[int, int] | None,
+) -> list[tuple[int, int]]:
+    points = [tuple(point) for point in action_points]
+    if start is None or start in WAREHOUSE_NARROW_CORRIDOR_CELLS:
+        return points
+    regional = [point for point in points if point not in WAREHOUSE_NARROW_CORRIDOR_CELLS]
+    if len(regional) >= 2:
+        points = regional
+    return sorted(points, key=lambda point: (manhattan(start, point), point))
+
+
+def build_delivery_tasks(
+    action_points,
+    num_robots=DEFAULT_NUM_ROBOTS,
+    tasks_per_robot=100,
+    *,
+    starts_by_robot: dict[int, tuple[int, int]] | None = None,
+):
     if len(action_points) < 2:
         raise ValueError("Need at least two action points to build delivery tasks.")
     offset = max(1, len(action_points) // 2)
     tasks_by_robot = {}
     for robot_id in range(num_robots):
+        robot_points = _robot_action_points(
+            action_points,
+            start=(starts_by_robot or {}).get(robot_id),
+        )
         tasks = []
         for task_idx in range(tasks_per_robot):
-            pickup_index = (robot_id + task_idx) % len(action_points)
-            dropoff_index = (pickup_index + offset) % len(action_points)
-            pickup = action_points[pickup_index]
-            dropoff = action_points[dropoff_index]
+            pickup_index = (robot_id + task_idx) % len(robot_points)
+            dropoff_index = (pickup_index + offset) % len(robot_points)
+            pickup = robot_points[pickup_index]
+            dropoff = robot_points[dropoff_index]
             if pickup == dropoff:
-                dropoff = action_points[(dropoff_index + 1) % len(action_points)]
+                dropoff = robot_points[(dropoff_index + 1) % len(robot_points)]
             tasks.append(DeliveryTask(f"r{robot_id}-task-{task_idx}", pickup, dropoff))
         tasks_by_robot[robot_id] = tuple(tasks)
     return tasks_by_robot
@@ -269,28 +293,58 @@ def _too_close_to_corridor(cell: tuple[int, int], clearance: int = 4) -> bool:
     return any(manhattan(cell, corridor) < clearance for corridor in WAREHOUSE_NARROW_CORRIDOR_CELLS)
 
 
+def _pick_spread_start(
+    grid,
+    chosen: list[tuple[int, int]],
+    blocked: set[tuple[int, int]],
+    *,
+    prefer_upper: bool | None = None,
+) -> tuple[int, int] | None:
+    rows = grid.shape[0]
+    mid_row = rows // 2
+    best = None
+    best_distance = -1
+    for anchor in _map_region_anchors(grid):
+        try:
+            cell = nearest_enterable_cell(grid, anchor, forbidden=blocked)
+        except ValueError:
+            continue
+        if cell in blocked or _too_close_to_corridor(cell):
+            continue
+        if prefer_upper is True and cell[0] >= mid_row:
+            continue
+        if prefer_upper is False and cell[0] < mid_row:
+            continue
+        distance = min(manhattan(cell, old) for old in chosen)
+        if distance > best_distance:
+            best = cell
+            best_distance = distance
+    return best
+
+
 def choose_spread_out_starts(grid, count: int, forbidden=None) -> list[tuple[int, int]]:
-    """Attacker starts in the bay; the other robots spawn from map-region anchors."""
+    """Attacker starts in the bay; benign robots spawn in opposite map halves."""
     blocked = set(forbidden or ())
     attacker = WAREHOUSE_ATTACKER_START if _is_free(grid, WAREHOUSE_ATTACKER_START) else nearest_enterable_cell(
         grid, WAREHOUSE_ATTACKER_START, blocked
     )
     chosen = [attacker]
     blocked = blocked | {attacker} | set(WAREHOUSE_NARROW_CORRIDOR_CELLS)
+    mid_row = grid.shape[0] // 2
+    first_benign = _pick_spread_start(grid, chosen, blocked)
+    if first_benign is not None:
+        chosen.append(first_benign)
+        blocked.add(first_benign)
+    if len(chosen) < count and first_benign is not None:
+        prefer_upper = first_benign[0] >= mid_row
+        second_benign = _pick_spread_start(grid, chosen, blocked, prefer_upper=prefer_upper)
+        if second_benign is None:
+            second_benign = _pick_spread_start(grid, chosen, blocked)
+        if second_benign is not None:
+            chosen.append(second_benign)
+            blocked.add(second_benign)
     while len(chosen) < count:
-        best = None
-        best_distance = -1
-        for anchor in _map_region_anchors(grid):
-            try:
-                cell = nearest_enterable_cell(grid, anchor, forbidden=blocked)
-            except ValueError:
-                continue
-            if cell in blocked or _too_close_to_corridor(cell):
-                continue
-            distance = min(manhattan(cell, old) for old in chosen)
-            if distance > best_distance:
-                best = cell
-                best_distance = distance
+        best = _pick_spread_start(grid, chosen, blocked)
         if best is None:
             break
         chosen.append(best)
@@ -367,6 +421,11 @@ def build_warehouse_layout(grid, deliveries_per_robot: int):
         else:
             action_points.append(WAREHOUSE_CORRIDOR_DELIVERY)
     goals = list(action_points)
-    tasks = build_delivery_tasks(action_points, DEFAULT_NUM_ROBOTS, deliveries_per_robot)
+    tasks = build_delivery_tasks(
+        action_points,
+        DEFAULT_NUM_ROBOTS,
+        deliveries_per_robot,
+        starts_by_robot=starts,
+    )
     tasks = repair_delivery_tasks(grid, tasks, starts, action_points)
     return starts, goals, tasks

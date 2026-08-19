@@ -136,11 +136,11 @@ def _map_error(robot: ModularRobot, world: World, step: int) -> float:
     """Operational map disagreement over non-static cells (unknown is free)."""
     errors = 0
     total = 0
-    for row in range(robot.belief.rows):
-        for col in range(robot.belief.cols):
-            cell = (row, col)
-            if robot.belief.static_grid[cell]:
-                continue
+    candidate_cells = set(robot.belief.direct)
+    candidate_cells.update(robot.fusion._runner.claims_by_cell.keys())
+    for cell in candidate_cells:
+        if robot.belief.static_grid[cell]:
+            continue
             direct = robot.belief.direct_state(cell, step)
             predicted_blocked = (
                 direct == ClaimType.BLOCKED
@@ -168,6 +168,8 @@ def run_manifest_rollout(
     config: SimulationConfig,
     manifest: ScenarioManifest,
     method: str,
+    *,
+    show_progress: bool = True,
 ) -> tuple[World, list[ModularRobot], dict]:
     """Replay a manifest without importing the retired simulator."""
     world = World(np.asarray(manifest.static_grid, dtype=np.uint8), manifest.obstacle_episodes)
@@ -201,10 +203,15 @@ def run_manifest_rollout(
     max_steps = config.total_steps
     serial = 0
     live_note = "heatmap then live maps" if config.visualization.animation else "no live animation"
-    print(f"Simulating {max_steps} steps with {method} ({live_note})...", flush=True)
+    if show_progress:
+        print(f"Simulating {max_steps} steps with {method} ({live_note})...", flush=True)
+    route_eval_period = max(1, int(config.visualization.route_impact_eval_period_steps))
+    latest_route_metrics: dict[int, tuple[float, bool]] = {
+        robot.robot_id: (0.0, False) for robot in robots
+    }
 
     for step in range(max_steps):
-        if step == 0 or (step + 1) % 200 == 0 or step + 1 == max_steps:
+        if show_progress and (step == 0 or (step + 1) % 200 == 0 or step + 1 == max_steps):
             print(f"  step {step + 1}/{max_steps}", flush=True)
         phase = _phase(config, step)
         log["phase"].append(phase)
@@ -246,11 +253,8 @@ def run_manifest_rollout(
         apply_verification()
 
         deliveries: dict[int, list[ClaimReport]] = {robot.robot_id: [] for robot in robots}
-        # Benign robots share local observations. The attacker only injects the
-        # authored malicious reports, so honest lidar from R0 cannot inflate trust.
+        # Robots share local observations throughout all phases.
         for robot in robots:
-            if robot.robot_id == attacker:
-                continue
             for observation in observations_by_robot[robot.robot_id]:
                 if not robot.should_share_observation(observation.cell, observation.claim, step):
                     continue
@@ -370,12 +374,14 @@ def run_manifest_rollout(
             })
 
         for robot in robots:
-            route_cost, route_affected = _route_attacker_cost(
-                robot,
-                attacker,
-                step,
-                config.visualization.route_impact_min_cost_delta,
-            )
+            if step < route_eval_period or step % route_eval_period == 0 or step == max_steps - 1:
+                latest_route_metrics[robot.robot_id] = _route_attacker_cost(
+                    robot,
+                    attacker,
+                    step,
+                    config.visualization.route_impact_min_cost_delta,
+                )
+            route_cost, route_affected = latest_route_metrics[robot.robot_id]
             active_fake_claims = sum(
                 1
                 for item in robot.fusion.report_history.values()
@@ -512,6 +518,10 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
 
 def replay_manifest(config: SimulationConfig, manifest: ScenarioManifest, method: str, output_directory: Path, *, show_animation: bool = False) -> SimpleNamespace:
     world, robots, log = run_manifest_rollout(config, manifest, method)
+    if show_animation:
+        print("Opening reconnaissance heatmap, then live belief-map windows...", flush=True)
+        from .live_view import show_live_windows
+        show_live_windows(log, world, robots, block=True)
     summary, collector = collect_rollout_metrics(config, manifest, method, world, robots, log)
     output_directory.mkdir(parents=True, exist_ok=True)
     print("Writing CSVs and diagrams...", flush=True)
@@ -524,10 +534,20 @@ def replay_manifest(config: SimulationConfig, manifest: ScenarioManifest, method
             warning = f"Warning: plot generation failed for {output_directory}: {exc}"
             print(warning)
             (output_directory / "plot_generation_error.txt").write_text(warning + "\n", encoding="utf-8")
-    if show_animation:
-        print("Opening reconnaissance heatmap, then live belief-map windows...", flush=True)
-        from .live_view import show_live_windows
-        show_live_windows(log, world, robots, block=True)
+    if manifest.reconnaissance_heatmap is not None:
+        from .recon_authoring import save_traffic_heatmap_artifacts
+        save_traffic_heatmap_artifacts(
+            output_directory,
+            np.asarray(manifest.reconnaissance_heatmap, dtype=np.int32),
+            title=f"Reconnaissance traffic heatmap | seed {config.seed}",
+        )
+    elif log.get("live", {}).get("recon_heatmap") is not None:
+        from .recon_authoring import save_traffic_heatmap_artifacts
+        save_traffic_heatmap_artifacts(
+            output_directory,
+            np.asarray(log["live"]["recon_heatmap"], dtype=np.int32),
+            title=f"Reconnaissance traffic heatmap | seed {config.seed}",
+        )
     effective = config.to_dict() | {"effective_method": method, "engine": "modular_native"}
     CsvMetrics.config(output_directory / "effective_config.json", effective)
     return SimpleNamespace(output_directory=output_directory, method=method, summary=summary, world=world, robots=robots, log=log)

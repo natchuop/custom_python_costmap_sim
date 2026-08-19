@@ -119,7 +119,7 @@ def config_from_args(args):
     enabled=() if args.attacks == "none" else tuple(x for x in args.attacks.split(",") if x)
     output_directory = args.output_directory or suggested_output_directory_from_args(args)
     raw_methods = getattr(args, "comparison_methods", None)
-    comparison_methods = tuple(item.strip() for item in str(raw_methods).split(",") if item.strip()) if raw_methods else PRIMARY_METHODS
+    comparison_methods = tuple(item.strip() for item in str(raw_methods).split(",") if item.strip()) if raw_methods else (args.defense_method,)
     return SimulationConfig(
         seed=args.seed,
         phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),
@@ -131,7 +131,7 @@ def config_from_args(args):
             animation=not args.no_animation and not args.headless,
             map_view=getattr(args, "map_view", "combined"),
         ),
-        comparison_methods=comparison_methods or PRIMARY_METHODS,
+        comparison_methods=comparison_methods or (args.defense_method,),
         manifest_path=args.manifest_path,
         map_npy=args.map_npy,
         map_movingai=args.map_movingai,

@@ -46,6 +46,29 @@ class RobotBeliefMap:
         claim, freshness = self.observation_status(cell, step)
         return claim if freshness == "fresh" else None
 
+    def display_state(self, cell: Cell, step: int | None = None, *, max_age: int | None = None) -> ClaimType | None:
+        """Return a direct observation for map display until it ages out."""
+        if not self.in_bounds(cell) or self.static_grid[cell]:
+            return ClaimType.BLOCKED
+        item = self.direct.get(cell)
+        if item is None:
+            return None
+        if step is not None:
+            age_limit = self.memory_steps if max_age is None else max(0, int(max_age))
+            if step - item.step > age_limit:
+                return None
+        return item.claim
+
+    def prune_expired(self, step: int, *, max_age: int | None = None) -> int:
+        """Drop direct observations older than the configured retention window."""
+        age_limit = self.memory_steps if max_age is None else max(0, int(max_age))
+        removed = 0
+        for cell in list(self.direct):
+            if step - self.direct[cell].step > age_limit:
+                del self.direct[cell]
+                removed += 1
+        return removed
+
     def has_direct_free(self, cell: Cell, step: int | None = None) -> bool:
         return self.direct_state(cell, step) == ClaimType.FREE
 
@@ -53,10 +76,14 @@ class RobotBeliefMap:
         if not self.in_bounds(cell) or self.static_grid[cell]:
             return True
         claim, freshness = self.observation_status(cell, step)
-        if freshness == "fresh" and claim == ClaimType.BLOCKED:
+        # Directly observed blocks should continue to block navigation even
+        # after they become "stale" for the FREE/peer-arbitration logic.
+        # This keeps navigation consistent with the UI, which can still show
+        # prior blocked observations until they are pruned.
+        if claim == ClaimType.BLOCKED and freshness in ("fresh", "stale"):
             return True
-        if freshness == "fresh" and claim == ClaimType.FREE:
-            # A robot currently looking at a free cell cannot be hard-blocked by peers.
+        if claim == ClaimType.FREE and freshness in ("fresh", "stale"):
+            # Explored clear cells stay open even when trusted peers report BLOCKED.
             return False
         check = hard_blocked_fn or (lambda: fusion.footprint_hard_blocked([cell], step))
         return bool(check())

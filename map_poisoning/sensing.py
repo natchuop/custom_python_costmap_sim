@@ -20,11 +20,12 @@ def lidar_observations(
   rows, cols = truth_grid.shape
   seen: dict[tuple[int, int], ClaimType] = {}
   radius = 5
-  occupied_by_robot = set(other_positions or ())
   for row in range(max(0, position[0] - radius), min(rows, position[0] + radius + 1)):
     for col in range(max(0, position[1] - radius), min(cols, position[1] + radius + 1)):
       cell = (row, col)
-      if abs(row - position[0]) + abs(col - position[1]) > radius or cell in occupied_by_robot:
+      if abs(row - position[0]) + abs(col - position[1]) > radius:
         continue
+      # Peer robots are not environmental obstacles. Keep sensing world occupancy
+      # under/around them so trusted fake obstacles there can still be verified.
       seen[cell] = ClaimType.BLOCKED if truth_grid[cell] else ClaimType.FREE
   return seen

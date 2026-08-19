@@ -22,8 +22,16 @@ def test_trust_threshold_method_zeros_untrusted_influence():
     engine.add(report("blocked", 0, ClaimType.BLOCKED))
     high = engine.evidence((2, 2), 0)
     assert high > 0
+    assert engine.blocked((2, 2), 0)
     trust[0] = 0.20
     assert engine.evidence((2, 2), 0) == 0
+    assert not engine.blocked((2, 2), 0)
+
+
+def test_trust_threshold_trusted_blocked_report_hard_blocks():
+    engine = FusionEngine("trust_threshold", lambda _: 0.70, trust_threshold=0.55)
+    engine.add(report("blocked", 1, ClaimType.BLOCKED))
+    assert engine.blocked((2, 2), 0)
 
 
 def test_primary_weighting_contracts_and_active_replacement():
@@ -80,6 +88,14 @@ def test_stale_direct_free_allows_peer_blocked_cost():
     assert belief.traversal_cost((2, 2), 2, fusion) == 1.0
     assert belief.traversal_cost((2, 2), 3, fusion) > 1.0
     assert not belief.has_direct_free((2, 2), 3)
+
+
+def test_display_state_outlasts_planning_memory():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=2)
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 0))
+    assert belief.direct_state((2, 2), 5) is None
+    assert belief.display_state((2, 2), 5, max_age=10) == ClaimType.FREE
+    assert belief.display_state((2, 2), 11, max_age=10) is None
 
 
 def test_manifest_has_exact_three_robot_team():

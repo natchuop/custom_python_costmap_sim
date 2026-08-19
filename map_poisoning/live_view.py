@@ -111,17 +111,64 @@ def _paint_overlays(arr, overlays, *, attacker_view: bool):
     return arr
 
 
-def _dominant_blocked_sender(robot, cell, step):
-    items = robot.fusion.claims.get(cell) or ()
+def _dominant_blocked_sender(robot, items, step):
+    threshold = float(getattr(robot, "trust_threshold", 0.0))
     blocked = []
     for item in items:
         if int(item.report.claim) != int(ClaimType.BLOCKED):
             continue
-        blocked.append((robot.trust.score(item.report.sender_id), item.report.sender_id))
+        if step - int(item.report.observation_step) > robot.fusion.max_claim_age:
+            continue
+        score = robot.trust.score(item.report.sender_id)
+        if score < threshold:
+            continue
+        blocked.append((score, item.report.sender_id))
     if not blocked:
         return None
     blocked.sort(reverse=True)
     return blocked[0][1]
+
+
+def _attack_cell_index(log, step: int, display_age: int) -> dict[tuple[int, int], int]:
+    """Map attack BLOCKED cells to attacker id for the current playback step."""
+    attacker = log.get("malicious_robot_id")
+    if attacker is None:
+        return {}
+    indexed: dict[tuple[int, int], int] = {}
+    for event in log.get("attack_events", ()):
+        event_step = int(event.step)
+        if event_step > step or step - event_step > display_age:
+            continue
+        if int(event.claim) != int(ClaimType.BLOCKED):
+            continue
+        for cell in event.cells:
+            indexed[tuple(cell)] = int(attacker)
+    return indexed
+
+
+def _paint_trusted_attack_reports(arr, robot, log, step, threshold: float) -> None:
+    """Paint trusted attacker BLOCKED attack claims on victim belief maps."""
+    attacker = log.get("malicious_robot_id")
+    if attacker is None or robot.robot_id == attacker:
+        return
+    if robot.trust.score(attacker) < threshold:
+        return
+    color = ROBOT_DISPLAY.get(attacker, DISPLAY_BLOCKED)
+    display_age = int(getattr(robot.fusion, "max_claim_age", 900))
+    for cell, source in _attack_cell_index(log, step, display_age).items():
+        row, col = cell
+        if not (0 <= row < arr.shape[0] and 0 <= col < arr.shape[1]):
+            continue
+        if arr[row, col] == DISPLAY_STATIC:
+            continue
+        if _fresh_direct_free(robot, cell, step):
+            continue
+        if not any(
+            item.report.sender_id == attacker and item.report.claim == ClaimType.BLOCKED
+            for item in robot.fusion.claims_at(cell)
+        ):
+            continue
+        arr[row, col] = color
 
 
 def truth_display_grid(world, robots, log, step):
@@ -136,14 +183,30 @@ def truth_display_grid(world, robots, log, step):
     return arr
 
 
+def _direct_display_state(robot, cell, step, display_age):
+    return robot.belief.display_state(cell, step, max_age=display_age)
+
+
+def _fresh_direct_free(robot, cell, step) -> bool:
+    claim, freshness = robot.belief.observation_status(cell, step)
+    return freshness == "fresh" and claim == ClaimType.FREE
+
+
+def _explored_clear(robot, cell, step, display_age) -> bool:
+    return _direct_display_state(robot, cell, step, display_age) == ClaimType.FREE
+
+
 def local_display_grid(robot, world, step):
     rows, cols = world.static_grid.shape
     arr = np.full((rows, cols), DISPLAY_UNKNOWN, dtype=np.int16)
     arr[world.static_grid.astype(bool)] = DISPLAY_STATIC
     own = ROBOT_DISPLAY.get(robot.robot_id, DISPLAY_BLOCKED)
-    for cell, observation in robot.belief.direct.items():
-        claim, freshness = robot.belief.observation_status(cell, step)
-        if freshness != "fresh" or claim is None or arr[cell] == DISPLAY_STATIC:
+    display_age = robot.fusion.max_claim_age
+    for cell in robot.belief.direct:
+        if arr[cell] == DISPLAY_STATIC:
+            continue
+        claim = _direct_display_state(robot, cell, step, display_age)
+        if claim is None:
             continue
         if claim == ClaimType.FREE:
             arr[cell] = DISPLAY_FREE
@@ -158,24 +221,52 @@ def local_display_grid(robot, world, step):
     return arr
 
 
-def combined_display_grid(robot, world, log, step):
+def combined_display_grid(robot, world, log, step, robots):
     arr = local_display_grid(robot, world, step)
     robot.fusion.set_time(step)
     own = ROBOT_DISPLAY.get(robot.robot_id, DISPLAY_BLOCKED)
-    for cell, items in robot.fusion.claims.items():
+    display_age = robot.fusion.max_claim_age
+    claims_by_cell = robot.fusion.claims
+    for cell, items in claims_by_cell.items():
         if arr[cell] == DISPLAY_STATIC or not items:
             continue
-        claim, freshness = robot.belief.observation_status(cell, step)
-        locally_blocked = freshness == "fresh" and claim == ClaimType.BLOCKED
-        if locally_blocked:
+        # Only a fresh direct clear sighting clears trusted peer obstacles.
+        if _fresh_direct_free(robot, cell, step):
+            arr[cell] = DISPLAY_FREE
+            continue
+        direct = _direct_display_state(robot, cell, step, display_age)
+        if direct == ClaimType.BLOCKED:
             arr[cell] = own
             continue
-        if not (robot.fusion.blocked(cell, step) or robot.fusion.probability(cell, step) >= 0.5):
-            continue
-        sender = _dominant_blocked_sender(robot, cell, step)
-        arr[cell] = ROBOT_DISPLAY.get(sender, DISPLAY_BLOCKED) if sender is not None else DISPLAY_BLOCKED
+        sender = _dominant_blocked_sender(robot, items, step)
+        if sender is not None:
+            arr[cell] = ROBOT_DISPLAY.get(sender, DISPLAY_BLOCKED)
+        elif _explored_clear(robot, cell, step, display_age):
+            arr[cell] = DISPLAY_FREE
     attacker = log.get("malicious_robot_id")
     _paint_overlays(arr, _overlay_groups(log, step), attacker_view=robot.robot_id == attacker)
+
+    # Visualize trusted peers' own direct BLOCKED observations.
+    # Clear cells stay uncolored; only obstacles use the source robot color.
+    threshold = float(getattr(robot, "trust_threshold", 0.0))
+    for peer in robots:
+        if peer.robot_id == robot.robot_id:
+            continue
+        if robot.trust.score(peer.robot_id) < threshold:
+            continue
+        peer_color = ROBOT_DISPLAY.get(peer.robot_id, DISPLAY_BLOCKED)
+        for cell in peer.belief.direct:
+            if arr[cell] == DISPLAY_STATIC:
+                continue
+            if _fresh_direct_free(robot, cell, step):
+                continue
+            claim = peer.belief.display_state(cell, step, max_age=display_age)
+            if claim != ClaimType.BLOCKED:
+                continue
+            arr[cell] = peer_color
+
+    _paint_trusted_attack_reports(arr, robot, log, step, threshold)
+
     if not robot.completed:
         task = robot.tasks[robot.task_index]
         goal = task.dropoff if robot.carrying else task.pickup
@@ -185,13 +276,13 @@ def combined_display_grid(robot, world, log, step):
     return arr
 
 
-def belief_display_grid(robot, world, log, step, map_view="combined"):
+def belief_display_grid(robot, world, log, step, map_view="combined", robots=None):
     if map_view == "local":
         arr = local_display_grid(robot, world, step)
         attacker = log.get("malicious_robot_id")
         _paint_overlays(arr, _overlay_groups(log, step), attacker_view=robot.robot_id == attacker)
         return arr
-    return combined_display_grid(robot, world, log, step)
+    return combined_display_grid(robot, world, log, step, robots or (robot,))
 
 
 def init_live_log(log, world, robots, config, manifest) -> None:
@@ -231,14 +322,17 @@ def record_live_frame(log, world, robots, step, phase) -> None:
         return
     live["truth"].append(truth_display_grid(world, robots, log, step))
     attacker = log["malicious_robot_id"]
+    map_view = live.get("map_view", "combined")
     snapshot = {}
     for robot in robots:
         rid = robot.robot_id
-        live["local_beliefs"][rid].append(local_display_grid(robot, world, step))
-        combined = combined_display_grid(robot, world, log, step)
-        live["combined_beliefs"][rid].append(combined)
-        selected = live["local_beliefs"][rid][-1] if live["map_view"] == "local" else combined
-        live["beliefs"][rid].append(selected)
+        if map_view == "local":
+            grid = local_display_grid(robot, world, step)
+            live["local_beliefs"][rid].append(grid)
+        else:
+            grid = combined_display_grid(robot, world, log, step, robots)
+            live["combined_beliefs"][rid].append(grid)
+        live["beliefs"][rid].append(grid)
         live["positions"][rid].append(robot.position)
         live["paths"][rid].append(list(robot.path or ()))
         live["trust"][rid].append(robot.trust.score(attacker))
@@ -346,10 +440,14 @@ def show_traffic_heatmap(log, *, show=True):
     seed_label = f"seed {seed}" if seed is not None else "seed unknown"
     overlay = np.array(heat, dtype=float)
     overlay[truth == DISPLAY_STATIC] = np.nan
+    valid = overlay[np.isfinite(overlay)]
+    vmax = float(np.nanpercentile(valid, 99.0)) if valid.size else None
+    if vmax is not None and vmax <= 0:
+        vmax = None
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.imshow(truth, cmap=_CMAP, norm=_NORM, origin="upper", alpha=0.35)
-    image = ax.imshow(overlay, origin="upper", alpha=0.82, cmap="hot")
-    title = f"Reconnaissance heatmap | {seed_label} | step {recon_end} (higher = more benign traffic)"
+    image = ax.imshow(overlay, origin="upper", alpha=0.82, cmap="hot", vmin=0, vmax=vmax)
+    title = f"Reconnaissance heatmap | {seed_label} | step {recon_end} (benign dwell steps during recon)"
     ax.set(title=title, xlabel="col", ylabel="row")
     _set_window_title(fig, f"Reconnaissance heatmap | {seed_label}")
     fig.colorbar(image, ax=ax, label="benign traffic count")
@@ -484,12 +582,14 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     latest_attack_text = latest_attack_ax.text(0.05, 0.90, "", fontsize=10, va="top", family="DejaVu Sans Mono", transform=latest_attack_ax.transAxes)
     sharing_ax.text(
         0.01, 0.50,
-        "Occupied peer cells use the source robot's color. "
-        "Multiple trusted sources use the highest-trust color.",
+        "Direct clear sight paints white; gray is unexplored. "
+        "Trusted attacker fake obstacles use Robot 0 purple until fresh lidar clears them.",
         fontsize=8.5, va="center", transform=sharing_ax.transAxes,
     )
     legend_ax.legend(
         handles=[
+            Patch(facecolor="#ffffff", edgecolor="#cccccc", label="Explored clear"),
+            Patch(facecolor="#bdbdbd", label="Unexplored"),
             Patch(facecolor="#222222", label="Static obstacle"),
             Patch(facecolor="#43a047", label="Temporary physical obstacle"),
             Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),

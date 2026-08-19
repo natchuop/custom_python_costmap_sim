@@ -36,11 +36,22 @@ class _PlanningBelief:
         return self._belief.in_bounds(cell)
 
     def is_blocked_for_planning(self, cell: tuple[int, int]) -> bool:
-        return cell in self._temporarily_blocked or self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
+        if cell in self._temporarily_blocked:
+            return True
+        claim, freshness = self._belief.observation_status(cell, self._step)
+        if self._fusion.method == "trust_threshold" and freshness == "unknown":
+            return False
+        return self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
 
     def traversal_cost(self, cell: tuple[int, int]) -> float:
         if cell in self._temporarily_blocked:
             return math.inf
+        claim, freshness = self._belief.observation_status(cell, self._step)
+        if self._fusion.method == "trust_threshold" and freshness == "unknown":
+            peer_cost = self._fusion.soft_routing_cost(cell, self._step)
+            if math.isinf(peer_cost):
+                return math.inf
+            return max(self._belief.UNKNOWN_TRAVERSAL_COST, peer_cost)
         return self._belief.traversal_cost(cell, self._step, self._fusion)
 
 
@@ -90,6 +101,7 @@ class ModularRobot:
     last_source_linked_replan_step: int = -10**9
     last_shared_claim: dict[tuple[int, int], ClaimType] = field(default_factory=dict)
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
+    verified_reports: set[str] = field(default_factory=set)
     defense_replan_needed: bool = False
     source_linked_replan_context: dict | None = None
     accepted_reports: int = 0
@@ -128,6 +140,8 @@ class ModularRobot:
 
     @property
     def goal(self) -> tuple[int, int]:
+        if self.completed or self.task_index >= len(self.tasks):
+            return tuple(self.position)
         task = self.tasks[self.task_index]
         return task.dropoff if self.carrying else task.pickup
 
@@ -236,6 +250,7 @@ class ModularRobot:
     def sense(self, world, step: int, other_positions: Iterable[tuple[int, int]]) -> list[DirectObservation]:
         if step % DEFENSE_PRUNE_PERIOD_STEPS == 0:
             self.fusion.prune(step)
+            self.belief.prune_expired(step, max_age=self.fusion.max_claim_age)
         truth = world.truth_grid(step)
         raw = lidar_observations(truth, self.position, other_positions)
         observations: list[DirectObservation] = []
@@ -245,47 +260,118 @@ class ModularRobot:
             observations.append(obs)
         return observations
 
+    def _resolve_observation(self, report: ClaimReport, by_cell: dict, step: int) -> DirectObservation | None:
+        observed = by_cell.get(report.target_cell)
+        if observed is not None:
+            return observed
+        claim, freshness = self.belief.observation_status(report.target_cell, step)
+        if freshness != "fresh" or claim is None:
+            return None
+        return DirectObservation(self.robot_id, report.target_cell, claim, step)
+
+    def _verify_report(
+        self,
+        report: ClaimReport,
+        observed: DirectObservation,
+        step: int,
+        *,
+        results: list,
+        verified_by_sender: dict[int, list[tuple[ClaimReport, bool]]],
+        old_trust_by_sender: dict[int, float],
+        processed: set[str],
+    ) -> None:
+        if report.report_id in processed or report.report_id in self.verified_reports:
+            return
+        if report.received_step is not None and report.received_step == step:
+            return
+        processed.add(report.report_id)
+        self.verified_reports.add(report.report_id)
+        self.pending.pop(report.report_id, None)
+        truth_matches = observed.claim == report.claim
+        sender_id = report.sender_id
+        if sender_id not in old_trust_by_sender:
+            old_trust_by_sender[sender_id] = self.trust.score(sender_id)
+        outcome = (
+            VerificationOutcome.CONFIRMED
+            if truth_matches
+            else VerificationOutcome.CONTRADICTED_FRESH
+        )
+        evidence_before = self.fusion.evidence(report.target_cell, step)
+        probability_before = self.fusion.probability(report.target_cell, step)
+        trust_severity = 1.0
+        if outcome == VerificationOutcome.CONTRADICTED_FRESH:
+            fake_obstacle = report.claim == ClaimType.BLOCKED and observed.claim == ClaimType.FREE
+            fake_clearance = report.claim == ClaimType.FREE and observed.claim == ClaimType.BLOCKED
+            if fake_obstacle or fake_clearance:
+                trust_severity = 2.5
+        old_trust, new_trust = self.trust.update(sender_id, outcome, severity=trust_severity)
+        evidence_after = self.fusion.evidence(report.target_cell, step)
+        probability_after = self.fusion.probability(report.target_cell, step)
+        results.append(
+            (
+                report,
+                outcome,
+                old_trust,
+                new_trust,
+                evidence_before,
+                evidence_after,
+                probability_before,
+                probability_after,
+            )
+        )
+        verified_by_sender.setdefault(sender_id, []).append((report, truth_matches))
+        if outcome == VerificationOutcome.CONTRADICTED_FRESH:
+            if report.claim == ClaimType.BLOCKED and observed.claim == ClaimType.FREE:
+                self.belief.observe(
+                    DirectObservation(self.robot_id, report.target_cell, ClaimType.FREE, step)
+                )
+            elif report.claim == ClaimType.FREE and observed.claim == ClaimType.BLOCKED:
+                self.belief.observe(
+                    DirectObservation(self.robot_id, report.target_cell, ClaimType.BLOCKED, step)
+                )
+            self.fusion.retract(report)
+
     def verify(self, observations: Iterable[DirectObservation], step: int):
         results = []
         by_cell = {item.cell: item for item in observations}
         verified_by_sender: dict[int, list[tuple[ClaimReport, bool]]] = {}
         old_trust_by_sender: dict[int, float] = {}
+        processed: set[str] = set()
 
-        for report_id, report in list(self.pending.items()):
-            observed = by_cell.get(report.target_cell)
+        for report in list(self.pending.values()):
+            observed = self._resolve_observation(report, by_cell, step)
             if observed is None:
-                claim, freshness = self.belief.observation_status(report.target_cell, step)
-                if freshness != "fresh" or claim is None:
+                continue
+            self._verify_report(
+                report,
+                observed,
+                step,
+                results=results,
+                verified_by_sender=verified_by_sender,
+                old_trust_by_sender=old_trust_by_sender,
+                processed=processed,
+            )
+
+        # Stored peer BLOCKED claims can outlive the one-shot pending queue.
+        # Re-check them whenever fresh direct sensing shows the cell is clear.
+        for cell, observed in by_cell.items():
+            if observed.claim != ClaimType.FREE:
+                continue
+            for item in self.fusion.claims_at(cell):
+                report = item.report
+                if report.claim != ClaimType.BLOCKED:
                     continue
-                observed = DirectObservation(self.robot_id, report.target_cell, claim, step)
-            truth_matches = observed.claim == report.claim
-            sender_id = report.sender_id
-            if sender_id not in old_trust_by_sender:
-                old_trust_by_sender[sender_id] = self.trust.score(sender_id)
-            outcome = (
-                VerificationOutcome.CONFIRMED
-                if truth_matches
-                else VerificationOutcome.CONTRADICTED_FRESH
-            )
-            evidence_before = self.fusion.evidence(report.target_cell, step)
-            probability_before = self.fusion.probability(report.target_cell, step)
-            old_trust, new_trust = self.trust.update(sender_id, outcome)
-            evidence_after = self.fusion.evidence(report.target_cell, step)
-            probability_after = self.fusion.probability(report.target_cell, step)
-            results.append(
-                (
+                if report.received_step is not None and report.received_step == step:
+                    continue
+                self._verify_report(
                     report,
-                    outcome,
-                    old_trust,
-                    new_trust,
-                    evidence_before,
-                    evidence_after,
-                    probability_before,
-                    probability_after,
+                    observed,
+                    step,
+                    results=results,
+                    verified_by_sender=verified_by_sender,
+                    old_trust_by_sender=old_trust_by_sender,
+                    processed=processed,
                 )
-            )
-            verified_by_sender.setdefault(sender_id, []).append((report, truth_matches))
-            del self.pending[report_id]
 
         if self.fusion.method == "source_linked" and verified_by_sender:
             route_cells = self._source_linked_route_cells(step)
@@ -337,11 +423,16 @@ class ModularRobot:
         old_cost = sum(self.fusion.routing_cost(cell, step) for cell in old) if old else None
         self.fusion.set_time(step)
         adapter = _PlanningBelief(self.belief, self.fusion, step, temporarily_blocked)
-        self.path = astar(
+        planned = astar(
             self.position,
             self.goal,
             lambda cell: adapter.traversal_cost(cell),
         )
+        if planned is None and reason.startswith("traffic_") and old:
+            # A failed traffic detour should not erase a still-valid waiting route.
+            self.path = old
+        else:
+            self.path = planned
         # A missing path is a real no-path condition in the modular engine.
         new = list(self.path or ())
         new_cost = sum(self.fusion.routing_cost(cell, step) for cell in new) if new else None
