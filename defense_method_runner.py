@@ -48,22 +48,12 @@ class StoredClaim:
     trust_at_report: float
     is_malicious: bool = False
 
-@dataclass(frozen=True)
-class EffectivePeerCell:
-    claim: int | None
-    has_active_evidence: bool
-    hard_blocked: bool
-    routing_cost: float
-    evidence: float
-    dominant_source: int | None = None
-    supporting_sources: tuple[int, ...] = ()
-
 
 @dataclass
 class DefenseConfig:
-    """Shared parameters for the selectable occupancy-defense policies."""
+    """Shared parameters for the five occupancy-defense policies."""
 
-    method: str = "trust_threshold"
+    method: str = "source_linked"
     trust_threshold: float = 0.55
     decay_rate: float = 0.01
     cost_scale: float = 8.0
@@ -108,9 +98,8 @@ class DefenseMethodRunner:
           Claim influence decays with age, but sender trust is ignored.
 
       trust_fused:
-          For each cell, the highest-current-trust eligible report wins. Its
-          influence is reduced by report age, so a newer eligible report can
-          replace an older one even when the older sender was initially trusted.
+          Each report is weighted by trust at report time. Later trust changes do
+          not revise old contributions.
 
       source_linked:
           Each report is weighted using current sender trust at planning time.
@@ -118,7 +107,8 @@ class DefenseMethodRunner:
 
       trust_threshold:
           Reports remain stored and verifiable, but current trust below the
-          configured threshold gives them zero operational influence.
+          configured threshold gives them zero operational influence. Occupancy
+          above the blocked-probability cutoff becomes a hard wall.
     """
 
     def __init__(
@@ -238,16 +228,19 @@ class DefenseMethodRunner:
     def claims_for(self, cell: Cell) -> Tuple[StoredClaim, ...]:
         return tuple(self.claims_by_cell.get(tuple(cell), ()))
 
-    def selected_claim(
-        self,
-        cell: Cell,
-        timestamp: Optional[int] = None,
-    ) -> Optional[int]:
-        """Return the operational winner's claim for winner-based methods."""
-        if self.method != "trust_fused":
-            return None
-        winner = self._trust_fused_winner(cell, timestamp)
-        return winner[0].claim if winner is not None else None
+    def retract_active(self, sender_id: int, cell: Cell) -> bool:
+        """Drop the active claim from one sender at one cell."""
+        cell = tuple(cell)
+        key = (int(sender_id), cell)
+        claim = self.active_claims.pop(key, None)
+        if claim is None:
+            return False
+        bucket = self.claims_by_cell.get(cell)
+        if bucket:
+            self.claims_by_cell[cell] = [item for item in bucket if item is not claim]
+            if not self.claims_by_cell[cell]:
+                del self.claims_by_cell[cell]
+        return True
 
     def _claim_impact(self, claim: int) -> float:
         if claim == BLOCKED_CLAIM:
@@ -261,51 +254,6 @@ class DefenseMethodRunner:
     def _age_weight(self, claim: StoredClaim, timestamp: int) -> float:
         age = max(0, int(timestamp) - claim.timestamp)
         return math.exp(-self.config.decay_rate * age)
-
-    def _trust_fused_winner(
-        self,
-        cell: Cell,
-        timestamp: Optional[int] = None,
-    ) -> Optional[Tuple[StoredClaim, float]]:
-        """Return the highest effective-trust eligible report for one cell.
-
-        Eligibility uses the sender's current trust. Ranking then applies a
-        small age decay, which lets a newer eligible report supersede an old
-        one without making trust itself stop updating normally.
-        """
-        now = self.current_timestamp if timestamp is None else int(timestamp)
-        candidates = []
-        for claim in self.claims_by_cell.get(tuple(cell), ()):
-            age = now - claim.timestamp
-            if age < 0 or age > self.config.max_claim_age:
-                continue
-            current_trust = min(1.0, max(0.0, float(self.trust_score(claim.sender_id))))
-            if current_trust < self.config.trust_threshold:
-                continue
-            effective_trust = (
-                claim.confidence
-                * current_trust
-                * self._age_weight(claim, now)
-            )
-            candidates.append((
-                claim,
-                effective_trust,
-                current_trust,
-            ))
-
-        if not candidates:
-            return None
-
-        winner, effective_trust, current_trust = max(
-            candidates,
-            key=lambda item: (
-                item[1],
-                item[2],
-                item[0].timestamp,
-                -item[0].sender_id,
-            ),
-        )
-        return winner, effective_trust
 
     def _method_weight(
         self,
@@ -322,11 +270,7 @@ class DefenseMethodRunner:
             return claim.confidence * self._age_weight(claim, timestamp)
 
         if method == "trust_fused":
-            current_trust = min(
-                1.0,
-                max(0.0, float(self.trust_score(claim.sender_id))),
-            )
-            return claim.confidence * current_trust * self._age_weight(claim, timestamp)
+            return claim.confidence * claim.trust_at_report
 
         if method in ("source_linked", "trust_threshold"):
             trust_value = (
@@ -345,24 +289,49 @@ class DefenseMethodRunner:
 
         raise RuntimeError(f"Unhandled defense method: {method}")
 
-    def evidence(self, cell: Cell, timestamp: Optional[int] = None) -> float:
+    @staticmethod
+    def _claim_included(claim, excluded_sender_id=None, excluded_claim_predicate=None):
+        if excluded_sender_id is not None and claim.sender_id == int(excluded_sender_id):
+            if excluded_claim_predicate is None:
+                return False
+            if excluded_claim_predicate(claim):
+                return False
+        if (
+            excluded_sender_id is None
+            and excluded_claim_predicate is not None
+            and excluded_claim_predicate(claim)
+        ):
+            return False
+        return True
+
+    def evidence(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
-        if self.method == "trust_fused":
-            winner = self._trust_fused_winner(cell, now)
-            if winner is None:
-                return 0.0
-            claim, effective_trust = winner
-            return effective_trust * self._claim_impact(claim.claim)
         if self.method == "majority_vote":
             votes = 0
             for claim in self.claims_by_cell.get(tuple(cell), ()):
-                if now - claim.timestamp <= self.config.max_claim_age:
+                if (
+                    now - claim.timestamp <= self.config.max_claim_age
+                    and self._claim_included(
+                        claim, excluded_sender_id, excluded_claim_predicate
+                    )
+                ):
                     votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
             return float(votes)
         total = 0.0
 
         for claim in self.claims_by_cell.get(tuple(cell), ()):
-            if now - claim.timestamp > self.config.max_claim_age:
+            if (
+                now - claim.timestamp > self.config.max_claim_age
+                or not self._claim_included(
+                    claim, excluded_sender_id, excluded_claim_predicate
+                )
+            ):
                 continue
             total += self._method_weight(claim, now) * self._claim_impact(claim.claim)
 
@@ -410,6 +379,8 @@ class DefenseMethodRunner:
         self,
         cell: Cell,
         timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
     ) -> float:
         """Return occupancy probability, with no claims treated as zero risk.
 
@@ -417,83 +388,108 @@ class DefenseMethodRunner:
         would charge every unreported cell a cost.  Here, an empty claim set is
         explicitly treated as no peer-derived occupancy risk.
         """
-        claims = self.claims_by_cell.get(tuple(cell), ())
+        claims = tuple(
+            claim for claim in self.claims_by_cell.get(tuple(cell), ())
+            if self._claim_included(claim, excluded_sender_id, excluded_claim_predicate)
+        )
         if not claims:
             return 0.0
 
-        if self.method == "trust_fused":
-            winner = self._trust_fused_winner(cell, timestamp)
-            if winner is None:
-                return 0.0
-            claim, effective_trust = winner
-            if claim.claim == BLOCKED_CLAIM:
-                return 1.0
-            if claim.claim == FREE_CLAIM:
-                return 0.0
-            return 1.0 / (1.0 + math.exp(-effective_trust * self.config.congested_impact))
-
-        value = self.evidence(cell, timestamp)
+        value = self.evidence(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return 1.0 / (1.0 + math.exp(-value))
 
     def normalized_occupied_risk(
         self,
         cell: Cell,
         timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
     ) -> float:
         """Map neutral probability 0.5 to risk 0 and occupied certainty to 1."""
-        probability = self.occupancy_probability(cell, timestamp)
+        probability = self.occupancy_probability(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return min(1.0, max(0.0, 2.0 * (probability - 0.5)))
 
-    def blocked_support(self, cell: Cell, timestamp: Optional[int] = None) -> float:
-        """Bounded current support for occupancy, excluding FREE claims."""
-        if self.method == "trust_fused":
-            winner = self._trust_fused_winner(cell, timestamp)
-            if winner is None or winner[0].claim != BLOCKED_CLAIM:
-                return 0.0
-            return min(1.0, winner[1])
-
-        now = self.current_timestamp if timestamp is None else int(timestamp)
-        support = 0.0
-        for claim in self.claims_for(cell):
-            if claim.claim != BLOCKED_CLAIM or now - claim.timestamp > self.config.max_claim_age:
-                continue
-            support += self._method_weight(claim, now)
-        return min(1.0, support)
-
-    def routing_cost(self, cell: Cell, timestamp: Optional[int] = None) -> float:
+    def routing_cost(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> float:
         """Return peer-derived traversal cost for a cell."""
-        if self.method == "trust_fused":
-            winner = self._trust_fused_winner(cell, timestamp)
-            if winner is None:
-                return 1.0
-            claim, effective_trust = winner
-            if claim.claim == BLOCKED_CLAIM:
-                return math.inf
-            if claim.claim == FREE_CLAIM:
-                return 1.0
-            risk = min(1.0, max(0.0, effective_trust * self.config.congested_impact))
-            return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
-
         if self.method == "hard_threshold":
-            return math.inf if self.is_hard_blocked(cell, timestamp) else 1.0
+            return math.inf if self.is_hard_blocked(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) else 1.0
         if self.method == "majority_vote":
             # Majority is a discrete baseline, not a soft evidence method.
             # Positive votes block; free majorities, ties, and no votes add no
             # peer traversal penalty.
-            return math.inf if self.evidence(cell, timestamp) > 0.0 else 1.0
+            return math.inf if self.evidence(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) > 0.0 else 1.0
 
-        risk = self.normalized_occupied_risk(cell, timestamp)
+        risk = self.normalized_occupied_risk(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
-    def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None) -> bool:
-        if self.method == "trust_fused":
-            winner = self._trust_fused_winner(cell, timestamp)
-            return winner is not None and winner[0].claim == BLOCKED_CLAIM
+    def is_hard_blocked(
+        self,
+        cell: Cell,
+        timestamp: Optional[int] = None,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> bool:
         if self.method == "majority_vote":
-            return self.evidence(cell, timestamp) > 0.0
-        if self.method not in ("hard_threshold", "trust_threshold"):
+            return self.evidence(
+                cell,
+                timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) > 0.0
+        if self.method == "trust_threshold":
+            now = self.current_timestamp if timestamp is None else int(timestamp)
+            for claim in self.claims_for(tuple(cell)):
+                if (
+                    now - claim.timestamp > self.config.max_claim_age
+                    or not self._claim_included(
+                        claim, excluded_sender_id, excluded_claim_predicate
+                    )
+                ):
+                    continue
+                if claim.claim != BLOCKED_CLAIM:
+                    continue
+                if self._method_weight(claim, now) > 0.0:
+                    return True
             return False
-        probability = self.occupancy_probability(cell, timestamp)
+        if self.method not in ("hard_threshold",):
+            return False
+        probability = self.occupancy_probability(
+            cell,
+            timestamp,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        )
         return probability > self.config.blocked_probability_threshold
 
     def footprint_cost(
@@ -516,59 +512,6 @@ class DefenseMethodRunner:
         timestamp: Optional[int] = None,
     ) -> bool:
         return any(self.is_hard_blocked(cell, timestamp) for cell in cells)
-
-    def effective_cells(self, timestamp: Optional[int] = None) -> Dict[Cell, EffectivePeerCell]:
-        """Read-only, method-aware peer state used by combined visualization."""
-        now = self.current_timestamp if timestamp is None else int(timestamp)
-        result = {}
-        for cell, claims in self.claims_by_cell.items():
-            active = [claim for claim in claims if now - claim.timestamp <= self.config.max_claim_age]
-            if not active:
-                continue
-
-            if self.method == "trust_fused":
-                winner = self._trust_fused_winner(cell, now)
-                if winner is None:
-                    continue
-                winning_claim, effective_trust = winner
-                result[cell] = EffectivePeerCell(
-                    claim=winning_claim.claim,
-                    has_active_evidence=True,
-                    hard_blocked=winning_claim.claim == BLOCKED_CLAIM,
-                    routing_cost=self.routing_cost(cell, now),
-                    evidence=effective_trust * self._claim_impact(winning_claim.claim),
-                    dominant_source=winning_claim.sender_id,
-                    supporting_sources=(winning_claim.sender_id,)
-                    if winning_claim.claim == BLOCKED_CLAIM else (),
-                )
-                continue
-
-            evidence = self.evidence(cell, now)
-            effective_blocked = [
-                claim for claim in active
-                if claim.claim == BLOCKED_CLAIM
-                and self._method_weight(claim, now) > 0.0
-            ]
-            dominant = None
-            if effective_blocked:
-                dominant = max(
-                    effective_blocked,
-                    key=lambda item: (
-                        self.trust_score(item.sender_id),
-                        item.timestamp,
-                        -item.sender_id,
-                    ),
-                ).sender_id
-            result[cell] = EffectivePeerCell(
-                claim=max(active, key=lambda item: item.timestamp).claim,
-                has_active_evidence=bool(evidence),
-                hard_blocked=self.is_hard_blocked(cell, now),
-                routing_cost=self.routing_cost(cell, now),
-                evidence=evidence,
-                dominant_source=dominant,
-                supporting_sources=tuple(sorted({claim.sender_id for claim in effective_blocked})),
-            )
-        return result
 
     def snapshot(self, timestamp: Optional[int] = None) -> Dict[str, object]:
         now = self.current_timestamp if timestamp is None else int(timestamp)

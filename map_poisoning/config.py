@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .models import AttackType
@@ -24,32 +25,40 @@ class PhaseConfig:
 @dataclass(frozen=True)
 class AttackConfig:
     enabled: tuple[str, ...] = tuple(item.value for item in AttackType)
-    interval_min: int = 30
-    interval_max: int = 30
-    candidate_top_k: int = 24
+    interval_min: int = 50
+    interval_max: int = 50
+    candidate_top_k: int = 12
     broadcast: bool = True
     global_awareness: bool = True
     # Rapid interactive runs can contain many actions; this is still a hard
     # cap, while spacing/minimum-unique checks diagnose concentration.
     max_uses_per_footprint: int = 20
-    min_center_spacing: int = 6
+    min_center_spacing: int = 3
     min_unique_footprints: int = 3
 
 
 @dataclass(frozen=True)
 class TrustConfig:
     model: str = "scalar"
+    # Match the main-branch trust prior: new peers begin at 0.90.
     prior_alpha: float = 9.0
     prior_beta: float = 1.0
     threshold: float = 0.55
+    # A lidar footprint can validate many same-sender reports at once.  Count
+    # at most one positive trust credit per sender in this window so report
+    # volume cannot restore authority instantly.
+    confirmation_cooldown_steps: int = 10
 
 
 @dataclass(frozen=True)
 class FusionConfig:
-    method: str = "trust_threshold"
+    method: str = "source_linked"
     admission_policy: str = "accept_all"
     decay_rate: float = 0.006
-    cost_scale: float = 14.0
+    # Must dominate the three-unit unknown-cell traversal cost when a highly
+    # trusted blocked claim lies on a planned corridor; otherwise trust changes
+    # cannot change navigation in an otherwise open controlled scenario.
+    cost_scale: float = 40.0
     cost_exponent: float = 1.5
     blocked_probability_threshold: float = 0.70
     max_claim_age: int = 900
@@ -59,7 +68,7 @@ class FusionConfig:
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    output_directory: str = "outputs/simulation_results"
+    output_directory: str = "outputs"
     timeseries_period_steps: int = 5
     generate_plots: bool = True
     plot_format: str = "png"
@@ -67,20 +76,23 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class VisualizationConfig:
-    animation: bool = True
+    animation: bool = False
     map_view: str = "combined"
+    fake_influence_min_cost_delta: float = 0.10
+    route_impact_min_cost_delta: float = 0.10
+    route_impact_eval_period_steps: int = 10
 
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    seed: int = 12
+    seed: int = 15
     phases: PhaseConfig = field(default_factory=PhaseConfig)
     attacks: AttackConfig = field(default_factory=AttackConfig)
     trust: TrustConfig = field(default_factory=TrustConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
-    comparison_methods: tuple[str, ...] = ("trust_fused",)
+    comparison_methods: tuple[str, ...] = PRIMARY_METHODS
     communication_period_steps: int = 4
     temporary_blockage_change_period_steps: int = 150
     map_npy: str | None = None
@@ -89,6 +101,9 @@ class SimulationConfig:
     manifest_path: str | None = None
     deliveries_per_robot: int = 100
     max_steps: int | None = None
+    # Fresh lidar readings override peers.  Older direct memory becomes stale so
+    # a later fake obstacle can still change an unused corridor.
+    direct_memory_steps: int = 12
 
     def validate(self) -> None:
         if self.seed < 0: raise ValueError("seed must be nonnegative")
@@ -99,8 +114,8 @@ class SimulationConfig:
         if self.trust.model not in {"bayesian", "scalar"}: raise ValueError("trust model must be bayesian or scalar")
         if self.trust.prior_alpha <= 0 or self.trust.prior_beta <= 0: raise ValueError("Bayesian priors must be positive")
         if not 0 <= self.trust.threshold <= 1: raise ValueError("trust threshold must be in [0, 1]")
+        if self.trust.confirmation_cooldown_steps < 0: raise ValueError("trust confirmation cooldown must be nonnegative")
         if self.fusion.method not in ALL_METHODS: raise ValueError(f"unknown defense method: {self.fusion.method}")
-        if not self.comparison_methods or any(item not in ALL_METHODS for item in self.comparison_methods): raise ValueError("comparison_methods must contain at least one valid defense method")
         if self.fusion.admission_policy not in {"auto_soft", "accept_all", "hard_reject"}: raise ValueError("unknown admission policy")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai: raise ValueError("use one map source")
@@ -109,8 +124,12 @@ class SimulationConfig:
             if self.scenario_preset not in PRESETS: raise ValueError(f"unknown scenario preset: {self.scenario_preset}")
         if self.deliveries_per_robot < 1: raise ValueError("deliveries_per_robot must be positive")
         if self.max_steps is not None and self.max_steps < 1: raise ValueError("max_steps must be positive")
+        if self.direct_memory_steps < 0: raise ValueError("direct_memory_steps must be nonnegative")
         if self.visualization.map_view not in MAP_VIEWS: raise ValueError("map_view must be combined or local")
-        if self.temporary_blockage_change_period_steps < 1: raise ValueError("temporary obstacle interval must be positive")
+        if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:
+            raise ValueError("visualization metric thresholds must be non-negative")
+        if self.visualization.route_impact_eval_period_steps < 1:
+            raise ValueError("route impact evaluation period must be positive")
 
     @property
     def total_steps(self) -> int: return min(self.phases.total_steps, self.max_steps) if self.max_steps else self.phases.total_steps

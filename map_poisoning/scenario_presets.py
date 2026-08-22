@@ -1,4 +1,4 @@
-"""Validated, reproducible geometry for the converted experiment maps."""
+"""Validated, reproducible scenario geometry for converted experiment maps."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,6 +22,10 @@ class FixedScenarioPreset:
     description: str = ""
 
 
+# Coordinates were selected from the largest 4-connected free-space component
+# of each converted map.  Every point has a free 3x3 neighbourhood; the
+# geographically separated points deliberately create crossing warehouse
+# routes instead of four nearly coincident delivery actions.
 PRESETS: dict[str, FixedScenarioPreset] = {
     "warehouse_002": FixedScenarioPreset(
         "warehouse_002", (188, 192),
@@ -47,26 +51,19 @@ PRESETS: dict[str, FixedScenarioPreset] = {
 }
 
 
-def grid_hash(grid: np.ndarray) -> str:
-    return hashlib.sha256(np.asarray(grid).tobytes()).hexdigest()
-
-
 def validate_fixed_preset(grid: np.ndarray, preset: FixedScenarioPreset) -> None:
-    """Reject changed, blocked, duplicated, or disconnected preset geometry."""
-    grid = np.asarray(grid)
+    """Reject changed, blocked, duplicated, or disconnected experiment geometry."""
     prefix = f"scenario preset {preset.preset_id} is invalid"
     if tuple(grid.shape) != preset.expected_shape:
         raise ValueError(f"{prefix}: expected shape {preset.expected_shape}, got {tuple(grid.shape)}")
-    if preset.expected_map_hash and grid_hash(grid) != preset.expected_map_hash:
+    if preset.expected_map_hash and hashlib.sha256(grid.tobytes()).hexdigest() != preset.expected_map_hash:
         raise ValueError(f"{prefix}: map hash does not match the validated conversion")
-
     points = list(preset.robot_starts.items()) + list(enumerate(preset.delivery_points))
     for label, cell in points:
         if not (0 <= cell[0] < grid.shape[0] and 0 <= cell[1] < grid.shape[1]):
             raise ValueError(f"{prefix}: {label} point {cell} is out of bounds")
         if grid[cell] != 0:
             raise ValueError(f"{prefix}: point {cell} is blocked")
-
     starts = list(preset.robot_starts.values())
     if len(starts) != len(set(starts)):
         raise ValueError(f"{prefix}: robot starts must be distinct")

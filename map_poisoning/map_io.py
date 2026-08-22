@@ -47,6 +47,21 @@ def default_warehouse_map() -> np.ndarray:
     return grid
 
 
-# Lower checkpoint in the attacker bay column (col 8).  The upper bay checkpoint
-# at (3, 8) stays; this one crowded the escape corridor visually and in routing.
-WAREHOUSE_EXCLUDED_ACTION_POINTS: frozenset[tuple[int, int]] = frozenset({(9, 8)})
+# Attacker-bay one-cell corridor. Keep a start and a delivery in this column;
+# traffic coordination must single-file it instead of deleting the bay.
+WAREHOUSE_NARROW_CORRIDOR_CELLS: frozenset[tuple[int, int]] = frozenset(
+    (row, 8) for row in range(2, 14)
+)
+WAREHOUSE_ATTACKER_START: tuple[int, int] = (6, 8)
+WAREHOUSE_CORRIDOR_DELIVERY: tuple[int, int] = (3, 8)
+# Keep exactly one delivery in the bay; extra corridor checkpoints pull every
+# robot into the one-cell aisle. The mouth stays a transit cell, not a goal.
+WAREHOUSE_EXCLUDED_ACTION_POINTS: frozenset[tuple[int, int]] = (
+    WAREHOUSE_NARROW_CORRIDOR_CELLS - {WAREHOUSE_CORRIDOR_DELIVERY}
+)
+# Keep the bay connected to the floor when palettes shift/teleport.
+WAREHOUSE_CORRIDOR_CONNECTIVITY_ANCHORS: tuple[tuple[int, int], ...] = (
+    WAREHOUSE_ATTACKER_START,
+    (13, 8),
+    (14, 8),
+)

@@ -1,4 +1,4 @@
-"""Sensor models aligned with the validated warehouse LiDAR model."""
+"""Deterministic local sensing for the modular grid simulator."""
 from __future__ import annotations
 
 from typing import Iterable
@@ -6,34 +6,26 @@ from typing import Iterable
 from .models import ClaimType
 
 
-def _claim_from_truth_value(value: int) -> ClaimType:
-  import sim2
-
-  state = sim2.CellState(int(value))
-  if state in (
-      sim2.CellState.OCCUPIED_STATIC,
-      sim2.CellState.OCCUPIED_DYNAMIC,
-      sim2.CellState.TEMPORARILY_BLOCKED,
-  ):
-    return ClaimType.BLOCKED
-  return ClaimType.FREE
-
-
 def lidar_observations(
     truth_grid,
     position: tuple[int, int],
     other_positions: Iterable[tuple[int, int]] | None = None,
 ) -> dict[tuple[int, int], ClaimType]:
-  """Ray-cast lidar from a grid cell center, matching legacy range and rays."""
-  import sim2
+  """Return a radius-five local occupancy observation.
 
-  world = sim2.GridWorld(truth_grid)
-  origin_xy = sim2.cell_to_xy(position)
-  observations, _ = world.observe_cells_lidar(
-      origin_xy,
-      max_range_cells=sim2.LIDAR_RANGE_CELLS,
-      num_rays=sim2.LIDAR_NUM_RAYS,
-      step_cells=sim2.LIDAR_STEP_CELLS,
-      robot_positions=set(other_positions or ()),
-  )
-  return {cell: _claim_from_truth_value(int(state)) for cell, state in observations.items()}
+  Other robots are not environmental obstacles.  This intentionally simple
+  sensor makes the information available to trust verification explicit and
+  reproducible on every supported map.
+  """
+  rows, cols = truth_grid.shape
+  seen: dict[tuple[int, int], ClaimType] = {}
+  radius = 5
+  for row in range(max(0, position[0] - radius), min(rows, position[0] + radius + 1)):
+    for col in range(max(0, position[1] - radius), min(cols, position[1] + radius + 1)):
+      cell = (row, col)
+      if abs(row - position[0]) + abs(col - position[1]) > radius:
+        continue
+      # Peer robots are not environmental obstacles. Keep sensing world occupancy
+      # under/around them so trusted fake obstacles there can still be verified.
+      seen[cell] = ClaimType.BLOCKED if truth_grid[cell] else ClaimType.FREE
+  return seen

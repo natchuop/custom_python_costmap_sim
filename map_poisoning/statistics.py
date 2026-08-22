@@ -3,13 +3,22 @@ from __future__ import annotations
 import math
 from statistics import mean, median
 
-# Two-sided .975 Student-t critical values, df 1..30; the normal limit is
-# sufficiently accurate for larger studies and avoids making SciPy required.
+# Fixed two-sided 95% Student-t critical values, df 1..30.  For n >= 2:
+#   sample SD = sqrt(sum((x - mean)^2) / (n - 1))
+#   SEM = sample SD / sqrt(n)
+#   CI95 = mean +/- t(0.975, n - 1) * SEM
+# The normal-limit expansion is used only beyond df 30.
 _T975 = {
     1: 12.7062047364, 2: 4.3026527299, 3: 3.1824463053,
     4: 2.7764451052, 5: 2.5705818366, 6: 2.4469118511,
     7: 2.3646242511, 8: 2.3060041352, 9: 2.2621571629,
-    10: 2.2281388519, 11: 2.2009851601,
+    10: 2.2281388519, 11: 2.2009851601, 12: 2.1788128297,
+    13: 2.1603686565, 14: 2.1447866879, 15: 2.1314495456,
+    16: 2.1199052992, 17: 2.1098155778, 18: 2.1009220402,
+    19: 2.0930240544, 20: 2.0859634473, 21: 2.0796138447,
+    22: 2.0738730679, 23: 2.0686576104, 24: 2.0638985616,
+    25: 2.0595385528, 26: 2.0555294386, 27: 2.0518305165,
+    28: 2.0484071418, 29: 2.0452296421, 30: 2.0422724563,
 }
 
 def t_critical_975(df: int) -> float:
