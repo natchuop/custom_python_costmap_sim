@@ -64,6 +64,7 @@ def _make_robots(config: SimulationConfig, manifest: ScenarioManifest, method: s
                 fusion,
                 config.trust.threshold,
                 config.fusion.admission_policy,
+                confirmation_cooldown_steps=config.trust.confirmation_cooldown_steps,
             )
         )
     return robots
@@ -141,14 +142,14 @@ def _map_error(robot: ModularRobot, world: World, step: int) -> float:
     for cell in candidate_cells:
         if robot.belief.static_grid[cell]:
             continue
-            direct = robot.belief.direct_state(cell, step)
-            predicted_blocked = (
-                direct == ClaimType.BLOCKED
-                if direct is not None
-                else robot.fusion.probability(cell, step) >= 0.5
-            )
-            errors += predicted_blocked != (world.state(cell, step) == ClaimType.BLOCKED)
-            total += 1
+        direct = robot.belief.direct_state(cell, step)
+        predicted_blocked = (
+            direct == ClaimType.BLOCKED
+            if direct is not None
+            else robot.fusion.probability(cell, step) >= 0.5
+        )
+        errors += predicted_blocked != (world.state(cell, step) == ClaimType.BLOCKED)
+        total += 1
     return errors / total if total else 0.0
 
 
@@ -384,7 +385,8 @@ def run_manifest_rollout(
             route_cost, route_affected = latest_route_metrics[robot.robot_id]
             active_fake_claims = sum(
                 1
-                for item in robot.fusion.report_history.values()
+                for items in robot.fusion.claims.values()
+                for item in items
                 if item.report.report_id in malicious_ids
             )
             sample = {

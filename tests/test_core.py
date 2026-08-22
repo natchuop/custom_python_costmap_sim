@@ -72,7 +72,7 @@ def test_confirmed_reports_raise_trust_and_false_blocked_drops_more():
     robot.receive(fake_blocked)
     robot.process_inbox(2)
     robot.verify([DirectObservation(1, (3, 3), ClaimType.FREE, 3)], 3)
-    assert robot.trust.score(0) == pytest.approx(0.57)
+    assert robot.trust.score(0) == pytest.approx(0.76)
     assert robot.belief.direct_state((3, 3), 3) == ClaimType.FREE
     assert (3, 3) not in robot.fusion.claims
 

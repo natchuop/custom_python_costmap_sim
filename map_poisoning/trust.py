@@ -54,9 +54,10 @@ class BayesianTrustModel(TrustModel):
 
 @dataclass
 class ScalarTrustModel(TrustModel):
-    initial: float = 0.70
+    initial: float = 0.90
     reward: float = 0.02
-    penalty: float = 0.10
+    # Main-branch contradiction penalty.
+    penalty: float = 0.06
 
     def __post_init__(self):
         self.values: dict[int, float] = {}

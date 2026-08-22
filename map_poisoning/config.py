@@ -40,9 +40,14 @@ class AttackConfig:
 @dataclass(frozen=True)
 class TrustConfig:
     model: str = "scalar"
-    prior_alpha: float = 7.0
-    prior_beta: float = 3.0
+    # Match the main-branch trust prior: new peers begin at 0.90.
+    prior_alpha: float = 9.0
+    prior_beta: float = 1.0
     threshold: float = 0.55
+    # A lidar footprint can validate many same-sender reports at once.  Count
+    # at most one positive trust credit per sender in this window so report
+    # volume cannot restore authority instantly.
+    confirmation_cooldown_steps: int = 10
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,7 @@ class SimulationConfig:
         if self.trust.model not in {"bayesian", "scalar"}: raise ValueError("trust model must be bayesian or scalar")
         if self.trust.prior_alpha <= 0 or self.trust.prior_beta <= 0: raise ValueError("Bayesian priors must be positive")
         if not 0 <= self.trust.threshold <= 1: raise ValueError("trust threshold must be in [0, 1]")
+        if self.trust.confirmation_cooldown_steps < 0: raise ValueError("trust confirmation cooldown must be nonnegative")
         if self.fusion.method not in ALL_METHODS: raise ValueError(f"unknown defense method: {self.fusion.method}")
         if self.fusion.admission_policy not in {"auto_soft", "accept_all", "hard_reject"}: raise ValueError("unknown admission policy")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled): raise ValueError("unknown attack type")

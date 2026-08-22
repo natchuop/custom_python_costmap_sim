@@ -2,11 +2,17 @@
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, TrustConfig
-from map_poisoning.models import AttackEvent, AttackType, ClaimType, DeliveryTask, TemporaryObstacleEpisode
-from map_poisoning.rollout import collect_rollout_metrics, run_manifest_rollout
+from map_poisoning.belief import RobotBeliefMap
+from map_poisoning.fusion import FusionEngine
+from map_poisoning.models import AttackEvent, AttackType, ClaimReport, ClaimType, DeliveryTask, DirectObservation, TemporaryObstacleEpisode, VerificationOutcome
+from map_poisoning.robot import ModularRobot
+from map_poisoning.rollout import _map_error, collect_rollout_metrics, run_manifest_rollout
 from map_poisoning.scenario import ScenarioManifest, author_manifest
+from map_poisoning.trust import ScalarTrustModel
+from map_poisoning.world import World
 
 
 def _grid():
@@ -45,6 +51,81 @@ def _config(*, trust=(7, 3)):
         deliveries_per_robot=1,
         max_steps=8,
     )
+
+
+def test_map_error_counts_active_peer_disagreement():
+    grid = np.zeros((5, 5), dtype=np.uint8)
+    world = World(grid, ())
+    trust = ScalarTrustModel(initial=0.80)
+    fusion = FusionEngine("full_trust", trust.score)
+    fusion.add(ClaimReport("peer", 0, (2, 2), ClaimType.BLOCKED, 0, 0))
+    robot = type(
+        "Robot",
+        (),
+        {"belief": RobotBeliefMap(grid), "fusion": fusion},
+    )()
+
+    assert _map_error(robot, world, 0) == 1.0
+
+
+def test_positive_trust_credit_is_rate_limited_per_sender():
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    task = (DeliveryTask("t", (1, 2), (6, 6)),)
+    trust = ScalarTrustModel(initial=0.80)
+    robot = ModularRobot(
+        1,
+        (1, 1),
+        task,
+        RobotBeliefMap(grid),
+        trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.55),
+        0.55,
+        "accept_all",
+        confirmation_cooldown_steps=10,
+    )
+    robot.receive(ClaimReport("free-a", 0, (2, 2), ClaimType.FREE, 0, 0, 0))
+    robot.receive(ClaimReport("free-b", 0, (2, 3), ClaimType.FREE, 0, 0, 0))
+    robot.process_inbox(0)
+    robot.verify(
+        [
+            DirectObservation(1, (2, 2), ClaimType.FREE, 1),
+            DirectObservation(1, (2, 3), ClaimType.FREE, 1),
+        ],
+        1,
+    )
+    assert trust.score(0) == pytest.approx(0.82)
+
+    robot.receive(ClaimReport("free-c", 0, (2, 4), ClaimType.FREE, 11, 11, 11))
+    robot.process_inbox(11)
+    robot.verify([DirectObservation(1, (2, 4), ClaimType.FREE, 12)], 12)
+    assert trust.score(0) == pytest.approx(0.84)
+
+
+def test_stale_honest_contradiction_is_ambiguous_not_distrust():
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    task = (DeliveryTask("t", (1, 2), (6, 6)),)
+    trust = ScalarTrustModel(initial=0.80)
+    robot = ModularRobot(
+        1,
+        (1, 1),
+        task,
+        RobotBeliefMap(grid, memory_steps=12),
+        trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.55),
+        0.55,
+        "accept_all",
+    )
+    report = ClaimReport("stale", 0, (2, 2), ClaimType.BLOCKED, 0, 0, 0)
+    robot.receive(report)
+    robot.process_inbox(0)
+    results = robot.verify(
+        [DirectObservation(1, (2, 2), ClaimType.FREE, 20)],
+        20,
+    )
+
+    assert results[0][1] == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
+    assert trust.score(0) == pytest.approx(0.80)
+    assert (2, 2) not in robot.fusion.claims
 
 
 def _received(log, report_id="attack-report"):
@@ -126,6 +207,18 @@ def test_each_attack_has_expected_fusion_and_verification_behavior():
     victim_replan = next(event for event in log["events"] if event.get("kind") == "replan" and event["robot_id"] == 1 and event["step"] == 1)
     assert (7, 8) in victim_replan["path"]
     assert any(event["kind"] == "trust_update" and event["report_id"] == "attack-report" and event["outcome"] == "contradicted_fresh" for event in log["events"])
+
+
+def test_active_fake_claim_metric_excludes_retracted_claims():
+    manifest = _manifest()
+    config = _config()
+    _, _, log = run_manifest_rollout(config, manifest, "source_linked")
+    final = next(
+        row
+        for row in reversed(log["timeseries"])
+        if row["robot_id"] == 1
+    )
+    assert final["active_fake_claim_count"] == 0
 
 
 def test_baselines_and_requested_metrics_run_on_one_manifest():

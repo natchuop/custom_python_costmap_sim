@@ -129,46 +129,26 @@ def _dominant_blocked_sender(robot, items, step):
     return blocked[0][1]
 
 
-def _attack_cell_index(log, step: int, display_age: int) -> dict[tuple[int, int], int]:
-    """Map attack BLOCKED cells to attacker id for the current playback step."""
-    attacker = log.get("malicious_robot_id")
-    if attacker is None:
-        return {}
-    indexed: dict[tuple[int, int], int] = {}
-    for event in log.get("attack_events", ()):
-        event_step = int(event.step)
-        if event_step > step or step - event_step > display_age:
-            continue
-        if int(event.claim) != int(ClaimType.BLOCKED):
-            continue
-        for cell in event.cells:
-            indexed[tuple(cell)] = int(attacker)
-    return indexed
-
-
 def _paint_trusted_attack_reports(arr, robot, log, step, threshold: float) -> None:
-    """Paint trusted attacker BLOCKED attack claims on victim belief maps."""
+    """Paint active trusted attacker BLOCKED fusion claims on victim belief maps."""
     attacker = log.get("malicious_robot_id")
     if attacker is None or robot.robot_id == attacker:
         return
     if robot.trust.score(attacker) < threshold:
         return
     color = ROBOT_DISPLAY.get(attacker, DISPLAY_BLOCKED)
-    display_age = int(getattr(robot.fusion, "max_claim_age", 900))
-    for cell, source in _attack_cell_index(log, step, display_age).items():
-        row, col = cell
-        if not (0 <= row < arr.shape[0] and 0 <= col < arr.shape[1]):
-            continue
-        if arr[row, col] == DISPLAY_STATIC:
-            continue
-        if _fresh_direct_free(robot, cell, step):
+    for cell, items in robot.fusion.claims.items():
+        if arr[cell] == DISPLAY_STATIC or not items:
             continue
         if not any(
             item.report.sender_id == attacker and item.report.claim == ClaimType.BLOCKED
-            for item in robot.fusion.claims_at(cell)
+            for item in items
         ):
             continue
-        arr[row, col] = color
+        if _fresh_direct_free(robot, cell, step):
+            arr[cell] = DISPLAY_FREE
+            continue
+        arr[cell] = color
 
 
 def truth_display_grid(world, robots, log, step):
@@ -326,13 +306,12 @@ def record_live_frame(log, world, robots, step, phase) -> None:
     snapshot = {}
     for robot in robots:
         rid = robot.robot_id
-        if map_view == "local":
-            grid = local_display_grid(robot, world, step)
-            live["local_beliefs"][rid].append(grid)
-        else:
-            grid = combined_display_grid(robot, world, log, step, robots)
-            live["combined_beliefs"][rid].append(grid)
-        live["beliefs"][rid].append(grid)
+        local = local_display_grid(robot, world, step)
+        combined = combined_display_grid(robot, world, log, step, robots)
+        live["local_beliefs"][rid].append(local)
+        live["combined_beliefs"][rid].append(combined)
+        selected = local if map_view == "local" else combined
+        live["beliefs"][rid].append(selected)
         live["positions"][rid].append(robot.position)
         live["paths"][rid].append(list(robot.path or ()))
         live["trust"][rid].append(robot.trust.score(attacker))
@@ -470,7 +449,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     threshold = float(live.get("threshold", 0.55))
     method = str(live.get("method") or "unknown")
     belief_source = live["combined_beliefs"] if selected_view == "combined" else live["local_beliefs"]
-    if not belief_source or not belief_source.get(robots[0].robot_id):
+    if not belief_source.get(robots[0].robot_id):
         belief_source = live["beliefs"]
 
     fig = plt.figure(figsize=(16, 11), constrained_layout=False)

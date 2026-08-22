@@ -122,17 +122,74 @@ def test_trusted_attacker_fake_obstacles_paint_on_victim_map():
     assert arr[2, 3] == DISPLAY_R0
 
 
+def test_validated_fake_obstacle_clears_from_victim_map():
+    from map_poisoning.live_view import DISPLAY_FREE, DISPLAY_R0
+    from map_poisoning.models import AttackEvent, AttackType, ClaimReport, DirectObservation
+
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    world = type("World", (), {"static_grid": grid})()
+    log = {
+        "malicious_robot_id": 0,
+        "attack_events": (
+            AttackEvent(
+                "attack-0000",
+                5,
+                AttackType.FAKE_OBSTACLE,
+                ((2, 2),),
+                ClaimType.BLOCKED,
+                5,
+                0,
+                (1,),
+                ("report-0",),
+            ),
+        ),
+    }
+    victim = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 1,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "trust_threshold": 0.55,
+            "belief": RobotBeliefMap(grid, memory_steps=12),
+            "trust": ScalarTrustModel(initial=0.80),
+            "fusion": FusionEngine("trust_threshold", lambda _: 0.80, trust_threshold=0.55),
+        },
+    )()
+    attacker = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 0,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "belief": RobotBeliefMap(grid, memory_steps=12),
+        },
+    )()
+    victim.fusion.add(
+        ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 5, 5),
+        is_malicious=True,
+    )
+    assert combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))[2, 2] == DISPLAY_R0
+
+    victim.belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 6))
+    victim.fusion.retract(ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 5, 5))
+    assert combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))[2, 2] == DISPLAY_FREE
+
+
 def test_live_recording_builds_heatmap_and_four_map_axes():
     config = replace(_config(), visualization=VisualizationConfig(animation=True))
     world, robots, log = run_manifest_rollout(config, _manifest(), "full_trust")
     live = log["live"]
     assert len(live["truth"]) == config.total_steps
     assert set(live["beliefs"]) == {robot.robot_id for robot in robots}
-    map_view = live.get("map_view", "combined")
-    if map_view == "combined":
-        assert len(live["combined_beliefs"][robots[0].robot_id]) == config.total_steps
-    else:
-        assert len(live["local_beliefs"][robots[0].robot_id]) == config.total_steps
+    assert len(live["combined_beliefs"][robots[0].robot_id]) == config.total_steps
+    assert len(live["local_beliefs"][robots[0].robot_id]) == config.total_steps
     assert live["heatmap"].sum() > 0
     assert live["threshold"] == config.trust.threshold
     heat = show_traffic_heatmap(log, show=False)

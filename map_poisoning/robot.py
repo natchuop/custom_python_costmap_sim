@@ -76,6 +76,7 @@ class ModularRobot:
     fusion: FusionEngine
     trust_threshold: float
     admission_policy: str
+    confirmation_cooldown_steps: int = 10
     position: tuple[int, int] = field(init=False)
     task_index: int = 0
     carrying: bool = False
@@ -102,6 +103,7 @@ class ModularRobot:
     last_shared_claim: dict[tuple[int, int], ClaimType] = field(default_factory=dict)
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
     verified_reports: set[str] = field(default_factory=set)
+    last_positive_trust_update_step: dict[int, int] = field(default_factory=dict)
     defense_replan_needed: bool = False
     source_linked_replan_context: dict | None = None
     accepted_reports: int = 0
@@ -291,19 +293,29 @@ class ModularRobot:
         sender_id = report.sender_id
         if sender_id not in old_trust_by_sender:
             old_trust_by_sender[sender_id] = self.trust.score(sender_id)
-        outcome = (
-            VerificationOutcome.CONFIRMED
-            if truth_matches
-            else VerificationOutcome.CONTRADICTED_FRESH
+        stale_honest_report = (
+            report.scenario_event_id is None
+            and step - report.observation_step > self.belief.memory_steps
         )
+        if stale_honest_report:
+            outcome = VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
+        else:
+            outcome = (
+                VerificationOutcome.CONFIRMED
+                if truth_matches
+                else VerificationOutcome.CONTRADICTED_FRESH
+            )
         evidence_before = self.fusion.evidence(report.target_cell, step)
         probability_before = self.fusion.probability(report.target_cell, step)
         trust_severity = 1.0
-        if outcome == VerificationOutcome.CONTRADICTED_FRESH:
-            fake_obstacle = report.claim == ClaimType.BLOCKED and observed.claim == ClaimType.FREE
-            fake_clearance = report.claim == ClaimType.FREE and observed.claim == ClaimType.BLOCKED
-            if fake_obstacle or fake_clearance:
-                trust_severity = 2.5
+        if outcome == VerificationOutcome.CONFIRMED:
+            last_credit = self.last_positive_trust_update_step.get(sender_id, -10**9)
+            if step - last_credit < self.confirmation_cooldown_steps:
+                # Keep the validation event, but do not let one lidar sweep
+                # provide dozens of independent reputation credits.
+                trust_severity = 0.0
+            else:
+                self.last_positive_trust_update_step[sender_id] = step
         old_trust, new_trust = self.trust.update(sender_id, outcome, severity=trust_severity)
         evidence_after = self.fusion.evidence(report.target_cell, step)
         probability_after = self.fusion.probability(report.target_cell, step)
@@ -330,6 +342,11 @@ class ModularRobot:
                     DirectObservation(self.robot_id, report.target_cell, ClaimType.BLOCKED, step)
                 )
             self.fusion.retract(report)
+        elif outcome == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED:
+            # The direct reading is current, but an old honest peer report is
+            # not reliable evidence that the sender was wrong when it spoke.
+            if not truth_matches:
+                self.fusion.retract(report)
 
     def verify(self, observations: Iterable[DirectObservation], step: int):
         results = []

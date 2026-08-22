@@ -107,6 +107,7 @@ def parser():
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--trust-model",choices=("bayesian","scalar"),default="scalar"); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
     p.add_argument("--trust-threshold",type=float,default=0.55)
+    p.add_argument("--trust-confirmation-cooldown",type=int,default=10,help="minimum steps between positive trust credits from one sender")
     p.add_argument("--attacks",default="fake_obstacle,false_clearance,stale_reassertion",help="comma separated, or 'none'")
     p.add_argument("--recon-steps",type=int,default=450); p.add_argument("--attack-steps",type=int,default=1200); p.add_argument("--recovery-steps",type=int,default=750); p.add_argument("--max-steps",type=int)
     p.add_argument("--deliveries-per-robot",type=int,default=100)
@@ -124,7 +125,7 @@ def config_from_args(args):
         seed=args.seed,
         phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),
         attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),
-        trust=TrustConfig(model=args.trust_model, threshold=float(args.trust_threshold)),
+        trust=TrustConfig(model=args.trust_model, threshold=float(args.trust_threshold), confirmation_cooldown_steps=int(args.trust_confirmation_cooldown)),
         fusion=FusionConfig(method=args.defense_method,admission_policy=args.admission_policy),
         logging=LoggingConfig(output_directory, generate_plots=not args.no_plots),
         visualization=VisualizationConfig(
