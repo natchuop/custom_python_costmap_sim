@@ -2,7 +2,7 @@ import numpy as np
 
 from map_poisoning.models import DeliveryTask
 from map_poisoning.robot import ModularRobot
-from map_poisoning.traffic import TrafficState, coordinate_robot_intents
+from map_poisoning.traffic import TrafficState, coordinate_robot_intents, summarize_traffic_events
 from map_poisoning.world import World
 
 
@@ -90,4 +90,17 @@ def test_yielded_swap_unparks_after_partner_moves():
     partner.path = [(5, 3)] if partner.robot_id == 1 else [(5, 6)]
     _, events = coordinate_robot_intents([first, second], world, 1, state)
     assert yielder.traffic_mode == "NORMAL"
-    assert any(event["event_type"] == "traffic_deadlock_recovered" for event in events)
+    assert any(event["event_type"] == "traffic_yield_completed" for event in events)
+
+
+def test_deadlock_summary_counts_unique_paired_episodes_only():
+    events = [
+        {"event_type": "traffic_deadlock_recovered", "deadlock_id": "orphan"},
+        {"event_type": "traffic_deadlock_detected", "deadlock_id": "d1"},
+        {"event_type": "traffic_deadlock_detected", "deadlock_id": "d1"},
+        {"event_type": "traffic_deadlock_recovered", "deadlock_id": "d1"},
+        {"event_type": "traffic_deadlock_detected", "deadlock_id": "d2"},
+    ]
+    summary = summarize_traffic_events(events)
+    assert summary["deadlocks_detected"] == 2
+    assert summary["deadlocks_recovered"] == 1

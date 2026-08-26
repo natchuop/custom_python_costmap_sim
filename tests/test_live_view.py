@@ -7,7 +7,7 @@ import numpy as np
 
 from map_poisoning.config import VisualizationConfig
 from map_poisoning.fusion import FusionEngine
-from map_poisoning.live_view import DISPLAY_R2, combined_display_grid
+from map_poisoning.live_view import DISPLAY_DYNAMIC, DISPLAY_R2, combined_display_grid
 from map_poisoning.models import ClaimReport, ClaimType, DirectObservation
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.live_view import show_belief_maps, show_traffic_heatmap
@@ -51,7 +51,7 @@ def test_stale_explored_clear_does_not_hide_trusted_peer_blocked_on_map():
     observer.belief.observe(DirectObservation(1, (3, 3), ClaimType.FREE, 0))
     peer.belief.observe(DirectObservation(2, (3, 3), ClaimType.BLOCKED, 5))
     observer.fusion.add(
-        ClaimReport("peer-blocked", 2, (3, 3), ClaimType.BLOCKED, 5, 5, 5),
+        ClaimReport("peer-blocked", 2, (3, 3), ClaimType.BLOCKED, 5, 1.0),
     )
     arr = combined_display_grid(observer, world, log, step=10, robots=(observer, peer))
     assert arr[3, 3] == DISPLAY_R2
@@ -109,11 +109,11 @@ def test_trusted_attacker_fake_obstacles_paint_on_victim_map():
     from map_poisoning.models import ClaimReport
 
     victim.fusion.add(
-        ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 5, 5),
+        ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-0000"),
         is_malicious=True,
     )
     victim.fusion.add(
-        ClaimReport("report-1", 0, (2, 3), ClaimType.BLOCKED, 5, 5, 5),
+        ClaimReport("report-1", 0, (2, 3), ClaimType.BLOCKED, 5, 1.0, "attack-0000"),
         is_malicious=True,
     )
     arr = combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))
@@ -172,13 +172,13 @@ def test_validated_fake_obstacle_clears_from_victim_map():
         },
     )()
     victim.fusion.add(
-        ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 5, 5),
+        ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-0000"),
         is_malicious=True,
     )
     assert combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))[2, 2] == DISPLAY_R0
 
     victim.belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 6))
-    victim.fusion.retract(ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 5, 5))
+    victim.fusion.retract(ClaimReport("report-0", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-0000"))
     assert combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))[2, 2] == DISPLAY_FREE
 
 
@@ -204,4 +204,94 @@ def test_live_recording_builds_heatmap_and_four_map_axes():
     assert any("Threshold:" in (text.get_text() or "") for ax in fig.axes for text in ax.texts)
     anim._func(0)
     heat.clf()
+    fig.clf()
+
+
+def test_source_memory_combined_map_hides_blocked_claim_after_distrust():
+    from map_poisoning.live_view import DISPLAY_R0, DISPLAY_UNKNOWN
+
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    world = type("World", (), {"static_grid": grid})()
+    log = {"malicious_robot_id": 0, "attack_events": ()}
+    trust = {0: .8}
+    memory = {0: .8}
+    victim = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 1,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "trust_threshold": .5,
+            "belief": RobotBeliefMap(grid, memory_steps=300),
+            "trust": type("Trust", (), {"score": lambda self, sender: trust[sender]})(),
+            "fusion": FusionEngine(
+                "source_memory",
+                lambda sender: trust[sender],
+                trust_memory_score=lambda sender: memory[sender],
+                trust_threshold=.5,
+            ),
+        },
+    )()
+    attacker = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 0,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "belief": RobotBeliefMap(grid, memory_steps=300),
+        },
+    )()
+    report = ClaimReport("malicious", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack")
+    victim.fusion.add(report, is_malicious=True)
+    assert combined_display_grid(victim, world, log, step=5, robots=(attacker, victim))[2, 2] == DISPLAY_R0
+    trust[0] = .4
+    memory[0] = .4
+    assert victim.fusion.operational_weight(report, 6) == 0.0
+    assert combined_display_grid(victim, world, log, step=6, robots=(attacker, victim))[2, 2] == DISPLAY_UNKNOWN
+
+
+def test_source_memory_popup_state_uses_memory_gate():
+    config = replace(_config(), visualization=VisualizationConfig(animation=True))
+    world, robots, log = run_manifest_rollout(config, _manifest(), "source_memory")
+    live = log["live"]
+    # Force a display-only snapshot where current trust recovered but Source
+    # Memory is still below the operational threshold.
+    live["pairwise_trust"][0][1][0] = 0.80
+    live["pairwise_source_memory"][0][1][0] = 0.40
+    fig, anim = show_belief_maps(log, world, robots, show=False, interval_ms=1)
+    anim._func(0)
+    trust_axes = [ax for ax in fig.axes if ax.get_title(loc="left").startswith("Robot trust level")]
+    assert trust_axes
+    table = trust_axes[0].tables[0]
+    headers = [table[(0, col)].get_text().get_text() for col in range(5)]
+    assert headers == ["Observer", "Sender", "Trust", "Memory", "State"]
+    target_row = None
+    for row in range(1, 7):
+        if table[(row, 0)].get_text().get_text() == "R1" and table[(row, 1)].get_text().get_text() == "R0":
+            target_row = row
+            break
+    assert target_row is not None
+    assert table[(target_row, 2)].get_text().get_text() == "0.80"
+    assert table[(target_row, 3)].get_text().get_text() == "0.40"
+    assert table[(target_row, 4)].get_text().get_text() == "IGNORED"
+    fig.clf()
+
+
+def test_reference_heatmap_background_excludes_one_step_dynamic_obstacles():
+    config = replace(_config(), visualization=VisualizationConfig(animation=True))
+    world, _, log = run_manifest_rollout(config, _manifest(), "source_memory")
+    live = log["live"]
+    dynamic_cell = tuple(_manifest().obstacle_episodes[0].cells[0]) if _manifest().obstacle_episodes else (2, 2)
+    # Force a dynamic color into the recorded truth frame. The reference
+    # heatmap must still use static geometry rather than this momentary state.
+    live["truth"][0][dynamic_cell] = DISPLAY_DYNAMIC
+    fig = show_traffic_heatmap(log, show=False)
+    background = np.asarray(fig.axes[0].images[0].get_array())
+    assert background[dynamic_cell] != DISPLAY_DYNAMIC
     fig.clf()

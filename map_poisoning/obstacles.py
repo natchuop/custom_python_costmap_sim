@@ -47,7 +47,20 @@ def sample_rectangle_dimensions(rng: random.Random, min_side: int = 1, max_side:
 
 
 def sample_fake_obstacle_dimensions(rng: random.Random) -> tuple[int, int]:
-    return sample_rectangle_dimensions(rng, max_side=FAKE_MAX_SIDE, min_area=FAKE_MIN_AREA)
+    """Sample a valid fake footprint with a moderate-size bias.
+
+    The absolute 7x7 bound is unchanged.  Weighting side lengths toward 3--6
+    makes consequential footprints more common without eliminating compact
+    bottleneck attacks or making the maximum rectangle the default.
+    """
+    sides = tuple(range(1, FAKE_MAX_SIDE + 1))
+    weights = (1, 2, 5, 7, 7, 5, 3)
+    for _ in range(100):
+        height = rng.choices(sides, weights=weights, k=1)[0]
+        width = rng.choices(sides, weights=weights, k=1)[0]
+        if height * width >= FAKE_MIN_AREA:
+            return height, width
+    return 3, 3
 
 
 def _in_bounds(grid, cell) -> bool:

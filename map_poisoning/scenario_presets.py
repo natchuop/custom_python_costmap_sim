@@ -51,6 +51,23 @@ PRESETS: dict[str, FixedScenarioPreset] = {
 }
 
 
+PRESET_MAP_RELATIVE_PATHS: dict[str, str] = {
+    "warehouse_002": "converted_maps/maps_002_map/static_grid.npy",
+    "warehouse_005": "converted_maps/maps_005_map/static_grid.npy",
+    "warehouse_005_rotated": "converted_maps/maps_005_map_rotated/static_grid.npy",
+}
+
+
+def map_path_for_preset(preset_id: str) -> str:
+    """Return the packaged converted NPY map for a fixed preset."""
+    preset_for_id(preset_id)  # validate identifier first
+    root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    path = root / PRESET_MAP_RELATIVE_PATHS[preset_id]
+    if not path.exists():
+        raise FileNotFoundError(f"converted map for scenario preset {preset_id} is missing: {path}")
+    return str(path)
+
+
 def validate_fixed_preset(grid: np.ndarray, preset: FixedScenarioPreset) -> None:
     """Reject changed, blocked, duplicated, or disconnected experiment geometry."""
     prefix = f"scenario preset {preset.preset_id} is invalid"

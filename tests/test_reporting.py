@@ -22,7 +22,7 @@ from map_poisoning.reporting import (
 
 
 SUMMARY_FIELDS = {
-    "method": "source_linked",
+    "method": "source_memory",
     "seed": "15",
     "manifest_hash": "same-map",
     "malicious_robot_id": "0",
@@ -52,7 +52,7 @@ SUMMARY_FIELDS = {
 }
 
 
-def _write_run(root, method="source_linked", manifest_hash="same-map"):
+def _write_run(root, method="source_memory", manifest_hash="same-map"):
     root.mkdir(parents=True, exist_ok=True)
     summary = dict(SUMMARY_FIELDS, method=method, manifest_hash=manifest_hash)
     with (root / "run_summary.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -114,7 +114,7 @@ def test_individual_report_smoke(tmp_path):
 
 def test_comparison_report_and_derived_metrics(tmp_path):
     root = tmp_path / "comparison"
-    for method in ("full_trust", "majority_vote", "trust_fused", "source_linked"):
+    for method in ("full_trust", "majority_vote", "trust_fused", "source_memory"):
         _write_run(root / method, method)
     result = generate_comparison_report(root)
     assert set(COMPARISON_PLOTS) == set(result["generated"])
@@ -128,7 +128,7 @@ def test_comparison_report_and_derived_metrics(tmp_path):
 def test_comparison_rejects_manifest_mismatch(tmp_path):
     root = tmp_path / "comparison"
     _write_run(root / "full_trust", "full_trust", "map-a")
-    _write_run(root / "source_linked", "source_linked", "map-b")
+    _write_run(root / "source_memory", "source_memory", "map-b")
     try:
         generate_comparison_report(root)
     except ValueError as exc:
@@ -208,9 +208,9 @@ def test_recovery_trust_gain_is_benign_recovery_delta():
     assert math.isclose(metrics["recovery_trust_gain"], .45)
 
 
-def test_focal_comparison_method_falls_back_without_source_linked():
+def test_focal_comparison_method_falls_back_without_source_memory():
     assert focal_comparison_method(["full_trust", "majority_vote"]) == "majority_vote"
-    assert focal_comparison_method(["majority_vote", "full_trust", "source_linked"]) == "source_linked"
+    assert focal_comparison_method(["majority_vote", "full_trust", "source_memory"]) == "source_memory"
     assert focal_comparison_method(["full_trust"]) is None
 
 

@@ -1,0 +1,59 @@
+{
+  "valid": true,
+  "requested_seeds": [
+    26,
+    27,
+    28,
+    29
+  ],
+  "requested_methods": [
+    "majority_vote",
+    "full_trust",
+    "trust_fused",
+    "source_memory"
+  ],
+  "requested_cell_count": 16,
+  "completed_cell_count": 16,
+  "failed_cell_count": 0,
+  "missing_cell_count": 0,
+  "complete_seeds": [
+    26,
+    27,
+    28,
+    29
+  ],
+  "incomplete_seeds": [],
+  "failed_cells": [],
+  "missing_cells": [],
+  "per_method_run_counts": {
+    "majority_vote": 4,
+    "full_trust": 4,
+    "trust_fused": 4,
+    "source_memory": 4
+  },
+  "paired_seed_count_by_comparison": {
+    "majority_vote": 4,
+    "full_trust": 4,
+    "trust_fused": 4
+  },
+  "focal_method": "source_memory",
+  "map_hashes_observed": [
+    "693dc26418767ea6f937b6334e1d7f891616a50a3386dba048e1a6bd2c290a2d"
+  ],
+  "scenario_presets_observed": [],
+  "experiment_config_hashes_observed": [
+    "addaf9cd965dbe333cfb6290418e8ce42f6ab4855493ec126a934de3c4bfe856"
+  ],
+  "git_commits_observed": [
+    null
+  ],
+  "git_dirty_flags_observed": [
+    null
+  ],
+  "warnings": [],
+  "batch_success_rate": 1.0,
+  "complete_seed_count": 4,
+  "incomplete_seed_count": 0,
+  "failed_seed_count": 0,
+  "failure_reason_counts": {}
+}

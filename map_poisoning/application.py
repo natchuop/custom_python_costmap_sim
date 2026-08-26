@@ -5,6 +5,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import gc
 import numpy as np
 from .config import SimulationConfig
 from .metrics import CsvMetrics
@@ -16,7 +17,15 @@ from .audit import audit_manifest
 
 def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bool = False):
     requested=config; requested.validate(); root=Path(config.logging.output_directory)
-    grid=load_npy(config.map_npy) if config.map_npy else load_movingai(config.map_movingai) if config.map_movingai else default_warehouse_map()
+    if config.map_npy:
+        grid = load_npy(config.map_npy)
+    elif config.map_movingai:
+        grid = load_movingai(config.map_movingai)
+    elif config.scenario_preset:
+        from .scenario_presets import map_path_for_preset
+        grid = load_npy(map_path_for_preset(config.scenario_preset))
+    else:
+        grid = default_warehouse_map()
     if config.manifest_path:
         manifest=load_manifest(config.manifest_path)
     elif not config.map_npy and not config.map_movingai and not config.scenario_preset:
@@ -29,24 +38,36 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
     CsvMetrics.config(root/"resolved_config.json",config.to_dict())
     CsvMetrics.config(root/"audit_report.json",audit_manifest(manifest))
     try:
-        commit=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()
-        dirty=bool(subprocess.check_output(["git","status","--porcelain"],text=True).strip())
+        commit=subprocess.check_output(["git","rev-parse","HEAD"],text=True,stderr=subprocess.DEVNULL).strip()
+        dirty=bool(subprocess.check_output(["git","status","--porcelain"],text=True,stderr=subprocess.DEVNULL).strip())
     except (OSError, subprocess.CalledProcessError):
         commit=None; dirty=None
     CsvMetrics.config(root/"run_metadata.json",{"python_version":sys.version,"platform":platform.platform(),"engine":"modular","settings_source":"modular_cli","scenario_id":manifest.scenario_id,"manifest_hash":manifest.map_hash,"map_hash":manifest.map_hash,"scenario_manifest_hash":scenario_manifest_hash(manifest),"git_commit":commit,"git_dirty":dirty})
     if manifest_only: return manifest
     methods=config.comparison_methods if comparison else (config.fusion.method,)
     results = []
+    heatmap = manifest.reconnaissance_heatmap
     for index, method in enumerate(methods):
         replay_config = config
         if comparison and config.visualization.animation and index > 0:
             replay_config = replace(config, visualization=replace(config.visualization, animation=False))
-        results.append(replay(replay_config, manifest, method, root / method if comparison else root))
-    if comparison:
-        heatmap = manifest.reconnaissance_heatmap
-        if heatmap is None and results:
-            live = (results[0].log or {}).get("live") or {}
+        result = replay(replay_config, manifest, method, root / method if comparison else root)
+        if comparison and heatmap is None and result.log:
+            live = result.log.get("live") or {}
             heatmap = live.get("recon_heatmap") or live.get("heatmap")
+        # Comparison reporting is file-based. Keeping every method's complete
+        # world/robot/event history resident makes long comparisons scale with
+        # the number of methods for no user-visible benefit. Preserve the first
+        # animated result when needed by a caller; otherwise retain just the
+        # summary/output metadata after CSVs have been written.
+        if comparison and not replay_config.visualization.animation:
+            result.world = None
+            result.robots = None
+            result.log = None
+        results.append(result)
+        if comparison:
+            gc.collect()
+    if comparison:
         if heatmap is not None:
             save_traffic_heatmap_artifacts(root, np.asarray(heatmap))
     if comparison and config.logging.generate_plots:

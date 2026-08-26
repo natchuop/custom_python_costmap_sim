@@ -12,16 +12,14 @@ from .cli import config_from_args, result_location_message, suggested_output_dir
 from .config import ALL_METHODS, PRIMARY_METHODS
 from .map_io import load_npy
 from .models import AttackType
-from .scenario_presets import PRESETS, preset_for_hash, preset_for_id, validate_fixed_preset
+from .scenario_presets import PRESETS, map_path_for_preset, preset_for_hash, preset_for_id, validate_fixed_preset
 
 
 MAP_OPTIONS = {
     "Default warehouse": (None, None),
-    "Map 002 (converted)": ("converted_maps/maps_002_map/static_grid.npy", "warehouse_002"),
-    "Map 005 (converted)": ("converted_maps/maps_005_map/static_grid.npy", "warehouse_005"),
-    "Map 005 rotated (converted)": (
-        "converted_maps/maps_005_map_rotated/static_grid.npy", "warehouse_005_rotated"
-    ),
+    "Map 002 (converted)": (map_path_for_preset("warehouse_002"), "warehouse_002"),
+    "Map 005 (converted)": (map_path_for_preset("warehouse_005"), "warehouse_005"),
+    "Map 005 rotated (converted)": (map_path_for_preset("warehouse_005_rotated"), "warehouse_005_rotated"),
 }
 
 
@@ -98,7 +96,7 @@ def launch(args) -> None:
         "scenario_preset": tk.StringVar(value=initial_preset),
         "seed": tk.StringVar(value=str(args.seed)),
         "trust_model": tk.StringVar(value=args.trust_model),
-        "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.55))),
+        "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.50))),
         "admission_policy": tk.StringVar(value=args.admission_policy),
         "output": tk.StringVar(value=args.output_directory or ""),
         "manifest": tk.StringVar(value=args.manifest_path or ""),
@@ -186,7 +184,7 @@ def launch(args) -> None:
     ttk.Label(
         form,
         text=(
-            "Live maps open the reconnaissance heatmap first. Close that window "
+            "Live maps open the shared attack-free reference heatmap first. Close that window "
             "to start ground-truth and per-robot belief playback with the trust panel."
         ),
         wraplength=650,
@@ -337,7 +335,7 @@ def launch(args) -> None:
             seed = 15
         seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
         return suggested_output_directory(
-            method=next((method for method in ALL_METHODS if method_enabled[method].get()), "source_linked"),
+            method=next((method for method in ALL_METHODS if method_enabled[method].get()), "source_memory"),
             seed=seed,
             seeds=seeds or None,
             compare=sum(1 for variable in method_enabled.values() if variable.get()) > 1,

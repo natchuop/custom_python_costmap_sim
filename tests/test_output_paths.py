@@ -50,7 +50,7 @@ def test_cli_comparison_methods_are_selectable():
         "--no-animation",
     ]))
     assert config.comparison_methods == ("trust_threshold", "full_trust")
-    assert config.fusion.method == "source_linked"
+    assert config.fusion.method == "source_memory"
 
 
 def test_cli_default_output_is_named_unless_overridden():

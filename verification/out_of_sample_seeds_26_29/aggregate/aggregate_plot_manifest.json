@@ -1,0 +1,24 @@
+{
+  "directory": "verification/out_of_sample_seeds_26_29",
+  "generated": [
+    "00_batch_completion.png",
+    "01_deliveries_by_method.png",
+    "02_mission_efficiency_by_method.png",
+    "03_attack_influence_by_method.png",
+    "04_trust_diagnostics_by_method.png",
+    "05_traffic_burden_by_method.png",
+    "06_fake_influence_over_time.png",
+    "07_delivery_progress_over_time.png",
+    "08_replans_over_time.png",
+    "14_route_cause_attribution.png",
+    "09_paired_method_differences.png",
+    "09_source_memory_paired_differences.png",
+    "10_delivery_vs_replan_tradeoff.png",
+    "11_paired_seed_outcomes.png",
+    "12_phase_outcomes_by_method.png",
+    "13_experiment_design.png"
+  ],
+  "failed": [],
+  "warnings": [],
+  "runs": 16
+}

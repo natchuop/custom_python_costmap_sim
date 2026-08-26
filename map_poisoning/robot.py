@@ -15,44 +15,56 @@ from .trust import TrustModel
 
 PATH_INVALID_REPLAN_COOLDOWN_STEPS = 8
 HONEST_REPORT_REFRESH_STEPS = 80
-SOURCE_LINKED_REPLAN_COOLDOWN_STEPS = 25
-SOURCE_LINKED_MIN_TRUST_DELTA = 0.05
-SOURCE_LINKED_MIN_ROUTE_RISK_DROP = 0.20
-SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS = 40
 DEFENSE_PRUNE_PERIOD_STEPS = 20
 TRAFFIC_REROUTE_AFTER_WAITS = 4
 
 
 class _PlanningBelief:
-    """Adapter exposing modular belief and fusion to the A* planner."""
-
     def __init__(self, belief: RobotBeliefMap, fusion: FusionEngine, step: int, temporarily_blocked=()):
         self._belief = belief
         self._fusion = fusion
         self._step = step
         self._temporarily_blocked = {tuple(cell) for cell in temporarily_blocked}
+        # A* may inspect the same cell multiple times. At a fixed simulation
+        # step the operational map is immutable for the duration of one plan,
+        # so cache traversal/blocking results inside this adapter.
+        self._blocked_cache: dict[tuple[int, int], bool] = {}
+        self._cost_cache: dict[tuple[int, int], float] = {}
 
     def in_bounds(self, cell: tuple[int, int]) -> bool:
         return self._belief.in_bounds(cell)
 
     def is_blocked_for_planning(self, cell: tuple[int, int]) -> bool:
+        cell = tuple(cell)
+        cached = self._blocked_cache.get(cell)
+        if cached is not None:
+            return cached
         if cell in self._temporarily_blocked:
-            return True
-        claim, freshness = self._belief.observation_status(cell, self._step)
-        if self._fusion.method == "trust_threshold" and freshness == "unknown":
-            return False
-        return self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
+            value = True
+        else:
+            claim, status = self._belief.observation_status(cell, self._step)
+            if self._fusion.method == "trust_threshold" and status == "unknown":
+                value = False
+            else:
+                value = self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
+        self._blocked_cache[cell] = value
+        return value
 
     def traversal_cost(self, cell: tuple[int, int]) -> float:
+        cell = tuple(cell)
+        if cell in self._cost_cache:
+            return self._cost_cache[cell]
         if cell in self._temporarily_blocked:
-            return math.inf
-        claim, freshness = self._belief.observation_status(cell, self._step)
-        if self._fusion.method == "trust_threshold" and freshness == "unknown":
-            peer_cost = self._fusion.soft_routing_cost(cell, self._step)
-            if math.isinf(peer_cost):
-                return math.inf
-            return max(self._belief.UNKNOWN_TRAVERSAL_COST, peer_cost)
-        return self._belief.traversal_cost(cell, self._step, self._fusion)
+            value = math.inf
+        else:
+            claim, status = self._belief.observation_status(cell, self._step)
+            if self._fusion.method == "trust_threshold" and status == "unknown":
+                peer_cost = self._fusion.soft_routing_cost(cell, self._step)
+                value = math.inf if math.isinf(peer_cost) else max(self._belief.UNKNOWN_TRAVERSAL_COST, peer_cost)
+            else:
+                value = self._belief.traversal_cost(cell, self._step, self._fusion)
+        self._cost_cache[cell] = value
+        return value
 
 
 @dataclass
@@ -64,6 +76,7 @@ class ReplanRecord:
     old_path_length: int
     new_path_length: int
     changed: bool
+    adopted: bool = True
 
 
 @dataclass
@@ -76,7 +89,9 @@ class ModularRobot:
     fusion: FusionEngine
     trust_threshold: float
     admission_policy: str
-    confirmation_cooldown_steps: int = 10
+    confidence_resend_delta: float = 0.10
+    environment_change_period_steps: int = 150
+    lidar_range_cells: int = 5
     position: tuple[int, int] = field(init=False)
     task_index: int = 0
     carrying: bool = False
@@ -84,13 +99,23 @@ class ModularRobot:
     path: list[tuple[int, int]] | None = None
     inbox: list[ClaimReport] = field(default_factory=list)
     pending: dict[str, ClaimReport] = field(default_factory=dict)
+    pending_by_cell: dict[tuple[int, int], set[str]] = field(default_factory=dict)
+    pending_exact_ids: set[str] = field(default_factory=set)
+    pending_index_size: int = 0
     deliveries_completed: int = 0
+    # ``delivery_durations`` is retained for compatibility and measures the
+    # loaded pickup-to-dropoff leg. ``delivery_cycle_durations`` measures the
+    # complete task cycle from task activation (or prior dropoff) to dropoff.
     delivery_durations: list[int] = field(default_factory=list)
+    delivery_cycle_durations: list[int] = field(default_factory=list)
     delivery_start_step: int | None = None
+    delivery_cycle_start_step: int = 0
     no_path_steps: int = 0
     movement_steps: int = 0
     total_distance: float = 0.0
-    total_replans: int = 0
+    total_replans: int = 0  # actual path changes, retained name for report compatibility
+    planning_checks: int = 0
+    path_changes: int = 0
     blocked_moves: int = 0
     traffic_wait_steps: int = 0
     consecutive_traffic_waits: int = 0
@@ -99,16 +124,18 @@ class ModularRobot:
     replan_records: list[ReplanRecord] = field(default_factory=list)
     no_path_causes: dict[str, int] = field(default_factory=dict)
     last_path_invalid_replan_step: int = -10**9
-    last_source_linked_replan_step: int = -10**9
     last_shared_claim: dict[tuple[int, int], ClaimType] = field(default_factory=dict)
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
-    verified_reports: set[str] = field(default_factory=set)
-    last_positive_trust_update_step: dict[int, int] = field(default_factory=dict)
-    defense_replan_needed: bool = False
-    source_linked_replan_context: dict | None = None
+    last_shared_sensor_confidence: dict[tuple[int, int], float] = field(default_factory=dict)
+    # report_id -> verification step. Only the operational memory horizon is
+    # retained; expired report IDs cannot affect fusion or trust anymore.
+    verified_reports: dict[str, int] = field(default_factory=dict)
+    last_trust_batches: list[dict] = field(default_factory=list)
+    last_route_affecting_report_ids: set[str] = field(default_factory=set)
+    previous_scan_observations: dict[tuple[int, int], DirectObservation] = field(default_factory=dict)
+    current_scan_observations: dict[tuple[int, int], DirectObservation] = field(default_factory=dict)
     accepted_reports: int = 0
     rejected_reports: int = 0
-    # Traffic coordination (sim2 parity, single-cell robots).
     traffic_mode: str = "NORMAL"
     traffic_blocked_by: int | None = None
     active_yield_target: tuple[int, int] | None = None
@@ -129,7 +156,6 @@ class ModularRobot:
         return tuple(self.path[0]) if self.path else None
 
     def reserved_cells(self) -> set[tuple[int, int]]:
-        """Current body plus the cell this robot intends to step into."""
         cells = {tuple(self.position)}
         nxt = self.proposed_next_cell()
         if nxt is not None:
@@ -147,6 +173,29 @@ class ModularRobot:
         task = self.tasks[self.task_index]
         return task.dropoff if self.carrying else task.pickup
 
+    def _add_pending(self, report: ClaimReport) -> None:
+        self.pending[report.report_id] = report
+        cell = tuple(report.target_cell)
+        self.pending_by_cell.setdefault(cell, set()).add(report.report_id)
+        self.pending_index_size += 1
+        remembered = self.belief.direct.get(cell)
+        if remembered is not None and remembered.step == report.observation_step:
+            self.pending_exact_ids.add(report.report_id)
+
+    def _remove_pending(self, report_id: str) -> ClaimReport | None:
+        report = self.pending.pop(report_id, None)
+        self.pending_exact_ids.discard(report_id)
+        if report is not None:
+            self.pending_index_size = max(0, self.pending_index_size - 1)
+        if report is not None:
+            cell = tuple(report.target_cell)
+            ids = self.pending_by_cell.get(cell)
+            if ids is not None:
+                ids.discard(report_id)
+                if not ids:
+                    self.pending_by_cell.pop(cell, None)
+        return report
+
     def receive(self, report: ClaimReport) -> None:
         self.inbox.append(report)
 
@@ -156,60 +205,44 @@ class ModularRobot:
     def route_evidence(self, step: int) -> float:
         return sum(self.fusion.evidence(cell, step) for cell in self.remaining_route())
 
-    def should_share_observation(self, cell: tuple[int, int], claim: ClaimType, step: int) -> bool:
+    def remaining_route_cost(self, step: int) -> float | None:
+        """Current operational cost of the remaining route without running A*."""
+        path = list(self.path or ())
+        if not path:
+            return None
+        self.fusion.set_time(step)
+        adapter = _PlanningBelief(self.belief, self.fusion, step)
+        return self._path_cost(path, adapter)
+
+    def should_share_observation(
+        self,
+        cell: tuple[int, int],
+        claim: ClaimType,
+        step: int,
+        sensor_confidence: float = 1.0,
+    ) -> bool:
         previous = self.last_shared_claim.get(cell)
+        previous_conf = self.last_shared_sensor_confidence.get(cell)
         last_step = self.last_shared_step.get(cell, -10**9)
-        if previous == claim and step - last_step < HONEST_REPORT_REFRESH_STEPS:
+        claim_changed = previous != claim
+        confidence_changed = previous_conf is None or abs(float(sensor_confidence) - previous_conf) + 1e-12 >= self.confidence_resend_delta
+        refresh_due = step - last_step >= HONEST_REPORT_REFRESH_STEPS
+        if not claim_changed and not confidence_changed and not refresh_due:
             return False
         self.last_shared_claim[cell] = claim
+        self.last_shared_sensor_confidence[cell] = float(sensor_confidence)
         self.last_shared_step[cell] = step
         return True
 
-    def _source_linked_route_cells(self, step: int) -> list[tuple[int, int]]:
-        if not self.path:
-            return []
-        anchors = self.path[:SOURCE_LINKED_ROUTE_LOOKAHEAD_ANCHORS]
-        cells: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        for anchor in anchors:
-            if self.belief.has_direct_free(anchor, step):
-                continue
-            if anchor not in seen:
-                seen.add(anchor)
-                cells.append(anchor)
-        return cells
-
-    def reports_affect_remaining_route(
-        self,
-        reports: Iterable[tuple[ClaimReport, object]],
-        malicious_ids: FrozenSet[str],
-        step: int,
-    ) -> bool:
+    def reports_affect_remaining_route(self, reports: Iterable[tuple[ClaimReport, object]], step: int) -> bool:
         if not self.path:
             return False
-        remaining = list(self.path)
-        for report, _ in reports:
-            target = tuple(report.target_cell)
-            if self.belief.has_direct_free(target, step):
-                continue
-            is_malicious = report.report_id in malicious_ids
-            if (
-                report.claim == ClaimType.FREE
-                and not is_malicious
-                and self.fusion.method != "majority_vote"
-            ):
-                continue
-            if target in remaining:
-                return True
-        return False
+        return any(report.report_id in self.last_route_affecting_report_ids for report, _ in reports)
 
     def path_invalid_or_empty(self, step: int) -> bool:
         if not self.path:
             return True
-        for cell in self.path:
-            if self.belief.is_blocked_for_planning(cell, self.fusion, step):
-                return True
-        return False
+        return any(self.belief.is_blocked_for_planning(cell, self.fusion, step) for cell in self.path)
 
     def should_replan_for_path_state(self, step: int) -> bool:
         if self.completed:
@@ -218,109 +251,246 @@ class ModularRobot:
             return self.position != self.goal
         if not self.path_invalid_or_empty(step):
             return False
+        # Current LiDAR is authoritative and must never be suppressed by the
+        # generic path-invalid cooldown.  The cooldown only throttles repeated
+        # replans caused by persistent remembered/peer state; a newly visible
+        # physical obstacle on any remaining path cell requires an immediate
+        # same-step A* check so the robot does not attempt to drive into it.
+        if any(
+            self.belief.observation_status(cell, step) == (ClaimType.BLOCKED, "current")
+            for cell in self.path
+        ):
+            return True
         return step - self.last_path_invalid_replan_step >= PATH_INVALID_REPLAN_COOLDOWN_STEPS
 
     def process_inbox(self, step: int, malicious_ids: FrozenSet[str] = frozenset()):
         accepted = []
-        route_affected = False
+        self.last_route_affecting_report_ids.clear()
+        remaining = set(self.path or ())
         for report in self.inbox:
             policy = decide(self.admission_policy, self.trust.score(report.sender_id), self.trust_threshold)
             if not policy.accepted:
                 self.rejected_reports += 1
                 continue
+            target = tuple(report.target_cell)
+            route_candidate = target in remaining and not self.belief.has_direct_free(target, step)
+            before_cost = self.belief.traversal_cost(target, step, self.fusion) if route_candidate else None
+            # The malicious label is passed only for offline counterfactual
+            # metrics; it never changes fusion weighting or robot decisions.
             is_malicious = report.report_id in malicious_ids
             previous = self.fusion.add(report, policy.influence, is_malicious=is_malicious)
             if previous is not None:
-                self.pending.pop(previous.report.report_id, None)
-            self.pending[report.report_id] = report
+                self._remove_pending(previous.report.report_id)
+            self._add_pending(report)
             accepted.append((report, policy))
             self.accepted_reports += 1
-            if self._report_affects_route(report, malicious_ids, step):
-                route_affected = True
+            if route_candidate:
+                after_cost = self.belief.traversal_cost(target, step, self.fusion)
+                materially_changed = (
+                    math.isinf(before_cost) != math.isinf(after_cost)
+                    or (not math.isinf(before_cost) and not math.isinf(after_cost) and abs(after_cost - before_cost) >= 0.10)
+                )
+                if materially_changed:
+                    self.last_route_affecting_report_ids.add(report.report_id)
         self.inbox.clear()
-        return accepted, route_affected
+        return accepted
 
-    def _report_affects_route(self, report: ClaimReport, malicious_ids: FrozenSet[str], step: int) -> bool:
-        target = tuple(report.target_cell)
-        if self.belief.has_direct_free(target, step):
-            return False
-        is_malicious = report.report_id in malicious_ids
-        if report.claim == ClaimType.FREE and not is_malicious and self.fusion.method != "majority_vote":
-            return False
-        return target in self.remaining_route()
-
-    def sense(self, world, step: int, other_positions: Iterable[tuple[int, int]]) -> list[DirectObservation]:
+    def sense(self, world, step: int, other_positions: Iterable[tuple[int, int]], truth_grid=None) -> list[DirectObservation]:
         if step % DEFENSE_PRUNE_PERIOD_STEPS == 0:
             self.fusion.prune(step)
-            self.belief.prune_expired(step, max_age=self.fusion.max_claim_age)
-        truth = world.truth_grid(step)
-        raw = lidar_observations(truth, self.position, other_positions)
+            self.belief.prune_expired(step)
+            # Pending validation should not outlive operational report memory.
+            self.pending = {
+                report_id: report for report_id, report in self.pending.items()
+                if step - report.observation_step < self.fusion.max_claim_age
+            }
+            self.pending_by_cell = {}
+            for report_id, report in self.pending.items():
+                self.pending_by_cell.setdefault(tuple(report.target_cell), set()).add(report_id)
+            self.pending_exact_ids.intersection_update(self.pending.keys())
+            self.pending_index_size = len(self.pending)
+            self.verified_reports = {
+                report_id: verified_step for report_id, verified_step in self.verified_reports.items()
+                if step - verified_step < self.fusion.max_claim_age
+            }
+        truth = world.truth_grid(step) if truth_grid is None else truth_grid
+        self.belief.begin_scan(step)
+        raw = lidar_observations(truth, self.position, other_positions, radius=self.lidar_range_cells)
         observations: list[DirectObservation] = []
-        for cell, claim in raw.items():
-            obs = DirectObservation(self.robot_id, cell, claim, step)
+        for cell, reading in raw.items():
+            obs = DirectObservation(
+                self.robot_id,
+                cell,
+                reading.claim,
+                step,
+                reading.sensor_confidence,
+            )
             self.belief.observe(obs)
             observations.append(obs)
+        self.previous_scan_observations = self.current_scan_observations
+        self.current_scan_observations = {obs.cell: obs for obs in observations}
         return observations
 
-    def _resolve_observation(self, report: ClaimReport, by_cell: dict, step: int) -> DirectObservation | None:
+    def _same_environment_epoch(self, earlier_step: int, later_step: int) -> bool:
+        """Return whether temporary-obstacle truth is guaranteed unchanged.
+
+        Temporary obstacles are authored in fixed change windows.  A peer
+        report may remain useful occupancy evidence for the full 300-step
+        memory horizon, but trust should only be rewarded/penalized when the
+        recipient can compare observations from the same physical-world epoch.
+        This avoids blaming an honest sender because a pallet moved later.
+        """
+        period = max(1, int(self.environment_change_period_steps))
+        return int(earlier_step) // period == int(later_step) // period
+
+    def _resolve_observation(
+        self, report: ClaimReport, by_cell: dict, step: int
+    ) -> tuple[DirectObservation, bool] | None:
+        # Prefer the previous scan when it is exactly contemporaneous with the
+        # peer report.  This matters when a temporary obstacle changes at the
+        # current step: the exact step-N snapshot is stronger evidence than the
+        # new step-(N+1) world state.
+        exact = self.previous_scan_observations.get(report.target_cell)
+        if exact is not None and exact.step == report.observation_step:
+            return exact, True
         observed = by_cell.get(report.target_cell)
         if observed is not None:
-            return observed
-        claim, freshness = self.belief.observation_status(report.target_cell, step)
-        if freshness != "fresh" or claim is None:
+            return observed, self._same_environment_epoch(report.observation_step, step)
+        # Reports arrive after sensing, so a report cannot be validated until
+        # the next simulation step.  An exact same-time direct snapshot is
+        # always comparable even if verification itself happens later.  Do NOT
+        # compare against arbitrary older direct memory: in a dynamic world
+        # that can turn an honest report into a false contradiction simply
+        # because a pallet moved.
+        remembered = self.belief.direct.get(report.target_cell)
+        if remembered is None or remembered.step != report.observation_step:
             return None
-        return DirectObservation(self.robot_id, report.target_cell, claim, step)
+        if step - remembered.step >= self.belief.memory_steps:
+            return None
+        return remembered, True
 
-    def _verify_report(
-        self,
-        report: ClaimReport,
-        observed: DirectObservation,
-        step: int,
-        *,
-        results: list,
-        verified_by_sender: dict[int, list[tuple[ClaimReport, bool]]],
-        old_trust_by_sender: dict[int, float],
-        processed: set[str],
-    ) -> None:
-        if report.report_id in processed or report.report_id in self.verified_reports:
-            return
-        if report.received_step is not None and report.received_step == step:
-            return
-        processed.add(report.report_id)
-        self.verified_reports.add(report.report_id)
-        self.pending.pop(report.report_id, None)
-        truth_matches = observed.claim == report.claim
-        sender_id = report.sender_id
-        if sender_id not in old_trust_by_sender:
-            old_trust_by_sender[sender_id] = self.trust.score(sender_id)
-        stale_honest_report = (
-            report.scenario_event_id is None
-            and step - report.observation_step > self.belief.memory_steps
-        )
-        if stale_honest_report:
-            outcome = VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
-        else:
-            outcome = (
-                VerificationOutcome.CONFIRMED
-                if truth_matches
-                else VerificationOutcome.CONTRADICTED_FRESH
-            )
-        evidence_before = self.fusion.evidence(report.target_cell, step)
-        probability_before = self.fusion.probability(report.target_cell, step)
-        trust_severity = 1.0
-        if outcome == VerificationOutcome.CONFIRMED:
-            last_credit = self.last_positive_trust_update_step.get(sender_id, -10**9)
-            if step - last_credit < self.confirmation_cooldown_steps:
-                # Keep the validation event, but do not let one lidar sweep
-                # provide dozens of independent reputation credits.
-                trust_severity = 0.0
+    def _report_age_weight(self, report: ClaimReport, step: int) -> float:
+        age = max(0, step - report.observation_step)
+        return max(0.0, 1.0 - age / float(self.fusion.max_claim_age))
+
+    def verify(self, observations: Iterable[DirectObservation], step: int):
+        """Validate peer reports and perform one trust update per sender/scan."""
+        by_cell = {item.cell: item for item in observations}
+        processed: set[str] = set()
+        candidates: list[tuple[ClaimReport, DirectObservation, VerificationOutcome, float, float]] = []
+
+        def collect(report: ClaimReport, observed: DirectObservation, temporally_comparable: bool) -> None:
+            if report.report_id in processed or report.report_id in self.verified_reports:
+                return
+            processed.add(report.report_id)
+            self.verified_reports[report.report_id] = step
+            self._remove_pending(report.report_id)
+            age_weight = self._report_age_weight(report, step)
+            if age_weight <= 0.0 or not temporally_comparable:
+                outcome = VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
             else:
-                self.last_positive_trust_update_step[sender_id] = step
-        old_trust, new_trust = self.trust.update(sender_id, outcome, severity=trust_severity)
-        evidence_after = self.fusion.evidence(report.target_cell, step)
-        probability_after = self.fusion.probability(report.target_cell, step)
-        results.append(
-            (
+                outcome = VerificationOutcome.CONFIRMED if observed.claim == report.claim else VerificationOutcome.CONTRADICTED_FRESH
+            evidence_before = self.fusion.evidence(report.target_cell, step)
+            probability_before = self.fusion.probability(report.target_cell, step)
+            candidates.append((report, observed, outcome, evidence_before, probability_before))
+
+        # Tests/legacy callers may insert directly into ``pending``. Rebuild
+        # the auxiliary index only when its size proves it is out of sync; the
+        # normal production path uses _add_pending/_remove_pending and avoids
+        # scanning the whole pending set each step.
+        if self.pending_index_size != len(self.pending):
+            self.pending_by_cell = {}
+            self.pending_exact_ids = set()
+            for report_id, report in self.pending.items():
+                cell = tuple(report.target_cell)
+                self.pending_by_cell.setdefault(cell, set()).add(report_id)
+                remembered = self.belief.direct.get(cell)
+                if remembered is not None and remembered.step == report.observation_step:
+                    self.pending_exact_ids.add(report_id)
+            self.pending_index_size = len(self.pending)
+
+        candidate_ids = set(self.pending_exact_ids)
+        for cell in by_cell:
+            candidate_ids.update(self.pending_by_cell.get(cell, ()))
+        for cell in self.previous_scan_observations:
+            candidate_ids.update(self.pending_by_cell.get(cell, ()))
+        for report_id in candidate_ids:
+            report = self.pending.get(report_id)
+            if report is None:
+                continue
+            resolved = self._resolve_observation(report, by_cell, step)
+            if resolved is not None:
+                observed, comparable = resolved
+                collect(report, observed, comparable)
+
+        # A current direct observation supersedes any contradictory retained
+        # peer claim.  If the report and current sighting are from different
+        # temporary-obstacle epochs, retract the stale map evidence without a
+        # trust penalty; the physical world may simply have changed.
+        for cell, observed in by_cell.items():
+            for item in list(self.fusion.claims_at(cell)):
+                report = item.report
+                if report.claim == observed.claim:
+                    continue
+                if report.report_id not in processed and report.report_id not in self.verified_reports:
+                    collect(report, observed, self._same_environment_epoch(report.observation_step, step))
+                elif report.report_id not in processed:
+                    self.fusion.retract(report)
+                    self._remove_pending(report.report_id)
+
+        by_sender: dict[int, list[tuple[ClaimReport, DirectObservation, VerificationOutcome]]] = {}
+        for report, observed, outcome, _, _ in candidates:
+            by_sender.setdefault(report.sender_id, []).append((report, observed, outcome))
+
+        sender_trust: dict[int, tuple[float, float]] = {}
+        self.last_trust_batches = []
+        for sender_id, items in by_sender.items():
+            weighted = []
+            for report, observed, outcome in items:
+                if outcome not in (VerificationOutcome.CONFIRMED, VerificationOutcome.CONTRADICTED_FRESH):
+                    continue
+                q = (
+                    max(0.0, min(1.0, report.sensor_confidence))
+                    * self._report_age_weight(report, step)
+                    * max(0.0, min(1.0, observed.sensor_confidence))
+                )
+                if q > 0.0:
+                    weighted.append((outcome, q))
+            if not weighted:
+                current = self.trust.score(sender_id)
+                sender_trust[sender_id] = (current, current)
+                continue
+            total_q = sum(q for _, q in weighted)
+            average_quality = total_q / len(weighted)
+            confirmed_fraction = sum(q for outcome, q in weighted if outcome == VerificationOutcome.CONFIRMED) / total_q
+            contradicted_fraction = sum(q for outcome, q in weighted if outcome == VerificationOutcome.CONTRADICTED_FRESH) / total_q
+            confirmed_weight = confirmed_fraction * average_quality
+            contradicted_weight = contradicted_fraction * average_quality
+            old_trust, new_trust = self.trust.update_batch(sender_id, confirmed_weight, contradicted_weight)
+            sender_trust[sender_id] = (old_trust, new_trust)
+            self.last_trust_batches.append({
+                "step": step,
+                "sender_id": sender_id,
+                "old_trust": old_trust,
+                "new_trust": new_trust,
+                "confirmed_weight": confirmed_weight,
+                "contradicted_weight": contradicted_weight,
+                "validated_reports": len(items),
+                "source_memory": self.trust.memory_score(sender_id),
+                "report_ids": [report.report_id for report, _, _ in items],
+            })
+
+        results = []
+        for report, observed, outcome, evidence_before, probability_before in candidates:
+            old_trust, new_trust = sender_trust.get(report.sender_id, (self.trust.score(report.sender_id), self.trust.score(report.sender_id)))
+            truth_matches = observed.claim == report.claim
+            if outcome == VerificationOutcome.CONTRADICTED_FRESH:
+                self.fusion.retract(report)
+            elif outcome == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED and not truth_matches:
+                self.fusion.retract(report)
+            evidence_after = self.fusion.evidence(report.target_cell, step)
+            probability_after = self.fusion.probability(report.target_cell, step)
+            results.append((
                 report,
                 outcome,
                 old_trust,
@@ -329,169 +499,81 @@ class ModularRobot:
                 evidence_after,
                 probability_before,
                 probability_after,
-            )
-        )
-        verified_by_sender.setdefault(sender_id, []).append((report, truth_matches))
-        if outcome == VerificationOutcome.CONTRADICTED_FRESH:
-            if report.claim == ClaimType.BLOCKED and observed.claim == ClaimType.FREE:
-                self.belief.observe(
-                    DirectObservation(self.robot_id, report.target_cell, ClaimType.FREE, step)
-                )
-            elif report.claim == ClaimType.FREE and observed.claim == ClaimType.BLOCKED:
-                self.belief.observe(
-                    DirectObservation(self.robot_id, report.target_cell, ClaimType.BLOCKED, step)
-                )
-            self.fusion.retract(report)
-        elif outcome == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED:
-            # The direct reading is current, but an old honest peer report is
-            # not reliable evidence that the sender was wrong when it spoke.
-            if not truth_matches:
-                self.fusion.retract(report)
-
-    def verify(self, observations: Iterable[DirectObservation], step: int):
-        results = []
-        by_cell = {item.cell: item for item in observations}
-        verified_by_sender: dict[int, list[tuple[ClaimReport, bool]]] = {}
-        old_trust_by_sender: dict[int, float] = {}
-        processed: set[str] = set()
-
-        for report in list(self.pending.values()):
-            observed = self._resolve_observation(report, by_cell, step)
-            if observed is None:
-                continue
-            self._verify_report(
-                report,
-                observed,
-                step,
-                results=results,
-                verified_by_sender=verified_by_sender,
-                old_trust_by_sender=old_trust_by_sender,
-                processed=processed,
-            )
-
-        # Stored peer BLOCKED claims can outlive the one-shot pending queue.
-        # Re-check them whenever fresh direct sensing shows the cell is clear.
-        for cell, observed in by_cell.items():
-            if observed.claim != ClaimType.FREE:
-                continue
-            for item in self.fusion.claims_at(cell):
-                report = item.report
-                if report.claim != ClaimType.BLOCKED:
-                    continue
-                if report.received_step is not None and report.received_step == step:
-                    continue
-                self._verify_report(
-                    report,
-                    observed,
-                    step,
-                    results=results,
-                    verified_by_sender=verified_by_sender,
-                    old_trust_by_sender=old_trust_by_sender,
-                    processed=processed,
-                )
-
-        if self.fusion.method == "source_linked" and verified_by_sender:
-            route_cells = self._source_linked_route_cells(step)
-            for sender_id, items in verified_by_sender.items():
-                old_trust = float(old_trust_by_sender[sender_id])
-                new_trust = float(self.trust.score(sender_id))
-                trust_delta = old_trust - new_trust
-                if trust_delta <= 0.0:
-                    continue
-                if trust_delta < SOURCE_LINKED_MIN_TRUST_DELTA:
-                    continue
-                if step - self.last_source_linked_replan_step < SOURCE_LINKED_REPLAN_COOLDOWN_STEPS:
-                    continue
-                risk_before = self.fusion.sender_route_risk(sender_id, route_cells, step, trust_override=old_trust)
-                risk_after = self.fusion.sender_route_risk(sender_id, route_cells, step, trust_override=new_trust)
-                risk_drop = risk_before - risk_after
-                # A false claim may already have forced the robot onto a detour,
-                # so it is no longer present on the *current* route.  A verified
-                # trust decrease must still release that earlier detour.
-                sender_has_active_blocked_claim = any(
-                    item.report.sender_id == sender_id and item.report.claim == ClaimType.BLOCKED
-                    for items in self.fusion.claims.values() for item in items
-                )
-                if risk_drop < SOURCE_LINKED_MIN_ROUTE_RISK_DROP and not sender_has_active_blocked_claim:
-                    continue
-                self.defense_replan_needed = True
-                self.source_linked_replan_context = {
-                    "sender_id": sender_id,
-                    "old_trust": old_trust,
-                    "new_trust": new_trust,
-                    "trust_delta": trust_delta,
-                    "route_risk_before": risk_before,
-                    "route_risk_after": risk_after,
-                    "route_risk_drop": risk_drop,
-                }
-                self.last_source_linked_replan_step = step
-                break
-
-        if self.fusion.method == "trust_threshold" and verified_by_sender:
-            for sender_id in verified_by_sender:
-                if old_trust_by_sender[sender_id] >= self.trust_threshold > self.trust.score(sender_id):
-                    self.defense_replan_needed = True
-                    break
-
+            ))
         return results
 
-    def replan(self, step: int, reason: str, temporarily_blocked=()) -> bool:
+    def _path_cost(self, path, adapter: _PlanningBelief) -> float | None:
+        if path is None:
+            return None
+        total = 0.0
+        for cell in path:
+            cost = adapter.traversal_cost(cell)
+            if math.isinf(cost):
+                return math.inf
+            total += cost
+        return total
+
+    def replan(
+        self,
+        step: int,
+        reason: str,
+        temporarily_blocked=(),
+        *,
+        only_if_improved: bool = False,
+        improvement_epsilon: float = 0.01,
+    ) -> bool:
         old = list(self.path or ())
-        old_cost = sum(self.fusion.routing_cost(cell, step) for cell in old) if old else None
         self.fusion.set_time(step)
         adapter = _PlanningBelief(self.belief, self.fusion, step, temporarily_blocked)
-        planned = astar(
-            self.position,
-            self.goal,
-            lambda cell: adapter.traversal_cost(cell),
-        )
+        old_cost = self._path_cost(old, adapter) if old else None
+        planned = astar(self.position, self.goal, lambda cell: adapter.traversal_cost(cell))
+        new_cost = self._path_cost(planned, adapter)
+        self.planning_checks += 1
+
+        adopt = True
+        if only_if_improved and old and planned is not None and old_cost is not None and not math.isinf(old_cost):
+            adopt = new_cost is not None and (old_cost - new_cost) > improvement_epsilon
         if planned is None and reason.startswith("traffic_") and old:
-            # A failed traffic detour should not erase a still-valid waiting route.
-            self.path = old
-        else:
+            adopt = False
+        if adopt:
             self.path = planned
-        # A missing path is a real no-path condition in the modular engine.
         new = list(self.path or ())
-        new_cost = sum(self.fusion.routing_cost(cell, step) for cell in new) if new else None
         changed = old != new
-        self.total_replans += 1
-        if reason.startswith("traffic_"):
-            self.traffic_replans += 1
-        self.productive_replans += int(changed)
+        if changed:
+            self.path_changes += 1
+            self.total_replans += 1
+            self.productive_replans += 1
+            if reason.startswith("traffic_"):
+                self.traffic_replans += 1
         if "path_invalid" in reason or reason == "path_invalid_or_empty":
             self.last_path_invalid_replan_step = step
-        self.replan_records.append(
-            ReplanRecord(step, reason, old_cost, new_cost, len(old), len(new), changed)
-        )
+        self.replan_records.append(ReplanRecord(
+            step,
+            reason,
+            old_cost,
+            self._path_cost(new, adapter) if new else None,
+            len(old),
+            len(new),
+            changed,
+            adopt,
+        ))
         return bool(self.path)
 
     def classify_no_path(self, world, step: int) -> str:
-        truth = astar(
-            self.position,
-            self.goal,
-            lambda cell: math.inf if world.state(cell, step) == ClaimType.BLOCKED else 1.0,
-        )
+        truth = astar(self.position, self.goal, lambda cell: math.inf if world.state(cell, step) == ClaimType.BLOCKED else 1.0)
         if truth is None:
             cause = "truth_disconnected"
         else:
             direct = astar(
                 self.position,
                 self.goal,
-                lambda cell: math.inf if self.belief.direct_state(cell) == ClaimType.BLOCKED else 1.0,
+                lambda cell: math.inf if self.belief.observation_status(cell, step) == (ClaimType.BLOCKED, "current") else 1.0,
             )
             if direct is None:
                 cause = "direct_belief_disconnected"
             else:
-                operational = astar(
-                    self.position,
-                    self.goal,
-                    lambda cell: self.belief.traversal_cost(cell, step, self.fusion),
-                )
-                cause = (
-                    "peer_fusion_disconnected"
-                    if operational is None
-                    else "planner_or_state_error"
-                )
+                operational = astar(self.position, self.goal, lambda cell: self.belief.traversal_cost(cell, step, self.fusion))
+                cause = "peer_fusion_disconnected" if operational is None else "planner_or_state_error"
         self.no_path_causes[cause] = self.no_path_causes.get(cause, 0) + 1
         return cause
 
@@ -504,12 +586,14 @@ class ModularRobot:
                 self.deliveries_completed += 1
                 if self.delivery_start_step is not None:
                     self.delivery_durations.append(step - self.delivery_start_step)
+                self.delivery_cycle_durations.append(step - self.delivery_cycle_start_step)
                 self.delivery_start_step = None
                 self.task_index += 1
                 if self.task_index >= len(self.tasks):
                     self.completed = True
                     self.path = None
                     return "task_transition"
+                self.delivery_cycle_start_step = step
                 self.path = None
                 return "task_transition"
             self.carrying = True
@@ -521,14 +605,13 @@ class ModularRobot:
             return "no_path"
         next_cell = self.path[0]
         if next_cell in occupied and next_cell != self.position:
-            # Another robot is a transient traffic constraint, not evidence of
-            # a physical obstacle. Preserve the route and record a wait.
             self.traffic_wait_steps += 1
             self.consecutive_traffic_waits += 1
             return "traffic_wait"
         if world.state(next_cell, step) == ClaimType.BLOCKED:
             self.blocked_moves += 1
-            self.belief.observe(DirectObservation(self.robot_id, next_cell, ClaimType.BLOCKED, step))
+            # Physical contact is authoritative and maximum confidence.
+            self.belief.observe(DirectObservation(self.robot_id, next_cell, ClaimType.BLOCKED, step, 1.0))
             self.path = None
             return "blocked_move"
         self.path.pop(0)

@@ -112,22 +112,30 @@ def _paint_overlays(arr, overlays, *, attacker_view: bool):
 
 
 def _dominant_blocked_sender(robot, items, step):
-    threshold = float(getattr(robot, "trust_threshold", 0.0))
+    """Choose a displayed BLOCKED source only when fusion says it matters."""
+    if robot.fusion.method == "majority_vote":
+        if robot.fusion.vote(items[0].report.target_cell, step) <= 0:
+            return None
+    elif robot.fusion.routing_cost(items[0].report.target_cell, step) <= 1.0 + 1e-9:
+        return None
     blocked = []
     for item in items:
-        if int(item.report.claim) != int(ClaimType.BLOCKED):
+        report = item.report
+        if int(report.claim) != int(ClaimType.BLOCKED):
             continue
-        if step - int(item.report.observation_step) > robot.fusion.max_claim_age:
+        if step - int(report.observation_step) >= robot.fusion.max_claim_age:
             continue
-        score = robot.trust.score(item.report.sender_id)
-        if score < threshold:
+        weight = robot.fusion.operational_weight(report, step)
+        if weight <= 1e-12:
             continue
-        blocked.append((score, item.report.sender_id))
+        # Display attribution follows actual operational influence rather than
+        # current trust. This is important for the trust-agnostic baselines and
+        # for Trust Fused, whose old reports intentionally retain trust-at-report.
+        blocked.append((weight, int(report.observation_step), -int(report.sender_id), report.sender_id))
     if not blocked:
         return None
     blocked.sort(reverse=True)
-    return blocked[0][1]
-
+    return blocked[0][-1]
 
 def _paint_trusted_attack_reports(arr, robot, log, step, threshold: float) -> None:
     """Paint active trusted attacker BLOCKED fusion claims on victim belief maps."""
@@ -169,7 +177,7 @@ def _direct_display_state(robot, cell, step, display_age):
 
 def _fresh_direct_free(robot, cell, step) -> bool:
     claim, freshness = robot.belief.observation_status(cell, step)
-    return freshness == "fresh" and claim == ClaimType.FREE
+    return freshness == "current" and claim == ClaimType.FREE
 
 
 def _explored_clear(robot, cell, step, display_age) -> bool:
@@ -226,26 +234,6 @@ def combined_display_grid(robot, world, log, step, robots):
     attacker = log.get("malicious_robot_id")
     _paint_overlays(arr, _overlay_groups(log, step), attacker_view=robot.robot_id == attacker)
 
-    # Visualize trusted peers' own direct BLOCKED observations.
-    # Clear cells stay uncolored; only obstacles use the source robot color.
-    threshold = float(getattr(robot, "trust_threshold", 0.0))
-    for peer in robots:
-        if peer.robot_id == robot.robot_id:
-            continue
-        if robot.trust.score(peer.robot_id) < threshold:
-            continue
-        peer_color = ROBOT_DISPLAY.get(peer.robot_id, DISPLAY_BLOCKED)
-        for cell in peer.belief.direct:
-            if arr[cell] == DISPLAY_STATIC:
-                continue
-            if _fresh_direct_free(robot, cell, step):
-                continue
-            claim = peer.belief.display_state(cell, step, max_age=display_age)
-            if claim != ClaimType.BLOCKED:
-                continue
-            arr[cell] = peer_color
-
-    _paint_trusted_attack_reports(arr, robot, log, step, threshold)
 
     if not robot.completed:
         task = robot.tasks[robot.task_index]
@@ -276,6 +264,7 @@ def init_live_log(log, world, robots, config, manifest) -> None:
         "paths": {robot.robot_id: [] for robot in robots},
         "trust": {robot.robot_id: [] for robot in robots},
         "pairwise_trust": [],
+        "pairwise_source_memory": [],
         "trusted": {robot.robot_id: [] for robot in robots},
         "deliveries": {robot.robot_id: [] for robot in robots},
         "carrying": {robot.robot_id: [] for robot in robots},
@@ -283,14 +272,23 @@ def init_live_log(log, world, robots, config, manifest) -> None:
         "rejected": {robot.robot_id: [] for robot in robots},
         "replans": {robot.robot_id: [] for robot in robots},
         "completed": {robot.robot_id: [] for robot in robots},
+        "report_counts": [],
+        "malicious_report_counts": [],
         "heatmap": np.zeros((rows, cols), dtype=np.int32),
-        "recon_heatmap": None,
+        "heatmap_static_grid": np.asarray(world.static_grid, dtype=np.uint8).copy(),
+        "recon_heatmap": (
+            None
+            if manifest.reconnaissance_heatmap is None
+            else np.asarray(manifest.reconnaissance_heatmap, dtype=np.int32)
+        ),
+        "heatmap_reference_steps": int(manifest.phase_boundaries.get("total", config.phases.total_steps)),
         "recon_end": config.phases.recon_steps,
         "attack_start": config.phases.recon_steps,
         "threshold": config.trust.threshold,
         "method": log.get("defense_method"),
         "map_view": config.visualization.map_view,
         "seed": config.seed,
+        "lidar_range_cells": int(config.lidar_range_cells),
     }
     log["attack_events"] = manifest.attack_events
     log["benign_robot_ids"] = manifest.benign_robot_ids
@@ -304,6 +302,7 @@ def record_live_frame(log, world, robots, step, phase) -> None:
     attacker = log["malicious_robot_id"]
     map_view = live.get("map_view", "combined")
     snapshot = {}
+    memory_snapshot = {}
     for robot in robots:
         rid = robot.robot_id
         local = local_display_grid(robot, world, step)
@@ -314,8 +313,11 @@ def record_live_frame(log, world, robots, step, phase) -> None:
         live["beliefs"][rid].append(selected)
         live["positions"][rid].append(robot.position)
         live["paths"][rid].append(list(robot.path or ()))
-        live["trust"][rid].append(robot.trust.score(attacker))
-        live["trusted"][rid].append(robot.trust.score(attacker) >= live["threshold"])
+        attacker_trust = robot.trust.score(attacker)
+        attacker_memory = robot.trust.memory_score(attacker)
+        live["trust"][rid].append(attacker_trust)
+        effective_attacker_trust = min(attacker_trust, attacker_memory) if live.get("method") == "source_memory" else attacker_trust
+        live["trusted"][rid].append(effective_attacker_trust >= live["threshold"])
         live["deliveries"][rid].append(robot.deliveries_completed)
         live["carrying"][rid].append(robot.carrying)
         live["accepted"][rid].append(robot.accepted_reports)
@@ -323,10 +325,14 @@ def record_live_frame(log, world, robots, step, phase) -> None:
         live["replans"][rid].append(robot.total_replans)
         live["completed"][rid].append(robot.completed)
         snapshot[rid] = {other.robot_id: robot.trust.score(other.robot_id) for other in robots if other.robot_id != rid}
+        memory_snapshot[rid] = {other.robot_id: robot.trust.memory_score(other.robot_id) for other in robots if other.robot_id != rid}
         if rid != attacker:
             live["heatmap"][robot.position] += 1
     live["pairwise_trust"].append(snapshot)
-    if step + 1 == live["recon_end"]:
+    live["pairwise_source_memory"].append(memory_snapshot)
+    live["report_counts"].append(int(log.get("report_count_total", 0)))
+    live["malicious_report_counts"].append(int(log.get("malicious_report_count_total", 0)))
+    if step + 1 == live["recon_end"] and live["recon_heatmap"] is None:
         live["recon_heatmap"] = live["heatmap"].copy()
 
 
@@ -337,12 +343,26 @@ def _draw_path(ax, path, color):
     return line
 
 
-def _draw_lidar(ax, origin, cells, color, alpha=0.22):
+def _lidar_items(readings):
+    if isinstance(readings, dict):
+        return list(readings.items())
+    return [(cell, None) for cell in readings]
+
+
+def _draw_lidar(ax, origin, readings, color, alpha=0.22, radius=LIDAR_RANGE_CELLS):
+    # Allocate enough artists for every lattice cell in the configured sensor
+    # circle; this avoids losing rays when later frames expose more cells.
+    radius = max(1, int(radius))
+    max_count = sum(
+        1 for dr in range(-radius, radius + 1)
+        for dc in range(-radius, radius + 1)
+        if dr * dr + dc * dc <= radius * radius
+    )
     lines = []
-    r0, c0 = origin
-    for row, col in cells:
-        line, = ax.plot([c0, col], [r0, row], color=color, linewidth=0.4, alpha=alpha)
+    for _ in range(max_count):
+        line, = ax.plot([], [], color=color, linewidth=0.4, alpha=alpha)
         lines.append(line)
+    _update_lidar(lines, origin, readings, base_alpha=alpha)
     return lines
 
 
@@ -355,15 +375,16 @@ def _update_path(line, path):
         line.set_visible(False)
 
 
-def _update_lidar(lines, origin, cells):
+def _update_lidar(lines, origin, readings, base_alpha=0.22):
     r0, c0 = origin
-    seen = list(cells)
-    for line, cell in zip(lines, seen):
+    seen = _lidar_items(readings)
+    for line, (cell, reading) in zip(lines, seen):
         line.set_data([c0, cell[1]], [r0, cell[0]])
+        confidence = float(getattr(reading, "sensor_confidence", 1.0)) if reading is not None else 1.0
+        line.set_alpha(max(0.06, base_alpha * confidence))
         line.set_visible(True)
     for line in lines[len(seen):]:
         line.set_visible(False)
-
 
 def draw_attack_outlines(ax, cells, color="#d32f2f"):
     cell_set = {tuple(cell) for cell in cells}
@@ -410,8 +431,16 @@ def show_traffic_heatmap(log, *, show=True):
     if heat is None:
         heat = live.get("heatmap")
     frames = live.get("truth") or []
-    recon_end = int(live.get("recon_end") or 0)
-    truth = frames[min(max(recon_end - 1, 0), len(frames) - 1)] if frames else None
+    static_grid = live.get("heatmap_static_grid")
+    if static_grid is not None:
+        static_grid = np.asarray(static_grid, dtype=np.uint8)
+        truth = np.zeros(static_grid.shape, dtype=np.int16)
+        truth[static_grid.astype(bool)] = DISPLAY_STATIC
+    else:
+        # Backward-compatible fallback for logs created before the static
+        # reference layer was recorded.
+        recon_end = int(live.get("recon_end") or 0)
+        truth = frames[min(max(recon_end - 1, 0), len(frames) - 1)] if frames else None
     if heat is None or truth is None:
         print("No traffic heatmap was recorded. Turn on live maps and run again.")
         return None
@@ -426,9 +455,10 @@ def show_traffic_heatmap(log, *, show=True):
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.imshow(truth, cmap=_CMAP, norm=_NORM, origin="upper", alpha=0.35)
     image = ax.imshow(overlay, origin="upper", alpha=0.82, cmap="hot", vmin=0, vmax=vmax)
-    title = f"Reconnaissance heatmap | {seed_label} | step {recon_end} (benign dwell steps during recon)"
+    reference_steps = int(live.get("heatmap_reference_steps") or recon_end)
+    title = f"Attack-free reference heatmap | {seed_label} | {reference_steps} clean steps"
     ax.set(title=title, xlabel="col", ylabel="row")
-    _set_window_title(fig, f"Reconnaissance heatmap | {seed_label}")
+    _set_window_title(fig, f"Attack-free reference heatmap | {seed_label}")
     fig.colorbar(image, ax=ax, label="benign traffic count")
     fig.tight_layout()
     if show and _can_show():
@@ -448,6 +478,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     attacker = log["malicious_robot_id"]
     threshold = float(live.get("threshold", 0.55))
     method = str(live.get("method") or "unknown")
+    lidar_range = int(live.get("lidar_range_cells", LIDAR_RANGE_CELLS))
     belief_source = live["combined_beliefs"] if selected_view == "combined" else live["local_beliefs"]
     if not belief_source.get(robots[0].robot_id):
         belief_source = live["beliefs"]
@@ -510,7 +541,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
         ax = belief_axes[rid]
         role = "MALICIOUS" if rid == attacker else "VICTIM"
         ax.set_title(
-            f"Robot {rid} | {view_label}\n({role}) - LiDAR {LIDAR_RANGE_CELLS:g} cells",
+            f"Robot {rid} | {view_label}\n({role}) - LiDAR {lidar_range:g} cells",
             fontsize=11, pad=5, color=ROBOT_COLORS.get(rid, "#555555"),
         )
         ax.set_xlabel("col")
@@ -519,7 +550,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
         belief_imgs[rid] = ax.imshow(first, cmap=_CMAP, norm=_NORM, origin="upper")
         r, c = live["positions"][rid][0]
         color = ROBOT_COLORS.get(rid, "#555555")
-        range_circle = Circle((c, r), LIDAR_RANGE_CELLS, fill=False, edgecolor=color, linestyle="--", linewidth=0.8, alpha=0.45, zorder=2)
+        range_circle = Circle((c, r), lidar_range, fill=False, edgecolor=color, linestyle="--", linewidth=0.8, alpha=0.45, zorder=2)
         ax.add_patch(range_circle)
         belief_lidar_range[rid] = range_circle
         patch = Rectangle((c - 0.5, r - 0.5), 1, 1, fill=False, linewidth=2.0, edgecolor=color, zorder=10)
@@ -548,27 +579,38 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
         for sender in robots
         if sender.robot_id != observer.robot_id
     ]
-    trust_table = trust_ax.table(
-        cellText=[[f"R{observer}", f"R{sender}", f"{threshold:.2f}", "TRUSTED"] for observer, sender in trust_pairs],
-        colLabels=("Observer", "Sender", "Score", "State"),
-        colWidths=(0.20, 0.20, 0.18, 0.27),
-        cellLoc="left",
-        colLoc="left",
-        bbox=(0.04, 0.12, 0.92, 0.68),
-    )
+    source_memory_table = method == "source_memory"
+    if source_memory_table:
+        trust_table = trust_ax.table(
+            cellText=[[f"R{observer}", f"R{sender}", f"{threshold:.2f}", f"{threshold:.2f}", "ACTIVE"] for observer, sender in trust_pairs],
+            colLabels=("Observer", "Sender", "Trust", "Memory", "State"),
+            colWidths=(0.17, 0.17, 0.17, 0.17, 0.22),
+            cellLoc="left",
+            colLoc="left",
+            bbox=(0.02, 0.12, 0.96, 0.68),
+        )
+    else:
+        trust_table = trust_ax.table(
+            cellText=[[f"R{observer}", f"R{sender}", f"{threshold:.2f}", "TRUSTED"] for observer, sender in trust_pairs],
+            colLabels=("Observer", "Sender", "Score", "State"),
+            colWidths=(0.20, 0.20, 0.18, 0.27),
+            cellLoc="left",
+            colLoc="left",
+            bbox=(0.04, 0.12, 0.92, 0.68),
+        )
     trust_table.auto_set_font_size(False)
     trust_table.set_fontsize(8.5)
     latest_attack_text = latest_attack_ax.text(0.05, 0.90, "", fontsize=10, va="top", family="DejaVu Sans Mono", transform=latest_attack_ax.transAxes)
     sharing_ax.text(
         0.01, 0.50,
-        "Direct clear sight paints white; gray is unexplored. "
-        "Trusted attacker fake obstacles use Robot 0 purple until fresh lidar clears them.",
+        "Valid known FREE paints white; gray is unknown or expired. "
+        "Operationally active attacker BLOCKED claims use Robot 0 purple; Source Memory hides them while IGNORED.",
         fontsize=8.5, va="center", transform=sharing_ax.transAxes,
     )
     legend_ax.legend(
         handles=[
             Patch(facecolor="#ffffff", edgecolor="#cccccc", label="Explored clear"),
-            Patch(facecolor="#bdbdbd", label="Unexplored"),
+            Patch(facecolor="#bdbdbd", label="Unknown / expired"),
             Patch(facecolor="#222222", label="Static obstacle"),
             Patch(facecolor="#43a047", label="Temporary physical obstacle"),
             Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),
@@ -627,7 +669,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
         truth_grid[live["truth"][frame] == DISPLAY_DYNAMIC] = 1
         positions = {robot.robot_id: live["positions"][robot.robot_id][frame] for robot in robots}
         others = [pos for rid, pos in positions.items() if rid != robot_id]
-        return list(lidar_observations(truth_grid, positions[robot_id], others))
+        return lidar_observations(truth_grid, positions[robot_id], others, radius=lidar_range)
 
     def update(_frame):
         nonlocal display_index, first_tick
@@ -645,7 +687,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
             color = "magenta" if rid == attacker else "#00bcd4"
             seen = lidar_cells(frame, rid)
             if not truth_lidar_lines[rid]:
-                truth_lidar_lines[rid] = _draw_lidar(truth_ax, (r, c), seen, color, alpha=0.16)
+                truth_lidar_lines[rid] = _draw_lidar(truth_ax, (r, c), seen, color, alpha=0.16, radius=lidar_range)
             else:
                 _update_lidar(truth_lidar_lines[rid], (r, c), seen)
             artists.extend(truth_lidar_lines[rid])
@@ -659,7 +701,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
             belief_lidar_range[rid].center = (c, r)
             artists.append(belief_lidar_range[rid])
             if not belief_lidar_lines[rid]:
-                belief_lidar_lines[rid] = _draw_lidar(belief_axes[rid], (r, c), seen, ROBOT_COLORS.get(rid, "#00bcd4"))
+                belief_lidar_lines[rid] = _draw_lidar(belief_axes[rid], (r, c), seen, ROBOT_COLORS.get(rid, "#00bcd4"), radius=lidar_range)
             else:
                 _update_lidar(belief_lidar_lines[rid], (r, c), seen)
             artists.extend(belief_lidar_lines[rid])
@@ -676,16 +718,16 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
                     belief_attack_outlines[rid] = draw_attack_outlines(belief_axes[rid], latest.cells)
                     artists.extend(belief_attack_outlines[rid])
 
-        reports = [item for item in log.get("reports", ()) if item.get("step", 0) <= frame]
-        malicious_reports = [item for item in reports if item.get("is_malicious")]
+        report_count = live.get("report_counts", [0])[frame] if live.get("report_counts") else 0
+        malicious_report_count = live.get("malicious_report_counts", [0])[frame] if live.get("malicious_report_counts") else 0
         latest = _latest_attack(log, frame)
         overlay_count = sum(len(item.get("cells", ())) for item in _overlay_groups(log, frame))
         status_lines = [
             f"Step: {frame}",
             f"Phase: {phase}",
             f"Attack starts: {live.get('attack_start', 'not yet')}",
-            f"Reports: {len(reports)}",
-            f"Malicious reports: {len(malicious_reports)}",
+            f"Reports: {report_count}",
+            f"Malicious reports: {malicious_report_count}",
             f"Attack overlays: {overlay_count}",
             f"Malicious robot: R{attacker}",
         ]
@@ -704,14 +746,22 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
                 f"Reports sent: {len(latest.report_ids)}",
             ]
         snapshot = live["pairwise_trust"][frame] if frame < len(live["pairwise_trust"]) else {}
+        memory_snapshot = live.get("pairwise_source_memory", [])
+        memory_snapshot = memory_snapshot[frame] if frame < len(memory_snapshot) else {}
         for row, (observer_id, sender_id) in enumerate(trust_pairs, start=1):
             value = float((snapshot.get(observer_id) or {}).get(sender_id, threshold))
-            state = "TRUSTED" if value >= threshold else "DISTRUSTED"
+            memory_value = float((memory_snapshot.get(observer_id) or {}).get(sender_id, value))
+            effective = min(value, memory_value) if source_memory_table else value
+            state = ("ACTIVE" if effective >= threshold else "IGNORED") if source_memory_table else ("TRUSTED" if value >= threshold else "DISTRUSTED")
             trust_table[(row, 0)].get_text().set_text(f"R{observer_id}")
             trust_table[(row, 1)].get_text().set_text(f"R{sender_id}")
             trust_table[(row, 2)].get_text().set_text(f"{value:.2f}")
-            trust_table[(row, 3)].get_text().set_text(state)
-            trust_table[(row, 3)].get_text().set_color("#2e7d32" if state == "TRUSTED" else "#c62828")
+            state_col = 3
+            if source_memory_table:
+                trust_table[(row, 3)].get_text().set_text(f"{memory_value:.2f}")
+                state_col = 4
+            trust_table[(row, state_col)].get_text().set_text(state)
+            trust_table[(row, state_col)].get_text().set_color("#2e7d32" if effective >= threshold else "#c62828")
         for robot in robots:
             rid = robot.robot_id
             status_lines.append(
@@ -735,10 +785,10 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
 
 
 def show_live_windows(log, world, robots, *, block=True):
-    """Show the reconnaissance heatmap first, then the live belief maps."""
+    """Show the shared attack-free heatmap first, then live belief maps."""
     heatmap = show_traffic_heatmap(log, show=True)
     if block and _can_show():
-        print("Close the reconnaissance heatmap to start live map playback.", flush=True)
+        print("Close the attack-free reference heatmap to start live map playback.", flush=True)
         plt.show()
     maps = show_belief_maps(log, world, robots, show=True)
     if block and _can_show():

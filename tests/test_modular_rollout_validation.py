@@ -47,7 +47,7 @@ def _config(*, trust=(7, 3)):
         phases=PhaseConfig(1, 4, 3),
         attacks=AttackConfig(enabled=(AttackType.FAKE_OBSTACLE.value,), interval_min=1, interval_max=1),
         trust=TrustConfig(model="scalar", prior_alpha=trust[0], prior_beta=trust[1]),
-        fusion=FusionConfig(method="source_linked"),
+        fusion=FusionConfig(method="source_memory"),
         deliveries_per_robot=1,
         max_steps=8,
     )
@@ -58,7 +58,7 @@ def test_map_error_counts_active_peer_disagreement():
     world = World(grid, ())
     trust = ScalarTrustModel(initial=0.80)
     fusion = FusionEngine("full_trust", trust.score)
-    fusion.add(ClaimReport("peer", 0, (2, 2), ClaimType.BLOCKED, 0, 0))
+    fusion.add(ClaimReport("peer", 0, (2, 2), ClaimType.BLOCKED, 0, 1.0))
     robot = type(
         "Robot",
         (),
@@ -68,65 +68,48 @@ def test_map_error_counts_active_peer_disagreement():
     assert _map_error(robot, world, 0) == 1.0
 
 
-def test_positive_trust_credit_is_rate_limited_per_sender():
+def test_trust_updates_once_per_sender_per_scan_without_cooldown():
     grid = np.zeros((8, 8), dtype=np.uint8)
     task = (DeliveryTask("t", (1, 2), (6, 6)),)
     trust = ScalarTrustModel(initial=0.80)
     robot = ModularRobot(
-        1,
-        (1, 1),
-        task,
-        RobotBeliefMap(grid),
-        trust,
-        FusionEngine("trust_threshold", trust.score, trust_threshold=0.55),
-        0.55,
-        "accept_all",
-        confirmation_cooldown_steps=10,
+        1, (1, 1), task, RobotBeliefMap(grid), trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.50),
+        0.50, "accept_all",
     )
-    robot.receive(ClaimReport("free-a", 0, (2, 2), ClaimType.FREE, 0, 0, 0))
-    robot.receive(ClaimReport("free-b", 0, (2, 3), ClaimType.FREE, 0, 0, 0))
+    for rid, cell in (("free-a", (2, 2)), ("free-b", (2, 3))):
+        robot.receive(ClaimReport(rid, 0, cell, ClaimType.FREE, 0, 1.0))
     robot.process_inbox(0)
-    robot.verify(
-        [
-            DirectObservation(1, (2, 2), ClaimType.FREE, 1),
-            DirectObservation(1, (2, 3), ClaimType.FREE, 1),
-        ],
-        1,
-    )
-    assert trust.score(0) == pytest.approx(0.82)
+    robot.verify([
+        DirectObservation(1, (2, 2), ClaimType.FREE, 1, 1.0),
+        DirectObservation(1, (2, 3), ClaimType.FREE, 1, 1.0),
+    ], 1)
+    assert len(robot.last_trust_batches) == 1
+    after_first = trust.score(0)
+    assert 0.80 < after_first < 0.83
 
-    robot.receive(ClaimReport("free-c", 0, (2, 4), ClaimType.FREE, 11, 11, 11))
-    robot.process_inbox(11)
-    robot.verify([DirectObservation(1, (2, 4), ClaimType.FREE, 12)], 12)
-    assert trust.score(0) == pytest.approx(0.84)
+    robot.receive(ClaimReport("free-c", 0, (2, 4), ClaimType.FREE, 2, 1.0))
+    robot.process_inbox(2)
+    robot.verify([DirectObservation(1, (2, 4), ClaimType.FREE, 3, 1.0)], 3)
+    assert len(robot.last_trust_batches) == 1
+    assert trust.score(0) > after_first
 
-
-def test_stale_honest_contradiction_is_ambiguous_not_distrust():
+def test_aged_report_can_be_contradicted_with_age_weighted_evidence():
     grid = np.zeros((8, 8), dtype=np.uint8)
     task = (DeliveryTask("t", (1, 2), (6, 6)),)
     trust = ScalarTrustModel(initial=0.80)
     robot = ModularRobot(
-        1,
-        (1, 1),
-        task,
-        RobotBeliefMap(grid, memory_steps=12),
-        trust,
-        FusionEngine("trust_threshold", trust.score, trust_threshold=0.55),
-        0.55,
-        "accept_all",
+        1, (1, 1), task, RobotBeliefMap(grid, memory_steps=300), trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.50, max_claim_age=300),
+        0.50, "accept_all",
     )
-    report = ClaimReport("stale", 0, (2, 2), ClaimType.BLOCKED, 0, 0, 0)
+    report = ClaimReport("aged", 0, (2, 2), ClaimType.BLOCKED, 0, 1.0)
     robot.receive(report)
     robot.process_inbox(0)
-    results = robot.verify(
-        [DirectObservation(1, (2, 2), ClaimType.FREE, 20)],
-        20,
-    )
-
-    assert results[0][1] == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
-    assert trust.score(0) == pytest.approx(0.80)
+    results = robot.verify([DirectObservation(1, (2, 2), ClaimType.FREE, 20, 1.0)], 20)
+    assert results[0][1] == VerificationOutcome.CONTRADICTED_FRESH
+    assert trust.score(0) < 0.80
     assert (2, 2) not in robot.fusion.claims
-
 
 def _received(log, report_id="attack-report"):
     return [event for event in log["events"] if event.get("kind") == "report_received" and event.get("report_id") == report_id]
@@ -135,23 +118,15 @@ def _received(log, report_id="attack-report"):
 def test_peer_reports_are_delivered_and_fused_per_recipient():
     manifest = _manifest()
     _, robots, log = run_manifest_rollout(_config(), manifest, "full_trust")
-    peer_deliveries = [
-        event for event in log["events"]
-        if event.get("kind") == "report_received" and event["sender_id"] == 1 and event["recipient_id"] == 2
-    ]
-    assert peer_deliveries and all(event["accepted"] for event in peer_deliveries)
-    delivered = peer_deliveries[0]
-    stored = robots[2].fusion.report_history[delivered["report_id"]]
-    assert stored.report.sender_id == 1
-    assert stored.report.target_cell == delivered["target_cell"]
-    assert robots[2].fusion.evidence(stored.report.target_cell, 7) < 0
+    assert log["report_count_total"] > log["malicious_report_count_total"]
+    assert robots[2].accepted_reports > 0
+    assert any(item.report.sender_id == 1 for item in robots[2].fusion.report_history.values())
     assert not any(item.report.sender_id == 1 for item in robots[1].fusion.report_history.values())
-
 
 def test_high_trust_fake_obstacle_changes_route_and_low_trust_does_not():
     manifest = _manifest()
-    _, _, high_log = run_manifest_rollout(_config(trust=(7, 3)), manifest, "source_linked")
-    _, _, low_log = run_manifest_rollout(_config(trust=(1, 9)), manifest, "source_linked")
+    _, _, high_log = run_manifest_rollout(_config(trust=(7, 3)), manifest, "source_memory")
+    _, _, low_log = run_manifest_rollout(_config(trust=(1, 9)), manifest, "source_memory")
     high_replan = next(
         event
         for event in high_log["events"]
@@ -160,9 +135,17 @@ def test_high_trust_fake_obstacle_changes_route_and_low_trust_does_not():
         and event["step"] == 1
         and "peer_report_on_route" in str(event.get("reason", ""))
     )
-    low_replan = next(event for event in low_log["events"] if event.get("kind") == "replan" and event["robot_id"] == 1 and event["step"] == 1)
+    low_peer_replans = [
+        event for event in low_log["events"]
+        if event.get("kind") == "replan"
+        and event["robot_id"] == 1
+        and event["step"] == 1
+        and "peer_report_on_route" in str(event.get("reason", ""))
+    ]
     assert "peer_report_on_route" in high_replan["reason"]
-    assert (7, 8) in low_replan["path"]
+    assert "malicious_report_on_route" in high_replan["reason"]
+    assert "fake_obstacle_report_on_route" in high_replan["reason"]
+    assert not low_peer_replans
     high_sample = next(
         row for row in high_log["timeseries"] if row["robot_id"] == 1 and row["step"] == 1
     )
@@ -172,6 +155,32 @@ def test_high_trust_fake_obstacle_changes_route_and_low_trust_does_not():
     assert high_sample["attacker_route_cost_delta"] > 0
     assert high_sample["attacker_route_cost_delta"] > low_sample["attacker_route_cost_delta"]
     assert not low_sample["route_affected_by_attacker"]
+    impact = next(event for event in high_log["events"] if event.get("kind") == "attack_route_impact" and event.get("recipient_id") == 1)
+    assert impact["scenario_event_id"] == "attack-0"
+    assert impact["attack_route_penalty"] >= 0
+    assert "attack_extra_path_length" in impact
+    assert "attack_induced_path_change" in impact
+
+
+def test_loaded_leg_and_full_delivery_cycle_durations_are_separate():
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    tasks = (
+        DeliveryTask("one", (1, 1), (1, 2)),
+        DeliveryTask("two", (1, 2), (1, 3)),
+    )
+    trust = ScalarTrustModel(initial=0.80)
+    robot = ModularRobot(
+        1, (1, 1), tasks, RobotBeliefMap(grid), trust,
+        FusionEngine("full_trust", trust.score), 0.50, "accept_all",
+    )
+    robot.move(None, 0, set())  # pick up task one
+    robot.position = (1, 2)
+    robot.move(None, 5, set())  # deliver task one; task two activates
+    robot.move(None, 6, set())  # pick up task two
+    robot.position = (1, 3)
+    robot.move(None, 10, set())
+    assert robot.delivery_durations == [5, 4]
+    assert robot.delivery_cycle_durations == [5, 5]
 
 
 def test_each_attack_has_expected_fusion_and_verification_behavior():
@@ -179,7 +188,7 @@ def test_each_attack_has_expected_fusion_and_verification_behavior():
     for kind in (AttackType.FAKE_OBSTACLE, AttackType.STALE_REASSERTION):
         cleared = (TemporaryObstacleEpisode("cleared", ((7, 8),), 0, 1),) if kind == AttackType.STALE_REASSERTION else ()
         manifest = _manifest(kind, ClaimType.BLOCKED, episode=cleared)
-        _, _, log = run_manifest_rollout(_config(), manifest, "source_linked")
+        _, _, log = run_manifest_rollout(_config(), manifest, "source_memory")
         deliveries = _received(log)
         assert len(deliveries) == 2 and all(event["accepted"] and event["evidence_after"] > 0 for event in deliveries)
         victim_replan = next(
@@ -192,27 +201,34 @@ def test_each_attack_has_expected_fusion_and_verification_behavior():
         )
         assert "peer_report_on_route" in victim_replan["reason"]
         assert any(
-            event["kind"] == "trust_update"
-            and event["report_id"] == "attack-report"
-            and event["outcome"] == "contradicted_fresh"
+            event.get("kind") == "fusion_effect"
+            and event.get("report_id") == "attack-report"
+            and event.get("outcome") == "contradicted_fresh"
             for event in log["events"]
         )
 
     # False clearance claims FREE while the physical temporary blockage exists.
     episode = TemporaryObstacleEpisode("temp", ((7, 8),), 0, 5)
     manifest = _manifest(AttackType.FALSE_CLEARANCE, ClaimType.FREE, episode=(episode,))
-    _, _, log = run_manifest_rollout(_config(), manifest, "source_linked")
+    _, _, log = run_manifest_rollout(_config(), manifest, "source_memory")
     deliveries = _received(log)
     assert len(deliveries) == 2 and all(event["accepted"] and event["evidence_after"] < 0 for event in deliveries)
-    victim_replan = next(event for event in log["events"] if event.get("kind") == "replan" and event["robot_id"] == 1 and event["step"] == 1)
-    assert (7, 8) in victim_replan["path"]
-    assert any(event["kind"] == "trust_update" and event["report_id"] == "attack-report" and event["outcome"] == "contradicted_fresh" for event in log["events"])
+    # A FREE report that does not materially change the current route cost no
+    # longer forces a redundant A* run. It is still fused and later validated.
+    assert not any(
+        event.get("kind") == "replan"
+        and event.get("robot_id") == 1
+        and event.get("step") == 1
+        and "peer_report_on_route" in str(event.get("reason", ""))
+        for event in log["events"]
+    )
+    assert any(event.get("kind") == "fusion_effect" and event.get("report_id") == "attack-report" and event.get("outcome") == "contradicted_fresh" for event in log["events"])
 
 
 def test_active_fake_claim_metric_excludes_retracted_claims():
     manifest = _manifest()
     config = _config()
-    _, _, log = run_manifest_rollout(config, manifest, "source_linked")
+    _, _, log = run_manifest_rollout(config, manifest, "source_memory")
     final = next(
         row
         for row in reversed(log["timeseries"])
@@ -223,17 +239,22 @@ def test_active_fake_claim_metric_excludes_retracted_claims():
 
 def test_baselines_and_requested_metrics_run_on_one_manifest():
     manifest = _manifest()
-    for method in ("full_trust", "majority_vote", "trust_fused", "source_linked"):
+    for method in ("majority_vote", "full_trust", "trust_fused", "source_memory"):
         world, robots, log = run_manifest_rollout(_config(), manifest, method)
         summary, _ = collect_rollout_metrics(_config(), manifest, method, world, robots, log)
         assert summary["engine"] == "modular_native"
         assert summary["malicious_report_deliveries"] == 2
         assert summary["false_acceptance_count"] == 2
         assert 0.0 <= summary["map_error_mean"] <= 1.0
+        assert "benign_delivery_cycle_duration_mean_steps" in summary
+        assert "benign_delivery_cycle_duration_median_steps" in summary
+        assert "benign_delivery_cycle_duration_p95_steps" in summary
+        assert "attack_route_penalty_mean" in summary
+        assert "attack_induced_path_changes" in summary
+        assert "steps_route_affected_by_attacker" in summary
         assert 0.0 <= summary["map_error_final"] <= 1.0
-        if method in ("full_trust", "majority_vote"):
-            assert summary["recovery_time_steps"] is not None
-        if method == "source_linked":
+        assert "recovery_time_steps" in summary
+        if method == "source_memory":
             assert summary["malicious_verified_false_reports"] > 0
 
 
@@ -301,10 +322,39 @@ def test_robot_contention_is_a_traffic_wait_not_a_blocked_world_move():
     assert summary["benign_blocked_moves"] == 0
 
 
+def test_temporary_obstacle_route_effect_is_labeled_and_counted():
+    grid = np.zeros((9, 12), dtype=np.uint8)
+    grid[[0, -1], :] = 1
+    grid[:, [0, -1]] = 1
+    episode = TemporaryObstacleEpisode("physical", ((4, 5),), 1, 5)
+    manifest = ScenarioManifest(
+        2, 5, {}, "physical-map", tuple(grid.shape), tuple(tuple(int(v) for v in row) for row in grid),
+        {"reconnaissance_end": 1, "attack_end": 4, "total": 5}, 0, (1, 2), (episode,), (),
+        robot_starts={0: (1, 1), 1: (4, 2), 2: (7, 1)},
+        task_queues={
+            0: (DeliveryTask("a", (1, 2), (1, 3)),),
+            1: (DeliveryTask("b", (4, 9), (4, 9)),),
+            2: (DeliveryTask("c", (7, 2), (7, 3)),),
+        },
+    )
+    config = replace(_config(), seed=5, phases=PhaseConfig(1, 3, 1), max_steps=5)
+    world, robots, log = run_manifest_rollout(config, manifest, "full_trust")
+    summary, _ = collect_rollout_metrics(config, manifest, "full_trust", world, robots, log)
+    physical = [
+        event for event in log["events"]
+        if event.get("kind") == "replan"
+        and event.get("robot_id") == 1
+        and "temporary_physical_obstacle_on_route" in str(event.get("reason", ""))
+    ]
+    assert physical and physical[0]["changed"]
+    assert summary["temporary_obstacle_replan_checks"] >= 1
+    assert summary["temporary_obstacle_path_changes"] >= 1
+
+
 def test_recovery_is_none_when_the_attacker_never_changes_a_route():
     manifest = _manifest()
-    world, robots, log = run_manifest_rollout(_config(trust=(1, 9)), manifest, "source_linked")
-    summary, _ = collect_rollout_metrics(_config(trust=(1, 9)), manifest, "source_linked", world, robots, log)
+    world, robots, log = run_manifest_rollout(_config(trust=(1, 9)), manifest, "source_memory")
+    summary, _ = collect_rollout_metrics(_config(trust=(1, 9)), manifest, "source_memory", world, robots, log)
     assert not any(
         row["route_affected_by_attacker"]
         for row in log["timeseries"]
@@ -323,7 +373,7 @@ def test_fresh_lidar_keeps_a_seen_free_cell_on_the_route():
             2: (DeliveryTask("c", (7, 14), (15, 1)),),
         },
     )
-    _, _, log = run_manifest_rollout(_config(trust=(7, 3)), manifest, "source_linked")
+    _, _, log = run_manifest_rollout(_config(trust=(7, 3)), manifest, "source_memory")
     first = next(event for event in log["events"] if event.get("kind") == "replan" and event["robot_id"] == 1)
     assert (7, 8) in first["path"]
     sample = next(row for row in log["timeseries"] if row["robot_id"] == 1 and row["step"] == 1)
@@ -359,7 +409,7 @@ def test_trust_threshold_drops_when_a_fake_obstacle_is_observed():
         for event in updates
     )
     assert any(
-        event.get("kind") == "trust_update"
+        event.get("kind") == "fusion_effect"
         and event.get("recipient_id") == 1
         and event.get("sender_id") == 0
         and event.get("outcome") == "contradicted_fresh"

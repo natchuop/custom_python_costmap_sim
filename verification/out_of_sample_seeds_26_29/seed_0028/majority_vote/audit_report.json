@@ -1,0 +1,11 @@
+{
+  "attacker_report_count": 1181,
+  "errors": [
+    "invalid audit label report-0002-02",
+    "invalid stale reassertion attack-0002"
+  ],
+  "passed": false,
+  "protocol_id": "modular_v1",
+  "scenario_id": "warehouse-28",
+  "warnings": []
+}

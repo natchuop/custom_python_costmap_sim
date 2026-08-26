@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -22,11 +23,11 @@ from .warehouse_layout import DEFAULT_NUM_ROBOTS, build_warehouse_layout, manhat
 from .planning import astar
 
 ATTACK_CANDIDATE_LIMIT = 24
-ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = False
+ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = True
 ATTACK_MIN_DISTANCE_FROM_GOAL = 2
 ATTACK_MIN_DISTANCE_FROM_ANY_BENIGN_ROBOT = 2
 MALICIOUS_FAKE_OBJECT_CENTER_MIN_SPACING = 3
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _build_attacker_route_cells(
@@ -91,11 +92,48 @@ def _fake_average_traffic_score(center, heatmap, height, width) -> float:
 def _footprint_bottleneck_score(grid, cells) -> float:
     if not cells:
         return 0.0
-    rows = [cell[0] for cell in cells]
-    cols = [cell[1] for cell in cells]
-    height = max(rows) - min(rows) + 1
-    width = max(cols) - min(cols) + 1
-    return float(height * width) / max(1, len(cells))
+    footprint = {tuple(cell) for cell in cells}
+    rows, cols = grid.shape
+    blocked_neighbors = 0
+    boundary_neighbors = 0
+    for row, col in footprint:
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in footprint:
+                continue
+            boundary_neighbors += 1
+            if not (0 <= neighbor[0] < rows and 0 <= neighbor[1] < cols) or grid[neighbor]:
+                blocked_neighbors += 1
+    return blocked_neighbors / max(1, boundary_neighbors)
+
+
+def _reference_detour_score(grid, victim, report_cells, active_temp_cells=()) -> float | None:
+    """Return clean-reference path-length increase caused by a fake block."""
+    if victim.goal is None or tuple(victim.position) == tuple(victim.goal):
+        return 0.0
+    rows, cols = grid.shape
+    physical = {tuple(cell) for cell in active_temp_cells}
+    fake = {tuple(cell) for cell in report_cells}
+
+    def cost(cell, extra=()):
+        return (
+            float("inf")
+            if not (0 <= cell[0] < rows and 0 <= cell[1] < cols)
+            or bool(grid[cell])
+            or cell in physical
+            or cell in extra
+            else 1.0
+        )
+
+    baseline = astar(tuple(victim.position), tuple(victim.goal), lambda cell: cost(cell))
+    if baseline is None:
+        return 0.0
+    attacked = astar(tuple(victim.position), tuple(victim.goal), lambda cell: cost(cell, fake))
+    if attacked is None:
+        # The stress experiment targets meaningful detours, not fabricated
+        # total disconnections.  No-path behavior remains measurable for real
+        # runtime interactions, but it is not deliberately authored here.
+        return None
+    return float(max(0, len(attacked) - len(baseline)))
 
 
 def _is_valid_recon_attack_cell(
@@ -142,6 +180,7 @@ def recon_heatmap_attack_candidates(
     require_route_overlap: bool = ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP,
     forbidden_cells=(),
     active_temp_cells=(),
+    visible_cells_by_robot=None,
 ):
     candidates = []
     rows, cols = heatmap.shape
@@ -172,30 +211,51 @@ def recon_heatmap_attack_candidates(
             )
             if len(report_cells) < FAKE_MIN_REPORT_CELLS:
                 continue
-            path_overlap = 0
-            affected_victims = 0
-            path_proximity_score = 0.0
+            victim_options = []
+            visible_cells_by_robot = visible_cells_by_robot or {}
             for victim in robots:
                 if victim.robot_id == 0:
+                    continue
+                visible = {tuple(item) for item in visible_cells_by_robot.get(victim.robot_id, ())}
+                if visible.intersection(report_cells):
                     continue
                 remaining = list(victim.path or ())
                 if not remaining:
                     continue
                 overlap = len(set(remaining).intersection(report_cells))
-                path_overlap += overlap
-                if overlap > 0:
-                    affected_victims += 1
-                    path_proximity_score += 10.0 + overlap
-                    continue
+                nearest_index = min(
+                    range(len(remaining)),
+                    key=lambda index: min(manhattan(remaining[index], cell) for cell in report_cells),
+                )
                 min_distance = min(
                     manhattan(report_cell, path_cell)
                     for report_cell in report_cells
                     for path_cell in remaining
                 )
-                if min_distance <= 2:
-                    affected_victims += 1
-                path_proximity_score += 1.0 / (1.0 + min_distance)
-            if require_route_overlap and path_overlap <= 0:
+                detour = _reference_detour_score(grid, victim, report_cells, active_temp_cells)
+                if detour is None or detour <= 0:
+                    continue
+                proximity = (10.0 + overlap) if overlap else 1.0 / (1.0 + min_distance)
+                victim_options.append({
+                    "victim_id": victim.robot_id,
+                    "path_overlap": overlap,
+                    "path_proximity_score": proximity,
+                    "route_distance_steps": nearest_index,
+                    "reference_detour_score": detour,
+                })
+            if not victim_options:
+                continue
+            victim_options.sort(
+                key=lambda item: (
+                    item["reference_detour_score"],
+                    item["path_overlap"],
+                    item["path_proximity_score"],
+                    -item["route_distance_steps"],
+                ),
+                reverse=True,
+            )
+            victim = victim_options[0]
+            if require_route_overlap and victim["path_overlap"] <= 0:
                 continue
             candidates.append(
                 {
@@ -205,17 +265,23 @@ def recon_heatmap_attack_candidates(
                     "footprint_height": height,
                     "footprint_width": width,
                     "report_cell_count": len(report_cells),
-                    "path_overlap": path_overlap,
-                    "path_proximity_score": path_proximity_score,
-                    "affected_victims": affected_victims,
+                    "path_overlap": victim["path_overlap"],
+                    "path_proximity_score": victim["path_proximity_score"],
+                    "affected_victims": len(victim_options),
+                    "victim_id": victim["victim_id"],
+                    "route_distance_steps": victim["route_distance_steps"],
+                    "reference_detour_score": victim["reference_detour_score"],
+                    "target_visible_to_victim": False,
                     "bottleneck_score": _footprint_bottleneck_score(grid, report_cells),
                 }
             )
     candidates.sort(
         key=lambda item: (
-            item["affected_victims"],
+            item["reference_detour_score"],
             item["path_overlap"],
+            item["bottleneck_score"],
             item["path_proximity_score"],
+            -item["route_distance_steps"],
             item["report_cell_count"],
             item["traffic_score"],
         ),
@@ -224,14 +290,29 @@ def recon_heatmap_attack_candidates(
     return candidates[:ATTACK_CANDIDATE_LIMIT]
 
 
-def run_clean_recon_rollout(config: SimulationConfig, manifest: ScenarioManifest):
-    """Replay a no-attack manifest through reconnaissance and return the traffic heatmap."""
-    recon_config = replace(config, max_steps=config.phases.recon_steps, visualization=replace(config.visualization, animation=False))
-    _, robots, log = run_manifest_rollout(recon_config, manifest, "full_trust", show_progress=False)
+def run_clean_reference_rollout(config: SimulationConfig, manifest: ScenarioManifest):
+    """Run one deterministic attack-free reference over the complete horizon.
+
+    The single shared heatmap counts benign traffic across all clean 2500
+    reference steps.  Per-step positions/routes/visibility are retained only
+    in memory while the manifest is authored.
+    """
+    reference_config = replace(
+        config,
+        max_steps=config.phases.total_steps,
+        visualization=replace(config.visualization, animation=False),
+    )
+    _, robots, log = run_manifest_rollout(
+        reference_config,
+        manifest,
+        "full_trust",
+        show_progress=False,
+        capture_reference_state=True,
+    )
     heatmap = np.zeros(manifest.map_shape, dtype=np.int32)
     benign = set(manifest.benign_robot_ids)
     for event in log["events"]:
-        if event.get("kind") != "robot_action" or event.get("phase") != "RECONNAISSANCE":
+        if event.get("kind") != "robot_action":
             continue
         if event.get("robot_id") not in benign:
             continue
@@ -239,14 +320,17 @@ def run_clean_recon_rollout(config: SimulationConfig, manifest: ScenarioManifest
         heatmap[position] += 1
     if not heatmap.any():
         for sample in log["timeseries"]:
-            if sample["step"] >= config.phases.recon_steps:
-                continue
             if sample["robot_id"] in benign:
                 heatmap[tuple(sample["position"])] += 1
     return heatmap, robots, log
 
 
-def save_traffic_heatmap_artifacts(root: Path, heatmap: np.ndarray, *, title: str = "Reconnaissance traffic heatmap") -> None:
+# Compatibility name retained for callers; behavior is now the full clean
+# reference rollout agreed for manifest authoring.
+run_clean_recon_rollout = run_clean_reference_rollout
+
+
+def save_traffic_heatmap_artifacts(root: Path, heatmap: np.ndarray, *, title: str = "Attack-free reference traffic heatmap") -> None:
     root.mkdir(parents=True, exist_ok=True)
     array = np.asarray(heatmap, dtype=np.int32)
     np.save(root / "traffic_heatmap.npy", array)
@@ -314,7 +398,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         robot_starts=starts,
         task_queues=task_queues,
     )
-    heatmap, robots, recon_log = run_clean_recon_rollout(config, skeleton)
+    heatmap, robots, reference_log = run_clean_reference_rollout(config, skeleton)
     place_rng = named_rng(config.seed, "attack_placement")
     task_cells = {
         tuple(task.pickup)
@@ -326,47 +410,65 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         for task in queue
     }
     protected_cells = set(starts.values()) | set(goals) | task_cells
-    candidates = recon_heatmap_attack_candidates(
-        grid,
-        goals,
-        robots,
-        heatmap,
-        rng=place_rng,
-        forbidden_cells=protected_cells,
-    )
-    if not candidates:
+    reference_states = reference_log.get("reference_states") or {}
+    enabled_types = [AttackType(value) for value in config.attacks.enabled]
+
+    def reference_robots_at_step(step: int):
+        frame = reference_states.get(min(max(0, step), config.phases.total_steps - 1), {})
+        proxies = []
+        visible = {}
+        for robot_id, state in frame.items():
+            proxies.append(SimpleNamespace(
+                robot_id=int(robot_id),
+                position=tuple(state["position"]),
+                goal=None if state.get("goal") is None else tuple(state["goal"]),
+                path=list(state.get("path") or ()),
+            ))
+            visible[int(robot_id)] = tuple(state.get("visible_cells") or ())
+        return proxies, visible
+
+    candidates = []
+    if enabled_types:
+        initial_robots, initial_visible = reference_robots_at_step(config.phases.recon_steps)
         candidates = recon_heatmap_attack_candidates(
             grid,
             goals,
-            robots,
+            initial_robots,
             heatmap,
             rng=place_rng,
-            require_route_overlap=False,
             forbidden_cells=protected_cells,
+            visible_cells_by_robot=initial_visible,
         )
-    if not candidates:
-        raise RuntimeError("clean warehouse rollout produced no manifest attack candidates")
+        if not candidates:
+            candidates = recon_heatmap_attack_candidates(
+                grid,
+                goals,
+                initial_robots,
+                heatmap,
+                rng=place_rng,
+                require_route_overlap=False,
+                forbidden_cells=protected_cells,
+                visible_cells_by_robot=initial_visible,
+            )
+        if not candidates:
+            raise RuntimeError("clean warehouse rollout produced no manifest attack candidates")
 
     def candidates_at_step(step: int):
-        frame = min(max(0, step), config.phases.recon_steps - 1)
-        for robot in robots:
-            samples = [row for row in recon_log["timeseries"] if row["robot_id"] == robot.robot_id and row["step"] == frame]
-            if samples:
-                robot.position = tuple(samples[-1]["position"])
-        dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in robots}
+        reference_robots, visible = reference_robots_at_step(step)
+        dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in reference_robots}
         return recon_heatmap_attack_candidates(
             grid,
             goals,
-            robots,
+            reference_robots,
             heatmap,
             rng=place_rng,
             require_route_overlap=True,
             forbidden_cells=dynamic_forbidden,
             active_temp_cells=_active_temp_cells(episodes, step),
+            visible_cells_by_robot=visible,
         )
 
     rng = named_rng(config.seed, "warehouse_manifest_scheduler")
-    enabled_types = [AttackType(value) for value in config.attacks.enabled]
     events = []
     metadata = []
     warnings = []
@@ -426,47 +528,63 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             continue
         step_candidates = candidates_at_step(step)
         if not step_candidates:
-            frame = min(max(0, step), config.phases.recon_steps - 1)
-            for robot in robots:
-                samples = [row for row in recon_log["timeseries"] if row["robot_id"] == robot.robot_id and row["step"] == frame]
-                if samples:
-                    robot.position = tuple(samples[-1]["position"])
-            dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in robots}
+            reference_robots, visible = reference_robots_at_step(step)
+            dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in reference_robots}
             step_candidates = recon_heatmap_attack_candidates(
                 grid,
                 goals,
-                robots,
+                reference_robots,
                 heatmap,
                 rng=place_rng,
                 require_route_overlap=False,
                 forbidden_cells=dynamic_forbidden,
                 active_temp_cells=_active_temp_cells(episodes, step),
+                visible_cells_by_robot=visible,
             )
         if step_candidates:
             pool = step_candidates[: config.attacks.candidate_top_k]
         else:
             active_now = _active_temp_cells(episodes, step)
-            blocked_now = protected_cells | {tuple(robot.position) for robot in robots} | set(active_now)
+            reference_robots, _ = reference_robots_at_step(step)
+            blocked_now = protected_cells | {tuple(robot.position) for robot in reference_robots} | set(active_now)
             fallback = [
                 candidate
                 for candidate in candidates
                 if not any(tuple(cell) in blocked_now for cell in candidate["report_cells"])
             ]
             pool = fallback[: config.attacks.candidate_top_k]
+        used_unique = set(uses)
+        require_new_center = len(used_unique) < config.attacks.min_unique_footprints
         eligible = [
             candidate
             for candidate in pool
             if uses.get(tuple(candidate["center_cell"]), 0) < config.attacks.max_uses_per_footprint
-            and all(
-                abs(candidate["center_cell"][0] - old[0]) + abs(candidate["center_cell"][1] - old[1])
-                >= config.attacks.min_center_spacing
-                for old in selected_centers
+            and (
+                not require_new_center
+                or (
+                    tuple(candidate["center_cell"]) not in used_unique
+                    and all(
+                        abs(candidate["center_cell"][0] - old[0]) + abs(candidate["center_cell"][1] - old[1])
+                        >= config.attacks.min_center_spacing
+                        for old in used_unique
+                    )
+                )
             )
         ]
         if not eligible:
-            warnings.append("concentrated_attack_manifest: diversity limits exhausted")
-            break
-        candidate = eligible[rng.randrange(len(eligible))]
+            # Do not truncate the attack phase merely because the preferred
+            # diversity constraint is exhausted; reuse a valid route-critical
+            # footprint within its explicit per-footprint cap.
+            eligible = [
+                candidate for candidate in pool
+                if uses.get(tuple(candidate["center_cell"]), 0) < config.attacks.max_uses_per_footprint
+            ]
+        if not eligible:
+            warnings.append("route_critical_attack_candidate_unavailable")
+            step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
+            continue
+        weights = list(range(len(eligible), 0, -1))
+        candidate = rng.choices(eligible, weights=weights, k=1)[0]
         cells = tuple(tuple(cell) for cell in candidate["report_cells"])
         center = tuple(candidate["center_cell"])
         events.append(
@@ -490,6 +608,12 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 "footprint_height": candidate.get("footprint_height"),
                 "footprint_width": candidate.get("footprint_width"),
                 "route_overlap": candidate["path_overlap"],
+                "intended_victim_id": candidate.get("victim_id"),
+                "reference_step": step,
+                "reference_route_distance_steps": candidate.get("route_distance_steps"),
+                "reference_detour_score": candidate.get("reference_detour_score"),
+                "target_visible_to_victim": candidate.get("target_visible_to_victim", False),
+                "heatmap_reference_steps": config.phases.total_steps,
                 "traffic_score": candidate["traffic_score"],
                 "bottleneck_score": candidate["bottleneck_score"],
                 "estimated_detour_score": candidate["path_proximity_score"],
@@ -537,8 +661,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             )
             else ClaimType.FREE,
             step,
-            step,
-            step,
+            sensor_confidence=1.0,
         )
         for step in range(0, config.phases.total_steps, config.communication_period_steps)
     )

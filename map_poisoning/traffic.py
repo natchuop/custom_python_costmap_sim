@@ -161,7 +161,7 @@ def _restore_robot_goal_after_yield(robot: ModularRobot, step: int):
     robot.consecutive_traffic_waits = 0
     return {
         "step": step,
-        "event_type": "traffic_deadlock_recovered",
+        "event_type": "traffic_deadlock_recovered" if deadlock_id is not None else "traffic_yield_completed",
         "robot_id": robot.robot_id,
         "other_robot_ids": (),
         "deadlock_id": deadlock_id,
@@ -519,6 +519,7 @@ def summarize_traffic_events(events: list[dict]) -> dict[str, int]:
         "head_on_swap_conflicts_detected": 0,
         "reservation_conflicts_detected": 0,
         "traffic_yield_events": 0,
+        "traffic_yields_completed": 0,
         "deadlocks_detected": 0,
         "deadlocks_recovered": 0,
         "robot_overlap_violations": 0,
@@ -529,13 +530,27 @@ def summarize_traffic_events(events: list[dict]) -> dict[str, int]:
         "traffic_swap_conflict": "head_on_swap_conflicts_detected",
         "traffic_reservation_conflict": "reservation_conflicts_detected",
         "traffic_yield_started": "traffic_yield_events",
-        "traffic_deadlock_detected": "deadlocks_detected",
-        "traffic_deadlock_recovered": "deadlocks_recovered",
+        "traffic_yield_completed": "traffic_yields_completed",
         "traffic_overlap_violation": "robot_overlap_violations",
         "traffic_corridor_conflict": "corridor_entry_denied",
     }
+    detected_ids: set[str] = set()
+    recovered_ids: set[str] = set()
     for event in events:
-        key = mapping.get(str(event.get("event_type")))
+        event_type = str(event.get("event_type"))
+        key = mapping.get(event_type)
         if key:
             counts[key] += 1
+        deadlock_id = event.get("deadlock_id")
+        if not deadlock_id:
+            continue
+        deadlock_id = str(deadlock_id)
+        if event_type == "traffic_deadlock_detected":
+            detected_ids.add(deadlock_id)
+        elif event_type == "traffic_deadlock_recovered":
+            recovered_ids.add(deadlock_id)
+    # Deadlock statistics are episode counts, not raw event counts.  Only a
+    # recovery paired with a previously detected deadlock is a recovery.
+    counts["deadlocks_detected"] = len(detected_ids)
+    counts["deadlocks_recovered"] = len(detected_ids & recovered_ids)
     return counts

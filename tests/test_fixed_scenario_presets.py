@@ -37,7 +37,7 @@ def test_fixed_preset_is_seed_independent(tmp_path):
 def test_fixed_preset_is_method_independent():
     path = MAPS["warehouse_005"]
     grid = load_npy(path)
-    first = author_manifest(SimulationConfig(scenario_preset="warehouse_005", map_npy=str(path), fusion=FusionConfig(method="source_linked")), grid)
+    first = author_manifest(SimulationConfig(scenario_preset="warehouse_005", map_npy=str(path), fusion=FusionConfig(method="source_memory")), grid)
     second = author_manifest(SimulationConfig(scenario_preset="warehouse_005", map_npy=str(path), fusion=FusionConfig(method="full_trust")), grid)
     assert first.robot_starts == second.robot_starts
     assert first.task_queues == second.task_queues
@@ -100,3 +100,20 @@ def test_attacker_receives_repeating_fixed_queue_in_short_runs():
     )
     assert len(manifest.task_queues[0]) > 1
     assert all(task.pickup != task.dropoff for task in manifest.task_queues[0])
+
+
+def test_cli_preset_without_explicit_map_resolves_packaged_map():
+    from map_poisoning.cli import config_from_args, parser
+    from map_poisoning.map_io import load_npy
+    config = config_from_args(parser().parse_args(["--headless", "--scenario-preset", "warehouse_002", "--no-plots"]))
+    assert config.map_npy is not None
+    assert load_npy(config.map_npy).shape == PRESETS["warehouse_002"].expected_shape
+
+
+def test_gui_packaged_map_options_are_cwd_independent():
+    from map_poisoning.ui import MAP_OPTIONS
+    for label in ("Map 002 (converted)", "Map 005 (converted)", "Map 005 rotated (converted)"):
+        path, preset_id = MAP_OPTIONS[label]
+        assert Path(path).is_absolute()
+        assert Path(path).exists()
+        validate_fixed_preset(load_npy(path), PRESETS[preset_id])

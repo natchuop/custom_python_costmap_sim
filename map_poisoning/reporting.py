@@ -20,7 +20,14 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 
-METHOD_ORDER = ("full_trust", "majority_vote", "trust_fused", "source_linked", "soft_probability")
+METHOD_ORDER = ("majority_vote", "full_trust", "trust_fused", "source_memory", "soft_probability")
+
+
+def _ordered_methods(values):
+    """Return unique method names with the four primary methods first."""
+    unique = list(dict.fromkeys(value for value in values if value))
+    rank = {method: index for index, method in enumerate(METHOD_ORDER)}
+    return sorted(unique, key=lambda method: (rank.get(method, len(METHOD_ORDER)), method))
 REPLAN_REASON_BIN_STEPS = 100
 RUN_PLOTS = (
     "01_attacker_trust_over_time.png",
@@ -386,7 +393,7 @@ REPLAN_REASON_CATEGORIES = {
     "real/world blockage": ("blocked_world", "blocked_move"),
     "malicious report on route": ("malicious_report_on_route", "peer_report_on_route"),
     "honest report on route": ("honest_report_on_route",),
-    "source-linked trust reweight": ("source_linked_trust_reweight",),
+    "source-memory trust reweight": ("source_memory_trust_reweight",),
     "direct verification": ("direct_verification",),
     "traffic replan": ("traffic_replan", "traffic_wait_reroute"),
     "traffic yield/recovery": ("traffic_yield", "traffic_deadlock"),
@@ -700,6 +707,8 @@ def _write_run_summary(data, plot_names):
         f"Steps: {s.get('steps_completed', 'unknown')}",
         "", "Mission:",
         f"  benign deliveries: {s.get('benign_total_deliveries_completed', 'NA')}",
+        f"  full-cycle duration mean/median/p95: {s.get('benign_delivery_cycle_duration_mean_steps', 'NA')}/{s.get('benign_delivery_cycle_duration_median_steps', 'NA')}/{s.get('benign_delivery_cycle_duration_p95_steps', 'NA')}",
+        f"  loaded-leg duration mean/median/p95: {s.get('benign_loaded_delivery_duration_mean_steps', 'NA')}/{s.get('benign_loaded_delivery_duration_median_steps', 'NA')}/{s.get('benign_loaded_delivery_duration_p95_steps', 'NA')}",
         f"  benign success rate: {s.get('benign_success_rate', 'NA')}",
         f"  benign deliveries after attack: {s.get('benign_deliveries_after_attack', 'NA')}",
         f"  benign deliveries after distrust: {s.get('benign_deliveries_after_distrust', 'NA')}",
@@ -711,8 +720,16 @@ def _write_run_summary(data, plot_names):
         *planning_diagnostics,
         *reason_diagnostics,
         "", "Trust:",
-        f"  time to distrust attacker: {s.get('time_to_distrust_malicious_robot', 'NA')}",
+        f"  time to first victim distrust: {s.get('time_to_distrust_malicious_robot', 'NA')}",
+        f"  time to all victims distrust: {s.get('time_to_all_benign_distrust', 'NA')}",
+        f"  victims that distrusted attacker: {s.get('distrusted_benign_robot_count', 'NA')}",
+        f"  minimum attacker trust mean: {s.get('attacker_min_trust_mean', 'NA')}",
         f"  final attacker trust mean: {s.get('final_attacker_trust_mean', 'NA')}",
+        f"  malicious reports operationally ignored: {s.get('malicious_reports_operationally_ignored', 'NA')}",
+        f"  attacks causing counterfactual path changes: {s.get('attack_induced_path_changes', 'NA')}",
+        f"  route penalty mean/max/total: {s.get('attack_route_penalty_mean', 'NA')}/{s.get('attack_route_penalty_max', 'NA')}/{s.get('attack_route_penalty_total', 'NA')}",
+        f"  extra path length mean/max/total: {s.get('attack_extra_path_length_mean', 'NA')}/{s.get('attack_extra_path_length_max', 'NA')}/{s.get('attack_extra_path_length_total', 'NA')}",
+        f"  steps route affected by attacker: {s.get('steps_route_affected_by_attacker', 'NA')}",
         *influence_diagnostics,
         "", "Traffic:",
         f"  traffic waits: {s.get('benign_traffic_wait_steps', 'NA')}",
@@ -844,10 +861,21 @@ def _comparison_split_plot(rows, left_metrics, right_metrics, title, path):
 
 
 def _comparison_trust_plot(rows, path):
-    methods = [name for name, _ in rows]; x = np.arange(len(methods))
+    methods = [name for name, _ in rows]; x = np.arange(len(methods)); width = 0.36
     fig, (left, right) = plt.subplots(1, 2, figsize=(13, 5))
-    left.bar(x, [parse_float(data.summary.get("time_to_distrust_malicious_robot"), 0) for _, data in rows]); left.set(title="Time to distrust", ylabel="Steps", xticks=x, xticklabels=methods)
-    right.bar(x, [parse_float(data.summary.get("final_attacker_trust_mean"), 0) for _, data in rows]); right.set(title="Final attacker trust", ylabel="Trust [0, 1]", ylim=(0, 1), xticks=x, xticklabels=methods)
+    first = [parse_float(data.summary.get("time_to_distrust_malicious_robot")) for _, data in rows]
+    all_victims = [parse_float(data.summary.get("time_to_all_benign_distrust")) for _, data in rows]
+    first_plot = [np.nan if value is None else value for value in first]
+    all_plot = [np.nan if value is None else value for value in all_victims]
+    left.bar(x - width / 2, first_plot, width, label="first victim")
+    left.bar(x + width / 2, all_plot, width, label="all victims")
+    left.set(title="Time to distrust", ylabel="Steps", xticks=x, xticklabels=methods); left.legend()
+    minimum = [parse_float(data.summary.get("attacker_min_trust_mean")) for _, data in rows]
+    final = [parse_float(data.summary.get("final_attacker_trust_mean")) for _, data in rows]
+    right.bar(x - width / 2, [np.nan if value is None else value for value in minimum], width, label="minimum")
+    right.bar(x + width / 2, [np.nan if value is None else value for value in final], width, label="final")
+    right.axhline(0.5, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+    right.set(title="Attacker trust", ylabel="Trust [0, 1]", ylim=(0, 1), xticks=x, xticklabels=methods); right.legend()
     fig.suptitle("Trust detection by defense method"); _save(fig, path)
 
 
@@ -937,6 +965,28 @@ MULTISEED_DIRECTIONS = {
     "deliveries_per_1000_steps": ("higher_better", "deliveries/1000 steps"),
     "benign_no_path_steps": ("lower_better", "steps"),
     "distance_per_delivery": ("lower_better", "distance/delivery"),
+    "benign_delivery_cycle_duration_mean_steps": ("lower_better", "steps"),
+    "benign_delivery_cycle_duration_median_steps": ("lower_better", "steps"),
+    "benign_delivery_cycle_duration_p95_steps": ("lower_better", "steps"),
+    "benign_loaded_delivery_duration_mean_steps": ("lower_better", "steps"),
+    "benign_loaded_delivery_duration_median_steps": ("lower_better", "steps"),
+    "benign_loaded_delivery_duration_p95_steps": ("lower_better", "steps"),
+    "benign_total_distance": ("lower_better", "cells"),
+    "benign_planning_checks": ("lower_better", "checks"),
+    "benign_path_changes": ("lower_better", "changes"),
+    "temporary_obstacle_replan_checks": ("diagnostic", "checks"),
+    "temporary_obstacle_path_changes": ("diagnostic", "changes"),
+    "robot_on_route_replan_checks": ("diagnostic", "checks"),
+    "robot_on_route_path_changes": ("diagnostic", "changes"),
+    "malicious_report_replan_checks": ("lower_better", "checks"),
+    "malicious_report_path_changes": ("lower_better", "changes"),
+    "fake_obstacle_replan_checks": ("lower_better", "checks"),
+    "fake_obstacle_path_changes": ("lower_better", "changes"),
+    "false_clearance_replan_checks": ("lower_better", "checks"),
+    "false_clearance_path_changes": ("lower_better", "changes"),
+    "stale_reassertion_replan_checks": ("lower_better", "checks"),
+    "stale_reassertion_path_changes": ("lower_better", "changes"),
+    "benign_blocked_moves": ("target_zero", "moves"),
     "replans_per_delivery": ("lower_better", "replans/delivery"),
     "traffic_waits_per_delivery": ("lower_better", "waits/delivery"),
     "deadlocks_detected": ("lower_better", "deadlocks"),
@@ -944,7 +994,19 @@ MULTISEED_DIRECTIONS = {
     "intent_commit_mismatches": ("target_zero", "mismatches"),
     "productive_replan_ratio": ("diagnostic", "ratio"),
     "time_to_distrust_malicious_robot": ("diagnostic", "steps"),
+    "time_to_all_benign_distrust": ("diagnostic", "steps"),
+    "distrusted_benign_robot_count": ("higher_better", "robots"),
+    "attacker_min_trust_mean": ("diagnostic", "trust"),
     "final_attacker_trust_mean": ("diagnostic", "trust"),
+    "malicious_reports_operationally_ignored": ("higher_better", "reports"),
+    "attack_induced_path_changes": ("lower_better", "attacks"),
+    "attack_route_penalty_mean": ("lower_better", "cost"),
+    "attack_route_penalty_max": ("lower_better", "cost"),
+    "attack_route_penalty_total": ("lower_better", "cost"),
+    "attack_extra_path_length_mean": ("lower_better", "cells"),
+    "attack_extra_path_length_max": ("lower_better", "cells"),
+    "attack_extra_path_length_total": ("lower_better", "cells"),
+    "steps_route_affected_by_attacker": ("lower_better", "steps"),
     "recovery_start_attacker_trust_mean": ("diagnostic", "trust"),
     "recovery_trust_gain": ("diagnostic", "trust"),
     "deliveries_during_recon": ("higher_better", "deliveries"),
@@ -1067,15 +1129,15 @@ def _seed_metric(data, field):
 def focal_comparison_method(methods) -> str | None:
     """Choose the method that paired differences are measured against.
 
-    ``source_linked`` remains the default proposed method when it is present.
+    ``source_memory`` remains the default proposed method when it is present.
     Otherwise the last requested method is the comparison focus, so a two-method
-    batch such as ``full_trust,majority_vote`` still produces paired statistics.
+    batch such as ``majority_vote,full_trust`` still produces paired statistics.
     """
     ordered = [method for method in methods if method]
     if not ordered:
         return None
-    if "source_linked" in ordered:
-        return "source_linked"
+    if "source_memory" in ordered:
+        return "source_memory"
     unique = list(dict.fromkeys(ordered))
     return unique[-1] if len(unique) >= 2 else None
 
@@ -1092,16 +1154,65 @@ def _write_multiseed_csvs(root, runs, requested_methods=None):
         raw.append(row)
     _write_rows(aggregate / "multiseed_runs.csv", raw)
     summary_rows = []
-    for method in sorted({row["method"] for row in raw}):
+    for method in _ordered_methods(row["method"] for row in raw):
         method_rows = [row for row in raw if row["method"] == method]
         for metric, (direction, unit) in MULTISEED_DIRECTIONS.items():
             values = [row[metric] for row in method_rows if row.get(metric) is not None]
             stats = __import__("map_poisoning.statistics", fromlist=["summarize"]).summarize(values)
             summary_rows.append({"method": method, "metric": metric, "direction": direction, "unit": unit, "n": stats["n"], "n_missing": len(method_rows)-stats["n"], **{key: stats[key] for key in ("mean","sample_std","sem","ci95_low","ci95_high","median","min","max")}})
     _write_rows(aggregate / "multiseed_summary.csv", summary_rows)
+    table_fields = (
+        "benign_total_deliveries_completed",
+        "benign_delivery_cycle_duration_mean_steps",
+        "benign_delivery_cycle_duration_median_steps",
+        "benign_delivery_cycle_duration_p95_steps",
+        "benign_loaded_delivery_duration_mean_steps",
+        "benign_loaded_delivery_duration_median_steps",
+        "benign_loaded_delivery_duration_p95_steps",
+        "benign_total_distance",
+        "distance_per_delivery",
+        "benign_planning_checks",
+        "benign_path_changes",
+        "temporary_obstacle_replan_checks",
+        "temporary_obstacle_path_changes",
+        "robot_on_route_replan_checks",
+        "robot_on_route_path_changes",
+        "malicious_report_replan_checks",
+        "malicious_report_path_changes",
+        "fake_obstacle_replan_checks",
+        "fake_obstacle_path_changes",
+        "false_clearance_replan_checks",
+        "false_clearance_path_changes",
+        "stale_reassertion_replan_checks",
+        "stale_reassertion_path_changes",
+        "attack_induced_path_changes",
+        "attack_route_penalty_mean",
+        "attack_route_penalty_max",
+        "attack_route_penalty_total",
+        "attack_extra_path_length_mean",
+        "attack_extra_path_length_max",
+        "attack_extra_path_length_total",
+        "steps_route_affected_by_attacker",
+        "time_to_distrust_malicious_robot",
+        "malicious_reports_operationally_ignored",
+        "benign_blocked_moves",
+        "benign_no_path_steps",
+    )
+    from .statistics import summarize
+    comparison_table = []
+    for method in _ordered_methods(row["method"] for row in raw):
+        method_rows = [row for row in raw if row["method"] == method]
+        output = {"method": method, "seed_count": len(method_rows)}
+        for field in table_fields:
+            values = [parse_float(row.get(field)) for row in method_rows]
+            values = [value for value in values if value is not None]
+            stats = summarize(values)
+            output[field] = stats["max"] if field in {"attack_route_penalty_max", "attack_extra_path_length_max"} else stats["mean"]
+        comparison_table.append(output)
+    _write_rows(aggregate / "method_comparison_table.csv", comparison_table)
     paired = []
-    present = list(dict.fromkeys(requested_methods or [])) or sorted({row["method"] for row in raw})
-    present = [method for method in present if any(row["method"] == method for row in raw)] or sorted({row["method"] for row in raw})
+    present = list(dict.fromkeys(requested_methods or [])) or _ordered_methods(row["method"] for row in raw)
+    present = [method for method in present if any(row["method"] == method for row in raw)] or _ordered_methods(row["method"] for row in raw)
     focal = focal_comparison_method(present)
     source = {row["seed"]: row for row in raw if row["method"] == focal} if focal else {}
     for baseline in [method for method in present if method != focal]:
@@ -1118,7 +1229,7 @@ def _write_multiseed_csvs(root, runs, requested_methods=None):
     return raw, summary_rows, paired, focal
 
 def _multiseed_point_plot(raw, metrics, title, path):
-    methods = sorted({row["method"] for row in raw}); fig, axes = plt.subplots(1, len(metrics), figsize=(5*len(metrics), 5), squeeze=False)
+    methods = _ordered_methods(row["method"] for row in raw); fig, axes = plt.subplots(1, len(metrics), figsize=(5*len(metrics), 5), squeeze=False)
     from .statistics import summarize
     for axis, metric in zip(axes[0], metrics):
         for x, method in enumerate(methods):
@@ -1178,7 +1289,7 @@ def _paired_seed_plot(raw, path):
 
 def _experiment_design_plot(path, methods=None):
     fig, ax = plt.subplots(figsize=(10, 5)); ax.axis("off")
-    method_label = "   ".join(methods) if methods else "full_trust   majority_vote   trust_fused   source_linked"
+    method_label = "   ".join(methods) if methods else "majority_vote   full_trust   trust_fused   source_memory"
     for index, seed in enumerate(("Seed 1", "Seed 2", "...")):
         y = .8 - index * .28; ax.text(.02, y, seed, fontsize=11, weight="bold", va="center")
         ax.text(.18, y, "one scenario manifest", bbox=dict(boxstyle="round", facecolor="#e8f1fb"), va="center")
@@ -1193,7 +1304,7 @@ def _batch_completion_plot(root, path):
     try: config = json.loads((Path(root) / "batch_config.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): pass
     seeds = [int(value) for value in config.get("seeds", sorted({parse_int(row.get("seed")) for row in status}))]
-    methods = list(config.get("methods", sorted({row.get("method") for row in status})))
+    methods = list(config.get("methods", _ordered_methods(row.get("method") for row in status)))
     state = {(parse_int(row.get("seed")), row.get("method")): row.get("status") for row in status}
     values = [[{"completed": 1, "skipped_resume": 1, "failed": 0, "pending": -1}.get(state.get((seed, method), "pending"), -1) for method in methods] for seed in seeds]
     fig, ax = plt.subplots(figsize=(max(6, len(methods) * 1.5), max(5, len(seeds) * .25)))
@@ -1232,7 +1343,7 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     if len({value for value in presets if value}) > 1: warnings.append("scenario presets differ across runs")
     warnings.extend([] if fairness_ok else ["scenario_manifest_hash mismatch within a seed"])
     requested_seeds = [int(value) for value in config.get("seeds", sorted(by_seed))]
-    requested_methods = list(config.get("methods", sorted({row["method"] for row in raw})))
+    requested_methods = list(config.get("methods", _ordered_methods(row["method"] for row in raw)))
     status = read_csv_rows(root / "batch_status.csv")
     status_map = {(parse_int(row.get("seed")), row.get("method")): row for row in status}
     successful_cells = {(seed, method) for (seed, method), row in status_map.items() if row.get("status") in {"completed", "skipped_resume"}}
@@ -1258,7 +1369,7 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
                        "failed_seed_count": len({seed for seed, _ in failed_cells}),
                        "failure_reason_counts": {reason: sum(1 for row in status if row.get("status") == "failed" and row.get("error") == reason) for reason in sorted({row.get("error") for row in status if row.get("status") == "failed" and row.get("error")})}})
     (aggregate / "batch_validation.json").write_text(json.dumps(validation, indent=2), encoding="utf-8")
-    jobs=[("01_deliveries_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_total_deliveries_completed","benign_deliveries_after_attack","benign_deliveries_after_distrust"],"Deliveries by method (seed points and 95% CI)",p)),("02_mission_efficiency_by_method.png",lambda p:_multiseed_point_plot(raw,["distance_per_delivery","replans_per_delivery","traffic_waits_per_delivery"],"Mission efficiency by method",p)),("03_attack_influence_by_method.png",lambda p:_multiseed_point_plot(raw,["attack_mean_influential_fake_cells","attack_fraction_samples_influenced","attack_mean_attacker_route_cost","attack_fraction_route_affected"],"Attack influence by method",p)),("04_trust_diagnostics_by_method.png",lambda p:_multiseed_point_plot(raw,["time_to_distrust_malicious_robot","final_attacker_trust_mean","recovery_trust_gain"],"Trust diagnostics",p)),("05_traffic_burden_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_traffic_wait_steps","deadlocks_detected","traffic_replans","robot_overlap_violations"],"Traffic burden by method",p)),("06_fake_influence_over_time.png",lambda p:_multiseed_timeseries(runs,"influential_fake_claim_count",p,"Fake influence over time","benign_mean")),("07_delivery_progress_over_time.png",lambda p:_multiseed_timeseries(runs,"deliveries_completed",p,"Benign delivery progress over time","benign_sum")),("08_replans_over_time.png",lambda p:_multiseed_timeseries(runs,"benign_total_replans",p,"Benign replans over time","benign_sum"))]
+    jobs=[("01_deliveries_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_total_deliveries_completed","benign_deliveries_after_attack","benign_deliveries_after_distrust"],"Deliveries by method (seed points and 95% CI)",p)),("02_mission_efficiency_by_method.png",lambda p:_multiseed_point_plot(raw,["distance_per_delivery","replans_per_delivery","traffic_waits_per_delivery"],"Mission efficiency by method",p)),("03_attack_influence_by_method.png",lambda p:_multiseed_point_plot(raw,["attack_mean_influential_fake_cells","attack_fraction_samples_influenced","attack_mean_attacker_route_cost","attack_fraction_route_affected"],"Attack influence by method",p)),("04_trust_diagnostics_by_method.png",lambda p:_multiseed_point_plot(raw,["time_to_distrust_malicious_robot","time_to_all_benign_distrust","attacker_min_trust_mean","final_attacker_trust_mean"],"Trust diagnostics",p)),("05_traffic_burden_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_traffic_wait_steps","deadlocks_detected","traffic_replans","robot_overlap_violations"],"Traffic burden by method",p)),("06_fake_influence_over_time.png",lambda p:_multiseed_timeseries(runs,"influential_fake_claim_count",p,"Fake influence over time","benign_mean")),("07_delivery_progress_over_time.png",lambda p:_multiseed_timeseries(runs,"deliveries_completed",p,"Benign delivery progress over time","benign_sum")),("08_replans_over_time.png",lambda p:_multiseed_timeseries(runs,"benign_total_replans",p,"Benign replans over time","benign_sum")),("14_route_cause_attribution.png",lambda p:_multiseed_point_plot(raw,["malicious_report_path_changes","fake_obstacle_path_changes","stale_reassertion_path_changes","temporary_obstacle_path_changes"],"Path changes by attributable cause",p))]
     if "png" in formats:
         jobs.insert(0, ("00_batch_completion.png", lambda p: _batch_completion_plot(root, p)))
         for name,job in jobs:
@@ -1270,12 +1381,12 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
         if labels: ax.errorbar(means,y,xerr=[[m-l if l is not None else 0 for m,l in zip(means,lows)],[h-m if h is not None else 0 for m,h in zip(means,highs)]],fmt="o")
         focal_label = focal or "focal method"
         ax.axvline(0,color="0.4"); ax.set(yticks=y,yticklabels=labels or ["(no paired methods)"],title=f"{focal_label} paired improvement",xlabel=f"Positive means {focal_label} better"); ax.grid(axis="x",alpha=.25); _save(fig,plots/"09_paired_method_differences.png"); generated.append("09_paired_method_differences.png")
-        if focal == "source_linked":
+        if focal == "source_memory":
             import shutil
-            shutil.copyfile(plots/"09_paired_method_differences.png", plots/"09_source_linked_paired_differences.png")
-            generated.append("09_source_linked_paired_differences.png")
+            shutil.copyfile(plots/"09_paired_method_differences.png", plots/"09_source_memory_paired_differences.png")
+            generated.append("09_source_memory_paired_differences.png")
         from .statistics import summarize
-        methods=sorted({row["method"] for row in raw}); fig, ax=plt.subplots(figsize=(8,6))
+        methods=_ordered_methods(row["method"] for row in raw); fig, ax=plt.subplots(figsize=(8,6))
         for method in methods:
             xvals=[row["replans_per_delivery"] for row in raw if row["method"]==method and row.get("replans_per_delivery") is not None]; yvals=[row["benign_deliveries_after_attack"] for row in raw if row["method"]==method and row.get("benign_deliveries_after_attack") is not None]
             if xvals and yvals:
@@ -1284,14 +1395,14 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
         try:
             _paired_seed_plot(raw, plots / "11_paired_seed_outcomes.png"); generated.append("11_paired_seed_outcomes.png")
             _multiseed_point_plot(raw, ["deliveries_during_attack", "deliveries_during_recovery", "traffic_wait_steps_during_attack", "replans_during_attack"], "Phase outcomes by method", plots / "12_phase_outcomes_by_method.png"); generated.append("12_phase_outcomes_by_method.png")
-            _experiment_design_plot(plots / "13_experiment_design.png", requested_methods or sorted({row["method"] for row in raw})); generated.append("13_experiment_design.png")
+            _experiment_design_plot(plots / "13_experiment_design.png", requested_methods or _ordered_methods(row["method"] for row in raw)); generated.append("13_experiment_design.png")
         except Exception as exc:
             plot_failures.append({"filename": "11-13 aggregate plots", "error": str(exc)}); print(f"[report] FAILED 11-13 aggregate plots: {exc}")
     _write_multiseed_report(aggregate, raw, paired, focal)
     manifest={"directory":str(root),"generated":generated,"failed":plot_failures,"warnings":[],"runs":len(runs)}; (aggregate/"aggregate_plot_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8"); return manifest
 
 def _write_multiseed_report(aggregate, raw, paired, focal=None):
-    methods=sorted({row["method"] for row in raw})
+    methods=_ordered_methods(row["method"] for row in raw)
     try: validation = json.loads((aggregate / "batch_validation.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): validation = {}
     status = "VALID" if validation.get("valid") else "INVALID / INCOMPLETE"
@@ -1301,7 +1412,7 @@ def _write_multiseed_report(aggregate, raw, paired, focal=None):
     from .statistics import summarize
     for method in methods:
         values=[row["benign_total_deliveries_completed"] for row in raw if row["method"]==method and row.get("benign_total_deliveries_completed") is not None]; s=summarize(values); lines.append(f"  {method}: mean deliveries={s['mean']} SD={s['sample_std']} 95% CI=[{s['ci95_low']}, {s['ci95_high']}]")
-    focal_label = focal or validation.get("focal_method") or "source_linked"
+    focal_label = focal or validation.get("focal_method") or "source_memory"
     lines += ["", f"Paired {focal_label} comparisons:"]
     for row in paired:
         if row["metric"]=="benign_deliveries_after_attack" and row["improvement_difference"] is not None: lines.append(f"  {focal_label} vs {row['baseline_method']}: mean paired improvement={row['improvement_difference']:.4g}, 95% CI [{row['improvement_ci95_low']}, {row['improvement_ci95_high']}], n={row['n_pairs']} (paired same-seed difference)")

@@ -37,9 +37,9 @@ preset validates the map shape/hash and uses the same starts and delivery points
 for every seed and defense method:
 
 ```powershell
-python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_002_map\static_grid.npy --scenario-preset warehouse_002 --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map002
-python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map\static_grid.npy --scenario-preset warehouse_005 --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map005
-python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map_rotated\static_grid.npy --scenario-preset warehouse_005_rotated --seed 15 --deliveries-per-robot 2 --defense-method source_linked --output-directory outputs\map005_rotated
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_002_map\static_grid.npy --scenario-preset warehouse_002 --seed 15 --deliveries-per-robot 2 --defense-method source_memory --output-directory outputs\map002
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map\static_grid.npy --scenario-preset warehouse_005 --seed 15 --deliveries-per-robot 2 --defense-method source_memory --output-directory outputs\map005
+python .\main.py --headless --no-animation --map-npy .\converted_maps\maps_005_map_rotated\static_grid.npy --scenario-preset warehouse_005_rotated --seed 15 --deliveries-per-robot 2 --defense-method source_memory --output-directory outputs\map005_rotated
 ```
 
 The fixed coordinates and converted-map SHA-256 hashes are defined in
@@ -56,9 +56,35 @@ The public entry point is the native modular package (`main.py` and
 `map_poisoning/`). It owns manifest authoring, sensing, peer delivery, fusion,
 planning, and metric collection.
 
-The primary comparison methods are `full_trust`, `majority_vote`, `trust_fused`,
-and `source_linked`. Optional additional methods are `hard_threshold`,
+The primary comparison methods are `majority_vote`, `full_trust`, `trust_fused`,
+and `source_memory`. Optional additional methods are `hard_threshold`,
 `soft_probability`, and `time_decay`; they are only run when explicitly selected.
+
+Current primary defaults are 300 reconnaissance steps, 1700 attack steps, and
+500 recovery steps (2500 total), with attacks scheduled every 35--40 steps.
+Manifest authoring first runs one deterministic attack-free 2500-step reference.
+Its benign traffic produces the one shared heatmap, while each proposed attack
+uses the position, visibility, and route from the matching reference step. The
+authored manifest is then replayed unchanged by every defense method. Robots use
+a 360-degree Euclidean line-of-sight
+LiDAR with a five-cell range; observation confidence falls from 1.0 near the robot
+to 0.60 at range five. Direct and peer occupancy memories use a shared 300-step
+linear lifetime, with current LiDAR observations authoritative. Bayesian trust is
+the default (`alpha=9`, `beta=1`, evidence cap 12, contradiction multiplier 6.0, distrust threshold 0.50).
+`source_memory` applies immediate trust loss to historical reports but rehabilitates
+them gradually with a default trust-memory recovery rate of 0.05. Reports are still
+received for audit under `accept_all`, but Source Memory gives a distrusted source zero
+operational map influence; Trust Fused similarly ignores new reports received while
+the sender is below the threshold. Majority Vote and Full Trust remain trust-agnostic
+baselines by design.
+
+Navigation replans immediately for real route-invalidating events and also performs
+a common 25-step route-optimization check for all four primary methods so gradual
+age/trust changes can reveal a better path. `planning_checks` and actual
+`path_changes` are logged separately. Run summaries also separate route changes
+caused by temporary physical obstacles, other robots, malicious reports, and each
+attack type. Attacker attribution is applied only to offline metrics after the
+operational decision; it cannot influence navigation.
 
 To compare the primary methods on one fixed seed-10 manifest:
 
@@ -85,6 +111,18 @@ method's `plots\` for a comparison, and `aggregate\plots\` for multi-seed.
 Completed runs also write `run_summary.csv`, `events.csv`, `robot_timeseries.csv`,
 `report_summary.txt`, and `plot_manifest.json`.
 
+Delivery reporting separates the loaded pickup-to-dropoff leg from the complete
+task cycle and reports mean, median, and p95 durations. Route-impact reporting
+includes event-level counterfactual penalty, extra path length, induced path
+changes, and steps during which attacker evidence affects a route.
+
+Do not use delivery count alone to judge defense separation. It is a coarse outcome
+over roughly 50--60 completed deliveries and is also affected by shared physical
+obstacles and traffic. Pair it with p95 cycle time, attacker route penalty,
+route-affected steps, malicious-report path changes, ignored-report counts, no-path
+steps, and traffic counters. P95 is the duration at or below which 95% of completed
+cycles finished.
+
 Disable report generation with `--no-plots`:
 
 ```powershell
@@ -94,7 +132,7 @@ python .\main.py --headless --no-animation --no-plots --max-steps 10
 Regenerate reports from existing CSV output without rerunning a simulation:
 
 ```powershell
-python -m map_poisoning.reporting outputs\source_linked
+python -m map_poisoning.reporting outputs\source_memory
 python -m map_poisoning.reporting --compare outputs\comparison
 ```
 
@@ -105,9 +143,9 @@ requested method against that seed's manifest:
 python .\main.py --headless --no-animation --seeds 1-3 --compare `
   --map-npy .\converted_maps\maps_005_map\static_grid.npy `
   --scenario-preset warehouse_005 --output-directory outputs\map005_multiseed
-python .\main.py --headless --no-animation --seeds 1-30 --methods source_linked `
+python .\main.py --headless --no-animation --seeds 1-30 --methods source_memory `
   --map-npy .\converted_maps\maps_005_map\static_grid.npy `
-  --scenario-preset warehouse_005 --output-directory outputs\map005_source_linked_multiseed
+  --scenario-preset warehouse_005 --output-directory outputs\map005_source_memory_multiseed
 ```
 
 Use `--resume` to skip only completed cells with matching seed, method,
@@ -123,7 +161,7 @@ python -m map_poisoning.reporting --multiseed outputs\map005_multiseed
 
 Aggregate results are stored below `aggregate\`, including
 `multiseed_runs.csv`, `multiseed_summary.csv`, `paired_method_differences.csv`,
-`batch_validation.json`, and the ten aggregate plots.
+`batch_validation.json`, the wide `method_comparison_table.csv`, and aggregate plots.
 
 ## Rebuild converted maps
 

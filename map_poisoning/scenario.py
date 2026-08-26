@@ -20,7 +20,7 @@ from .world import demo_grid
 from .planning import astar
 from .scenario_presets import preset_for_hash, preset_for_id, validate_fixed_preset
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 def scenario_manifest_hash(manifest: "ScenarioManifest") -> str:
     """Digest the complete canonical manifest, not only its static map."""
@@ -292,7 +292,10 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     positions=tuple(attacker_route[step % len(attacker_route)] for step in range(phases.total_steps))
     def truth(cell, step):
         return ClaimType.BLOCKED if any(cell in episode.cells and episode.appearance_step <= step < episode.clearance_step for episode in episodes) else ClaimType.FREE
-    honest=tuple(ClaimReport(f"attacker-honest-{step:05}",sender,positions[step],truth(positions[step],step),step,step,step) for step in range(0,phases.total_steps,config.communication_period_steps))
+    honest=tuple(ClaimReport(
+        f"attacker-honest-{step:05}", sender, positions[step],
+        truth(positions[step], step), step, sensor_confidence=1.0
+    ) for step in range(0, phases.total_steps, config.communication_period_steps))
     labels=tuple(
         ReportAuditLabel(
             report_id,
@@ -310,11 +313,11 @@ def save_manifest(manifest: ScenarioManifest, path: str | Path) -> None:
 
 def load_manifest(path: str | Path) -> ScenarioManifest:
     raw=json.loads(Path(path).read_text(encoding="utf-8"))
-    if raw.get("schema_version") != SCHEMA_VERSION: raise ValueError("unsupported scenario manifest schema; author a schema-v2 manifest")
+    if raw.get("schema_version") != SCHEMA_VERSION: raise ValueError("unsupported scenario manifest schema; author a schema-v3 manifest")
     episodes=tuple(TemporaryObstacleEpisode(x["episode_id"], tuple(map(tuple,x["cells"])), x["appearance_step"],x["clearance_step"]) for x in raw["obstacle_episodes"])
     events=tuple(AttackEvent(x["event_id"],x["step"],AttackType(x["attack_type"]),tuple(map(tuple,x["cells"])),ClaimType(x["claim"]),x["observation_step"],x["sender_id"],tuple(x["recipients"]),tuple(x["report_ids"]),x.get("obstacle_episode_id")) for x in raw["attack_events"])
     starts={int(key):tuple(value) for key,value in (raw.get("robot_starts") or {}).items()}
     queues={int(key):tuple(DeliveryTask(item["task_id"],tuple(item["pickup"]),tuple(item["dropoff"])) for item in value) for key,value in (raw.get("task_queues") or {}).items()}
-    reports=tuple(ClaimReport(item["report_id"],item["sender_id"],tuple(item["target_cell"]),ClaimType(item["claim"]),item["observation_step"],item["sent_step"],item["received_step"],item.get("confidence",1.),item.get("scenario_event_id")) for item in raw.get("honest_attacker_reports",()))
+    reports=tuple(ClaimReport(item["report_id"], item["sender_id"], tuple(item["target_cell"]), ClaimType(item["claim"]), item["observation_step"], item.get("sensor_confidence", 1.0), item.get("scenario_event_id")) for item in raw.get("honest_attacker_reports",()))
     labels=tuple(ReportAuditLabel(item["report_id"],item["is_malicious"],AttackType(item["attack_type"]) if item.get("attack_type") else None,item.get("obstacle_episode_id"),ClaimType(item["actual_state_at_observation"]),item.get("original_obstacle_appearance_step"),item.get("original_obstacle_clearance_step")) for item in raw.get("report_audit_labels",()))
     return ScenarioManifest(raw["schema_version"],raw["master_seed"],raw["derived_seeds"],raw["map_hash"],tuple(raw["map_shape"]),tuple(tuple(row) for row in raw["static_grid"]),raw["phase_boundaries"],raw["malicious_robot_id"],tuple(raw["benign_robot_ids"]),episodes,events,raw.get("scenario_id",""),raw.get("protocol_id","custom"),starts,queues,tuple(map(tuple,raw.get("attacker_positions",()))),reports,labels,tuple(raw.get("candidate_metadata",())),tuple(raw.get("authoring_warnings",())),tuple(tuple(int(value) for value in row) for row in raw["reconnaissance_heatmap"]) if raw.get("reconnaissance_heatmap") else None,raw.get("scenario_preset"))

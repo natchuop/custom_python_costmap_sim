@@ -1,0 +1,82 @@
+{
+  "attacks": {
+    "broadcast": true,
+    "candidate_top_k": 12,
+    "enabled": [
+      "fake_obstacle",
+      "false_clearance",
+      "stale_reassertion"
+    ],
+    "global_awareness": true,
+    "interval_max": 40,
+    "interval_min": 35,
+    "max_uses_per_footprint": 20,
+    "min_center_spacing": 3,
+    "min_unique_footprints": 3
+  },
+  "code_revision_hash": "df56c7c357b60479df569479f3b75f857195bbd4076a6d29f520d5eec41f958e",
+  "communication_period_steps": 4,
+  "comparison_methods": [
+    "source_memory"
+  ],
+  "confidence_resend_delta": 0.1,
+  "deliveries_per_robot": 100,
+  "effective_method": "trust_fused",
+  "engine": "modular_native",
+  "experiment_config_hash": "addaf9cd965dbe333cfb6290418e8ce42f6ab4855493ec126a934de3c4bfe856",
+  "fusion": {
+    "admission_policy": "accept_all",
+    "blocked_probability_threshold": 0.7,
+    "congested_impact": 0.5,
+    "cost_exponent": 1.5,
+    "cost_scale": 40.0,
+    "decay_rate": 0.006,
+    "duplicate_window_steps": 0,
+    "majority_unknown_cost": 3.0,
+    "max_claim_age": 300,
+    "method": "trust_fused"
+  },
+  "git_commit": "unknown",
+  "git_dirty": false,
+  "lidar_range_cells": 5,
+  "logging": {
+    "generate_plots": false,
+    "output_directory": "verification/out_of_sample_seeds_26_29/seed_0029/trust_fused",
+    "plot_format": "png",
+    "timeseries_period_steps": 5
+  },
+  "manifest_path": "verification/out_of_sample_seeds_26_29/seed_0029/scenario_manifest.json",
+  "map_movingai": null,
+  "map_npy": null,
+  "max_steps": null,
+  "method": "trust_fused",
+  "observation_lifetime_steps": 300,
+  "periodic_route_check_steps": 25,
+  "periodic_route_improvement_epsilon": 0.01,
+  "phases": {
+    "attack_steps": 1700,
+    "recon_steps": 300,
+    "recovery_steps": 500
+  },
+  "scenario_manifest_hash": "4a5eba5398cc53065af01d64da7098089667da8579b0f43c3f55184de0166cc0",
+  "scenario_preset": null,
+  "seed": 29,
+  "temporary_blockage_change_period_steps": 150,
+  "trust": {
+    "confirmation_multiplier": 1.0,
+    "contradiction_multiplier": 6.0,
+    "evidence_cap": 12.0,
+    "model": "bayesian",
+    "prior_alpha": 9.0,
+    "prior_beta": 1.0,
+    "source_memory_recovery_rate": 0.05,
+    "threshold": 0.5
+  },
+  "visualization": {
+    "animation": false,
+    "fake_influence_min_cost_delta": 0.1,
+    "map_view": "combined",
+    "route_impact_eval_period_steps": 25,
+    "route_impact_min_cost_delta": 0.1
+  }
+}

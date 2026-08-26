@@ -1,4 +1,4 @@
-"""Low-level data types.  These deliberately contain no simulator imports."""
+"""Low-level data types. These deliberately contain no simulator imports."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -30,22 +30,25 @@ class VerificationOutcome(str, Enum):
     CONFIRMED = "confirmed"
     CONTRADICTED_FRESH = "contradicted_fresh"
     TEMPORALLY_AMBIGUOUS_OR_EXPIRED = "temporally_ambiguous_or_expired"
-    # Compatibility name for old CSV readers.  It no longer implies honesty or
-    # rewards trust; audit-only truth labels belong outside operational code.
     HONEST_STALE_OR_EXPIRED = "temporally_ambiguous_or_expired"
     UNRESOLVED = "unresolved"
 
 
 @dataclass(frozen=True)
 class ClaimReport:
+    """One peer occupancy report.
+
+    Communication is instantaneous in this simulator, so only the time the
+    information was observed is retained. ``sensor_confidence`` is the quality
+    of that particular observation; source trust is maintained separately.
+    """
+
     report_id: str
     sender_id: int
     target_cell: Cell
     claim: ClaimType
     observation_step: int
-    sent_step: int
-    received_step: int | None = None
-    confidence: float = 1.0
+    sensor_confidence: float = 1.0
     scenario_event_id: str | None = None
 
 
@@ -73,6 +76,7 @@ class DirectObservation:
     cell: Cell
     claim: ClaimType
     step: int
+    sensor_confidence: float = 1.0
 
 
 @dataclass(frozen=True)

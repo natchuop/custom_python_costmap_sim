@@ -1,0 +1,9 @@
+{
+  "code_revision_hash": "df56c7c357b60479df569479f3b75f857195bbd4076a6d29f520d5eec41f958e",
+  "experiment_config_hash": "addaf9cd965dbe333cfb6290418e8ce42f6ab4855493ec126a934de3c4bfe856",
+  "git_commit": "unknown",
+  "git_dirty": false,
+  "method": "majority_vote",
+  "scenario_manifest_hash": "74f201fafb6be5a1dc57697712c13080ebe02bf2938aaced0c2ecdccfc9871af",
+  "seed": 26
+}

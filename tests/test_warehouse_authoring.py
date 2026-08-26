@@ -24,6 +24,9 @@ def test_default_warehouse_manifest_includes_reconnaissance_heatmap():
     )
     manifest = author_warehouse_manifest(config, default_warehouse_map())
     assert manifest.reconnaissance_heatmap is not None
+    # One shared heatmap covers the complete deterministic attack-free
+    # reference horizon, not only the reconnaissance prefix.
+    assert sum(map(sum, manifest.reconnaissance_heatmap)) == len(manifest.benign_robot_ids) * config.phases.total_steps
     assert manifest.obstacle_episodes
     assert sum(1 for episode in manifest.obstacle_episodes if episode.appearance_step == 0) >= min(
         TEMP_ACTIVE_COUNT, 3
@@ -31,6 +34,24 @@ def test_default_warehouse_manifest_includes_reconnaissance_heatmap():
     assert all(len(episode.cells) >= TEMP_MIN_AREA for episode in manifest.obstacle_episodes)
     assert manifest.attack_events
     assert any(item.get("traffic_score") is not None for item in manifest.candidate_metadata)
+    assert all(item.get("heatmap_reference_steps") == config.phases.total_steps for item in manifest.candidate_metadata)
+    assert all(item.get("reference_step") >= config.phases.recon_steps for item in manifest.candidate_metadata)
+    assert all(item.get("target_visible_to_victim") is False for item in manifest.candidate_metadata)
+    assert all(item.get("intended_victim_id") in manifest.benign_robot_ids for item in manifest.candidate_metadata)
+
+
+def test_attack_free_warehouse_manifest_skips_candidate_requirement():
+    config = replace(
+        SimulationConfig(),
+        phases=PhaseConfig(3, 4, 3),
+        attacks=AttackConfig(enabled=()),
+        deliveries_per_robot=1,
+        max_steps=10,
+    )
+    manifest = author_warehouse_manifest(config, default_warehouse_map())
+    assert manifest.attack_events == ()
+    assert manifest.candidate_metadata == ()
+    assert sum(map(sum, manifest.reconnaissance_heatmap)) == 20
 
 
 def test_warehouse_layout_and_candidates_are_reachable():

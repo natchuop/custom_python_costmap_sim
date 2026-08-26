@@ -1,0 +1,5 @@
+method,seed_count,deliveries_mean,cycle_p95_steps,no_path_steps_mean,traffic_wait_steps_mean,attack_route_penalty_mean,steps_route_affected_mean,malicious_reports_ignored_mean,malicious_report_replans_mean,malicious_report_path_changes_mean,fake_obstacle_replans_mean,fake_obstacle_path_changes_mean,temporary_obstacle_path_changes_mean,prevented_robot_conflicts_mean,robot_overlap_violations_mean,blocked_moves_mean
+majority_vote,4,54.25,122.3125,90.25,18.75,1.8704126793740936,173.5,0.0,8.25,6.5,6.75,5.0,53.75,37.0,0.0,0.0
+full_trust,4,54.5,120.575,38.25,22.5,2.699830202609957,241.5,0.0,11.0,8.75,9.75,7.5,39.0,42.0,0.0,0.0
+trust_fused,4,53.75,125.05,113.5,22.25,1.5046996226472778,145.0,253.75,8.25,5.75,7.0,5.25,40.5,39.25,0.0,0.0
+source_memory,4,55.0,119.925,38.75,24.75,1.000397635039611,114.25,302.5,5.5,4.5,4.5,4.0,38.5,47.5,0.0,0.0

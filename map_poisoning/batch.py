@@ -1,6 +1,6 @@
 """Serial, paired multi-seed experiment execution."""
 from __future__ import annotations
-import csv, hashlib, json, subprocess, tempfile, time
+import csv, hashlib, json, pickle, subprocess, sys, tempfile, time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +72,28 @@ class MultiSeedResult:
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 
+def _run_method_isolated(config: SimulationConfig, batch_metadata: dict) -> None:
+    """Run one batch cell in a fresh Python subprocess.
+
+    The worker writes batch completion metadata before exiting, so a fully
+    written cell remains resumable even if the parent process is interrupted
+    immediately afterward.
+    """
+    config_path = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", suffix=".pkl", delete=False) as handle:
+            config_path = Path(handle.name)
+            pickle.dump({"config": config, "batch_metadata": dict(batch_metadata)}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        completed = subprocess.run(
+            [sys.executable, "-m", "map_poisoning.batch_worker", str(config_path)],
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"isolated method process exited with code {completed.returncode}")
+    finally:
+        if config_path is not None:
+            config_path.unlink(missing_ok=True)
+
 def _valid_resume(path: Path, seed: int, method: str, manifest_hash: str, config_hash: str, code_hash: str | None = None) -> bool:
     summary_path = path / "run_summary.csv"
     effective_path = path / "effective_config.json"
@@ -136,10 +158,13 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
                     status = "skipped_resume"
                 else:
                     try:
-                        run(method_cfg, comparison=False)
-                        effective = json.loads((output / "effective_config.json").read_text(encoding="utf-8"))
-                        effective.update({"experiment_config_hash": cfg_hash, **revision})
-                        (output / "effective_config.json").write_text(json.dumps(effective, indent=2, sort_keys=True), encoding="utf-8")
+                        _run_method_isolated(method_cfg, {
+                            "seed": seed,
+                            "method": method,
+                            "scenario_manifest_hash": manifest_hash,
+                            "experiment_config_hash": cfg_hash,
+                            **revision,
+                        })
                     except Exception as exc:
                         status = "failed"; error = str(exc)
                         if fail_fast: raise
@@ -169,7 +194,7 @@ def run_multiseed(config: SimulationConfig, seeds: tuple[int, ...], *, methods: 
         f"Batch valid: {validation.get('valid', 'unknown')}\n\nRaw runs: {root / 'seed_XXXX' / '<method>'}\n"
         f"Statistics: {root / 'aggregate'}\nAggregate report: {root / 'aggregate' / 'multiseed_report.txt'}\nAggregate plots: {root / 'aggregate' / 'plots'}\n\n"
         "Per-run plots are disabled by default for multi-seed runs; use --per-run-plots to enable them.\n"
-        "Individual report example: python -m map_poisoning.reporting outputs/map005_30seed_comparison/seed_0001/source_linked --run\n"
+        "Individual report example: python -m map_poisoning.reporting outputs/map005_30seed_comparison/seed_0001/source_memory --run\n"
         "Aggregate regeneration: python -m map_poisoning.reporting outputs/map005_30seed_comparison --multiseed\n", encoding="utf-8")
     print(f"Multi-seed results:\n  raw runs:       {root / 'seed_XXXX' / '<method>'}\n  statistics:     {root / 'aggregate'}\n  aggregate plots:{root / 'aggregate' / 'plots'}")
     return MultiSeedResult(root, records)
