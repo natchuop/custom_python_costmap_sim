@@ -41,7 +41,7 @@ class BayesianTrustModel(TrustModel):
     alpha0: float = 9.0
     beta0: float = 1.0
     evidence_cap: float = 12.0
-    confirmation_multiplier: float = 1.0
+    confirmation_multiplier: float = 0.25
     contradiction_multiplier: float = 6.0
     memory_recovery_rate: float = 0.05
 
@@ -95,7 +95,7 @@ class BayesianTrustModel(TrustModel):
 @dataclass
 class ScalarTrustModel(TrustModel):
     initial: float = 0.90
-    reward: float = 0.02
+    reward: float = 0.005
     penalty: float = 0.06
     memory_recovery_rate: float = 0.05
 
@@ -134,7 +134,7 @@ def make_trust_model(
     beta: float = 1.0,
     *,
     evidence_cap: float = 12.0,
-    confirmation_multiplier: float = 1.0,
+    confirmation_multiplier: float = 0.25,
     contradiction_multiplier: float = 6.0,
     memory_recovery_rate: float = 0.05,
 ) -> TrustModel:

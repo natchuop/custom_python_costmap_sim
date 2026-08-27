@@ -7,7 +7,7 @@ import numpy as np
 
 from map_poisoning.config import VisualizationConfig
 from map_poisoning.fusion import FusionEngine
-from map_poisoning.live_view import DISPLAY_DYNAMIC, DISPLAY_R2, combined_display_grid
+from map_poisoning.live_view import DISPLAY_DYNAMIC, DISPLAY_FREE, DISPLAY_R1, DISPLAY_R2, combined_display_grid
 from map_poisoning.models import ClaimReport, ClaimType, DirectObservation
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.live_view import show_belief_maps, show_traffic_heatmap
@@ -55,6 +55,55 @@ def test_stale_explored_clear_does_not_hide_trusted_peer_blocked_on_map():
     )
     arr = combined_display_grid(observer, world, log, step=10, robots=(observer, peer))
     assert arr[3, 3] == DISPLAY_R2
+
+
+def test_trusted_peer_free_clears_older_peer_blocked_on_combined_map():
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    world = type("World", (), {"static_grid": grid})()
+    log = {"malicious_robot_id": 0}
+    scores = {1: 0.80, 2: 0.80}
+    observer = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 0,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "belief": RobotBeliefMap(grid, memory_steps=300),
+            "fusion": FusionEngine("trust_threshold", scores.get, trust_threshold=0.55),
+        },
+    )()
+    orange = type("Robot", (), {"robot_id": 1})()
+    blue = type("Robot", (), {"robot_id": 2})()
+    observer.fusion.add(ClaimReport("old-blocked", 1, (3, 3), ClaimType.BLOCKED, 5, 1.0))
+    observer.fusion.add(ClaimReport("new-free", 2, (3, 3), ClaimType.FREE, 6, 1.0))
+    assert combined_display_grid(observer, world, log, step=6, robots=(observer, orange, blue))[3, 3] == DISPLAY_FREE
+    scores[2] = 0.40
+    assert combined_display_grid(observer, world, log, step=7, robots=(observer, orange, blue))[3, 3] == DISPLAY_R1
+
+
+def test_accepted_false_clearance_report_paints_white():
+    grid = np.zeros((6, 6), dtype=np.uint8)
+    world = type("World", (), {"static_grid": grid})()
+    log = {"malicious_robot_id": 0}
+    victim = type(
+        "Robot",
+        (),
+        {
+            "robot_id": 1,
+            "completed": True,
+            "tasks": (),
+            "task_index": 0,
+            "carrying": False,
+            "belief": RobotBeliefMap(grid, memory_steps=300),
+            "fusion": FusionEngine("trust_threshold", lambda _: 0.80, trust_threshold=0.55),
+        },
+    )()
+    attacker = type("Robot", (), {"robot_id": 0})()
+    victim.fusion.add(ClaimReport("false-clear", 0, (2, 2), ClaimType.FREE, 5, 1.0))
+    assert combined_display_grid(victim, world, log, step=5, robots=(attacker, victim))[2, 2] == DISPLAY_FREE
 
 
 def test_trusted_attacker_fake_obstacles_paint_on_victim_map():
@@ -270,10 +319,10 @@ def test_source_memory_popup_state_uses_memory_gate():
     assert trust_axes
     table = trust_axes[0].tables[0]
     headers = [table[(0, col)].get_text().get_text() for col in range(5)]
-    assert headers == ["Observer", "Sender", "Trust", "Memory", "State"]
+    assert headers == ["Reporter", "Observed by", "Trust", "Memory", "State"]
     target_row = None
     for row in range(1, 7):
-        if table[(row, 0)].get_text().get_text() == "R1" and table[(row, 1)].get_text().get_text() == "R0":
+        if table[(row, 0)].get_text().get_text() == "R0" and table[(row, 1)].get_text().get_text() == "R1":
             target_row = row
             break
     assert target_row is not None

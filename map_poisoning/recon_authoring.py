@@ -181,6 +181,7 @@ def recon_heatmap_attack_candidates(
     forbidden_cells=(),
     active_temp_cells=(),
     visible_cells_by_robot=None,
+    future_visibility_delay_fn=None,
 ):
     candidates = []
     rows, cols = heatmap.shape
@@ -219,6 +220,11 @@ def recon_heatmap_attack_candidates(
                 visible = {tuple(item) for item in visible_cells_by_robot.get(victim.robot_id, ())}
                 if visible.intersection(report_cells):
                     continue
+                visibility_delay = None
+                if future_visibility_delay_fn is not None:
+                    visibility_delay = future_visibility_delay_fn(victim.robot_id, report_cells)
+                    if visibility_delay is None:
+                        continue
                 remaining = list(victim.path or ())
                 if not remaining:
                     continue
@@ -242,6 +248,7 @@ def recon_heatmap_attack_candidates(
                     "path_proximity_score": proximity,
                     "route_distance_steps": nearest_index,
                     "reference_detour_score": detour,
+                    "first_visibility_delay": visibility_delay,
                 })
             if not victim_options:
                 continue
@@ -272,6 +279,7 @@ def recon_heatmap_attack_candidates(
                     "route_distance_steps": victim["route_distance_steps"],
                     "reference_detour_score": victim["reference_detour_score"],
                     "target_visible_to_victim": False,
+                    "first_visibility_delay": victim["first_visibility_delay"],
                     "bottleneck_score": _footprint_bottleneck_score(grid, report_cells),
                 }
             )
@@ -365,7 +373,11 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
 
     config.validate()
     grid = np.asarray(default_warehouse_map() if grid is None else grid, dtype=np.uint8)
-    starts, goals, task_queues = build_warehouse_layout(grid, config.deliveries_per_robot)
+    starts, goals, task_queues = build_warehouse_layout(
+        grid,
+        config.deliveries_per_robot,
+        seed=config.seed,
+    )
     sender = 0
     benign = tuple(robot_id for robot_id in starts if robot_id != sender)
     forbidden = set(starts.values()) | set(WAREHOUSE_NARROW_CORRIDOR_CELLS)
@@ -427,35 +439,28 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             visible[int(robot_id)] = tuple(state.get("visible_cells") or ())
         return proxies, visible
 
-    candidates = []
-    if enabled_types:
-        initial_robots, initial_visible = reference_robots_at_step(config.phases.recon_steps)
-        candidates = recon_heatmap_attack_candidates(
-            grid,
-            goals,
-            initial_robots,
-            heatmap,
-            rng=place_rng,
-            forbidden_cells=protected_cells,
-            visible_cells_by_robot=initial_visible,
-        )
-        if not candidates:
-            candidates = recon_heatmap_attack_candidates(
-                grid,
-                goals,
-                initial_robots,
-                heatmap,
-                rng=place_rng,
-                require_route_overlap=False,
-                forbidden_cells=protected_cells,
-                visible_cells_by_robot=initial_visible,
-            )
-        if not candidates:
-            raise RuntimeError("clean warehouse rollout produced no manifest attack candidates")
-
     def candidates_at_step(step: int):
         reference_robots, visible = reference_robots_at_step(step)
         dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in reference_robots}
+
+        def future_visibility_delay(victim_id, report_cells):
+            current = reference_states.get(step, {}).get(victim_id, {})
+            current_goal = current.get("goal")
+            footprint = {tuple(cell) for cell in report_cells}
+            for delay in range(1, config.attacks.visibility_delay_max + 1):
+                state = reference_states.get(step + delay, {}).get(victim_id)
+                if state is None:
+                    return None
+                if footprint.intersection(tuple(cell) for cell in state.get("visible_cells", ())):
+                    if delay < config.attacks.visibility_delay_min:
+                        return None
+                    # Keep the target attached to the same clean-reference
+                    # delivery leg; otherwise visibility is incidental.
+                    if current_goal is not None and state.get("goal") != current_goal:
+                        return None
+                    return delay
+            return None
+
         return recon_heatmap_attack_candidates(
             grid,
             goals,
@@ -466,6 +471,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             forbidden_cells=dynamic_forbidden,
             active_temp_cells=_active_temp_cells(episodes, step),
             visible_cells_by_robot=visible,
+            future_visibility_delay_fn=future_visibility_delay,
         )
 
     rng = named_rng(config.seed, "warehouse_manifest_scheduler")
@@ -477,6 +483,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     step = config.phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     index = 0
     while step < config.phases.recon_steps + config.phases.attack_steps and enabled_types:
+        active_temp_now = set(_active_temp_cells(episodes, step))
         feasible = [
             kind
             for kind in enabled_types
@@ -487,7 +494,11 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             )
             or (
                 kind == AttackType.STALE_REASSERTION
-                and any(episode.clearance_step <= step for episode in episodes)
+                and any(
+                    episode.clearance_step <= step
+                    and not set(episode.cells).intersection(active_temp_now)
+                    for episode in episodes
+                )
             )
         ]
         if not feasible:
@@ -501,7 +512,11 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                     selected_attack == AttackType.FALSE_CLEARANCE
                     and episode.appearance_step <= step < episode.clearance_step
                 )
-                or (selected_attack == AttackType.STALE_REASSERTION and episode.clearance_step <= step)
+                or (
+                    selected_attack == AttackType.STALE_REASSERTION
+                    and episode.clearance_step <= step
+                    and not set(episode.cells).intersection(active_temp_now)
+                )
             ]
             if not eligible:
                 step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
@@ -527,32 +542,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
             continue
         step_candidates = candidates_at_step(step)
-        if not step_candidates:
-            reference_robots, visible = reference_robots_at_step(step)
-            dynamic_forbidden = protected_cells | {tuple(robot.position) for robot in reference_robots}
-            step_candidates = recon_heatmap_attack_candidates(
-                grid,
-                goals,
-                reference_robots,
-                heatmap,
-                rng=place_rng,
-                require_route_overlap=False,
-                forbidden_cells=dynamic_forbidden,
-                active_temp_cells=_active_temp_cells(episodes, step),
-                visible_cells_by_robot=visible,
-            )
-        if step_candidates:
-            pool = step_candidates[: config.attacks.candidate_top_k]
-        else:
-            active_now = _active_temp_cells(episodes, step)
-            reference_robots, _ = reference_robots_at_step(step)
-            blocked_now = protected_cells | {tuple(robot.position) for robot in reference_robots} | set(active_now)
-            fallback = [
-                candidate
-                for candidate in candidates
-                if not any(tuple(cell) in blocked_now for cell in candidate["report_cells"])
-            ]
-            pool = fallback[: config.attacks.candidate_top_k]
+        pool = step_candidates[: config.attacks.candidate_top_k]
         used_unique = set(uses)
         require_new_center = len(used_unique) < config.attacks.min_unique_footprints
         eligible = [
@@ -580,7 +570,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 if uses.get(tuple(candidate["center_cell"]), 0) < config.attacks.max_uses_per_footprint
             ]
         if not eligible:
-            warnings.append("route_critical_attack_candidate_unavailable")
+            warnings.append("visibility_window_attack_candidate_unavailable")
             step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
             continue
         weights = list(range(len(eligible), 0, -1))
@@ -613,11 +603,17 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 "reference_route_distance_steps": candidate.get("route_distance_steps"),
                 "reference_detour_score": candidate.get("reference_detour_score"),
                 "target_visible_to_victim": candidate.get("target_visible_to_victim", False),
+                "first_visibility_delay": candidate.get("first_visibility_delay"),
+                "expected_visibility_step": step + int(candidate["first_visibility_delay"]),
+                "visibility_delay_window": [
+                    config.attacks.visibility_delay_min,
+                    config.attacks.visibility_delay_max,
+                ],
                 "heatmap_reference_steps": config.phases.total_steps,
                 "traffic_score": candidate["traffic_score"],
                 "bottleneck_score": candidate["bottleneck_score"],
                 "estimated_detour_score": candidate["path_proximity_score"],
-                "rank": (step_candidates.index(candidate) + 1 if candidate in step_candidates else candidates.index(candidate) + 1),
+                "rank": step_candidates.index(candidate) + 1,
                 "selection_weight": 1 / len(eligible),
                 "prior_use_count": uses.get(center, 0),
             }
@@ -626,7 +622,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         selected_centers.append(center)
         index += 1
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
-    if len(set(selected_centers)) < config.attacks.min_unique_footprints:
+    if AttackType.FAKE_OBSTACLE in enabled_types and len(set(selected_centers)) < config.attacks.min_unique_footprints:
         warnings.append("concentrated_attack_manifest: minimum unique footprint count not met")
     labels = tuple(
         ReportAuditLabel(

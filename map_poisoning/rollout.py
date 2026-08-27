@@ -286,7 +286,10 @@ def run_manifest_rollout(
         phase = _phase(config, step)
         log["phase"].append(phase)
         positions = {robot.robot_id: robot.position for robot in robots}
-        truth_grid = world.truth_grid(step)
+        # A temporary obstacle yields at onset while any robot occupies its
+        # footprint; otherwise a discrete rectangle can materialize around a
+        # robot and create an artificial full-episode no-path stall.
+        truth_grid = world.begin_step(step, positions.values())
         observations_by_robot = {}
         direct_verification_replan: dict[int, bool] = {}
         trust_verification_route_change: dict[int, bool] = {}
@@ -594,6 +597,7 @@ def run_manifest_rollout(
                     occupied.discard(before)
                     occupied.add(robot.position)
                     robot.consecutive_traffic_waits = 0
+            no_path_cause = robot.classify_no_path(world, step) if action == "no_path" else None
             robot.record_position()
             if action == "blocked_move" or (action == "task_transition" and not robot.completed):
                 robot.replan(step, action)
@@ -618,6 +622,7 @@ def run_manifest_rollout(
                 "method": method,
                 "robot_id": robot.robot_id,
                 "action": action,
+                "reason": no_path_cause,
                 "phase": phase,
                 "position": robot.position,
                 "goal": robot.goal if not robot.completed else None,
@@ -813,6 +818,15 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "benign_deliveries_after_attack": delivery_after_attack,
         "benign_deliveries_after_distrust": delivery_after_distrust,
         "benign_no_path_steps": sum(robot.no_path_steps for robot in benign),
+        "benign_no_path_causes": {
+            cause: sum(robot.no_path_causes.get(cause, 0) for robot in benign)
+            for cause in (
+                "truth_disconnected",
+                "direct_belief_disconnected",
+                "peer_fusion_disconnected",
+                "planner_or_state_error",
+            )
+        },
         "benign_movement_steps": sum(robot.movement_steps for robot in benign),
         "benign_total_distance": sum(robot.total_distance for robot in benign),
         "benign_total_replans": sum(robot.total_replans for robot in benign),
@@ -820,6 +834,18 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "benign_path_changes": sum(robot.path_changes for robot in benign),
         "temporary_obstacle_replan_checks": replan_count("temporary_physical_obstacle_on_route"),
         "temporary_obstacle_path_changes": replan_count("temporary_physical_obstacle_on_route", changed_only=True),
+        "temporary_obstacle_deferred_activation_steps": world.deferred_activation_steps,
+        "temporary_obstacle_episodes_deferred": len(world.deferred_episode_ids),
+        "attack_events_while_obstacle_deferred": sum(
+            1
+            for event in manifest.attack_events
+            if event.obstacle_episode_id is not None
+            and event.obstacle_episode_id in world.deferred_episode_ids
+            and (
+                world.activation_step(event.obstacle_episode_id) is None
+                or int(event.step) < int(world.activation_step(event.obstacle_episode_id))
+            )
+        ),
         "robot_on_route_replan_checks": replan_count("robot_detected_on_route"),
         "robot_on_route_path_changes": replan_count("robot_detected_on_route", changed_only=True),
         "malicious_report_replan_checks": replan_count("malicious_report_on_route"),

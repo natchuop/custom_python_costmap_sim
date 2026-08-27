@@ -1,0 +1,22 @@
+BATCH STATUS: VALID
+Completed cells: 10 / 10
+Complete seeds: 2 / 2
+Statistical summaries below exclude failed cells.
+
+Multi-seed report
+
+Methods: latest_report, majority_vote, full_trust, trust_fused, source_memory
+Completed seed/method runs: 10
+
+Mission outcomes:
+  latest_report: mean deliveries=54.0 SD=5.656854249492381 95% CI=[3.1751810543999994, 104.8248189456]
+  majority_vote: mean deliveries=56.5 SD=3.5355339059327378 95% CI=[24.734488159, 88.265511841]
+  full_trust: mean deliveries=58.0 SD=1.4142135623730951 95% CI=[45.2937952636, 70.7062047364]
+  trust_fused: mean deliveries=57.0 SD=1.4142135623730951 95% CI=[44.2937952636, 69.7062047364]
+  source_memory: mean deliveries=57.0 SD=1.4142135623730951 95% CI=[44.2937952636, 69.7062047364]
+
+Paired source_memory comparisons:
+  source_memory vs latest_report: mean paired improvement=3, 95% CI [-35.1186142092, 41.1186142092], n=2 (paired same-seed difference)
+  source_memory vs majority_vote: mean paired improvement=0.5, 95% CI [-18.5593071046, 19.5593071046], n=2 (paired same-seed difference)
+  source_memory vs full_trust: mean paired improvement=-1, 95% CI [-1.0, -1.0], n=2 (paired same-seed difference)
+  source_memory vs trust_fused: mean paired improvement=0, 95% CI [0.0, 0.0], n=2 (paired same-seed difference)

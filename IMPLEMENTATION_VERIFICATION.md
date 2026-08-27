@@ -1,11 +1,12 @@
 # Implementation Verification
 
-This build implements the agreed four-method experiment in this order:
+This build implements the agreed five-method experiment in this order:
 
-1. Majority Vote
-2. Full Trust
-3. Trust Fused
-4. Source Memory
+1. Latest Report
+2. Majority Vote
+3. Full Trust
+4. Trust Fused
+5. Source Memory
 
 ## Baseline defaults
 
@@ -17,7 +18,7 @@ This build implements the agreed four-method experiment in this order:
 - Direct-observation and peer-report lifetime: 300 steps
 - Confidence resend threshold: 0.10
 - Bayesian trust: prior alpha=9, beta=1, evidence cap=12
-- Confirmation evidence multiplier: 1.0
+- Confirmation evidence multiplier: 0.25
 - Contradiction evidence multiplier: 6.0
 - Distrust threshold: 0.50
 - Source Memory recovery rate: 0.05 per positive trust-update batch
@@ -27,7 +28,9 @@ This build implements the agreed four-method experiment in this order:
 
 ## Verification completed
 
-- `python -m pytest -q`: 117 tests passed, including full-reference heatmap, static heatmap background, time-aligned authoring, physical-obstacle attribution, route-impact, delivery-cycle, and attack-free CLI contracts.
+- `python -m pytest -q`: 124 tests passed, including peer FREE/BLOCKED display fusion, latest-report categorical behavior, strict future visibility, seeded deliveries, trust recovery, collision-safe temporary-obstacle activation, popup labels, and the earlier contracts.
+- Seed 15 completed all five 2500-step methods on one identical audited manifest. It had zero robot overlaps, deadlocks, or physically blocked moves in every method.
+- Held-out seeds 16 and 17 completed all ten requested 2500-step cells with zero failures or missing runs. Both manifests passed audit; every fake target's first visibility was within 15--40 future steps.
 - Fake-obstacle stress regression completed: default warehouse seeds 24 and 25 x four methods x 2500 steps = 8 valid full runs.
 - Each stress manifest contains 45 attacks at 35--40-step spacing, one 5000-count clean heatmap, positive finite reference detours, and targets outside the intended victim's current LiDAR view.
 - All eight stress runs completed deliveries with zero physical blocked moves; batch validation reports zero failed or missing cells.

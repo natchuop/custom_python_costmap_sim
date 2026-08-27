@@ -1,0 +1,80 @@
+{
+  "attacks": {
+    "broadcast": true,
+    "candidate_top_k": 12,
+    "enabled": [
+      "fake_obstacle",
+      "false_clearance",
+      "stale_reassertion"
+    ],
+    "global_awareness": true,
+    "interval_max": 40,
+    "interval_min": 35,
+    "max_uses_per_footprint": 20,
+    "min_center_spacing": 3,
+    "min_unique_footprints": 3,
+    "visibility_delay_max": 40,
+    "visibility_delay_min": 15
+  },
+  "communication_period_steps": 4,
+  "comparison_methods": [
+    "latest_report",
+    "majority_vote",
+    "full_trust",
+    "trust_fused",
+    "source_memory"
+  ],
+  "confidence_resend_delta": 0.1,
+  "deliveries_per_robot": 100,
+  "fusion": {
+    "admission_policy": "accept_all",
+    "blocked_probability_threshold": 0.7,
+    "congested_impact": 0.5,
+    "cost_exponent": 1.5,
+    "cost_scale": 40.0,
+    "decay_rate": 0.006,
+    "duplicate_window_steps": 0,
+    "majority_unknown_cost": 3.0,
+    "max_claim_age": 300,
+    "method": "source_memory"
+  },
+  "lidar_range_cells": 5,
+  "logging": {
+    "generate_plots": false,
+    "output_directory": "verification/latest_report_peer_fusion_full_compare_corrected",
+    "plot_format": "png",
+    "timeseries_period_steps": 5
+  },
+  "manifest_path": "verification/latest_report_peer_fusion_manifest_corrected/scenario_manifest.json",
+  "map_movingai": null,
+  "map_npy": null,
+  "max_steps": null,
+  "observation_lifetime_steps": 300,
+  "periodic_route_check_steps": 25,
+  "periodic_route_improvement_epsilon": 0.01,
+  "phases": {
+    "attack_steps": 1700,
+    "recon_steps": 300,
+    "recovery_steps": 500
+  },
+  "scenario_preset": null,
+  "seed": 15,
+  "temporary_blockage_change_period_steps": 150,
+  "trust": {
+    "confirmation_multiplier": 0.25,
+    "contradiction_multiplier": 6.0,
+    "evidence_cap": 12.0,
+    "model": "bayesian",
+    "prior_alpha": 9.0,
+    "prior_beta": 1.0,
+    "source_memory_recovery_rate": 0.05,
+    "threshold": 0.5
+  },
+  "visualization": {
+    "animation": false,
+    "fake_influence_min_cost_delta": 0.1,
+    "map_view": "combined",
+    "route_impact_eval_period_steps": 25,
+    "route_impact_min_cost_delta": 0.1
+  }
+}

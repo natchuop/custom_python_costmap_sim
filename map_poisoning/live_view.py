@@ -137,6 +137,21 @@ def _dominant_blocked_sender(robot, items, step):
     blocked.sort(reverse=True)
     return blocked[0][-1]
 
+
+def _peer_fused_state(robot, cell, step):
+    """Return the operational peer result used by routing and visualization.
+
+    FREE is a real fused state, not merely the absence of a BLOCKED report.
+    This lets a trusted peer clear stale occupied information on a combined
+    belief map while preserving each method's tie and trust-gating rules.
+    """
+    evidence = robot.fusion.evidence(cell, step)
+    if evidence > 1e-12:
+        return ClaimType.BLOCKED
+    if evidence < -1e-12:
+        return ClaimType.FREE
+    return None
+
 def _paint_trusted_attack_reports(arr, robot, log, step, threshold: float) -> None:
     """Paint active trusted attacker BLOCKED fusion claims on victim belief maps."""
     attacker = log.get("malicious_robot_id")
@@ -226,10 +241,17 @@ def combined_display_grid(robot, world, log, step, robots):
         if direct == ClaimType.BLOCKED:
             arr[cell] = own
             continue
-        sender = _dominant_blocked_sender(robot, items, step)
-        if sender is not None:
-            arr[cell] = ROBOT_DISPLAY.get(sender, DISPLAY_BLOCKED)
-        elif _explored_clear(robot, cell, step, display_age):
+        peer_state = _peer_fused_state(robot, cell, step)
+        if peer_state == ClaimType.FREE:
+            arr[cell] = DISPLAY_FREE
+            continue
+        if peer_state == ClaimType.BLOCKED:
+            sender = _dominant_blocked_sender(robot, items, step)
+            if sender is not None:
+                arr[cell] = ROBOT_DISPLAY.get(sender, DISPLAY_BLOCKED)
+                continue
+        # A tied/ignored peer result does not erase valid local memory.
+        if _explored_clear(robot, cell, step, display_age):
             arr[cell] = DISPLAY_FREE
     attacker = log.get("malicious_robot_id")
     _paint_overlays(arr, _overlay_groups(log, step), attacker_view=robot.robot_id == attacker)
@@ -582,8 +604,8 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     source_memory_table = method == "source_memory"
     if source_memory_table:
         trust_table = trust_ax.table(
-            cellText=[[f"R{observer}", f"R{sender}", f"{threshold:.2f}", f"{threshold:.2f}", "ACTIVE"] for observer, sender in trust_pairs],
-            colLabels=("Observer", "Sender", "Trust", "Memory", "State"),
+            cellText=[[f"R{sender}", f"R{observer}", f"{threshold:.2f}", f"{threshold:.2f}", "ACTIVE"] for observer, sender in trust_pairs],
+            colLabels=("Reporter", "Observed by", "Trust", "Memory", "State"),
             colWidths=(0.17, 0.17, 0.17, 0.17, 0.22),
             cellLoc="left",
             colLoc="left",
@@ -591,8 +613,8 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
         )
     else:
         trust_table = trust_ax.table(
-            cellText=[[f"R{observer}", f"R{sender}", f"{threshold:.2f}", "TRUSTED"] for observer, sender in trust_pairs],
-            colLabels=("Observer", "Sender", "Score", "State"),
+            cellText=[[f"R{sender}", f"R{observer}", f"{threshold:.2f}", "TRUSTED"] for observer, sender in trust_pairs],
+            colLabels=("Reporter", "Observed by", "Score", "State"),
             colWidths=(0.20, 0.20, 0.18, 0.27),
             cellLoc="left",
             colLoc="left",
@@ -603,8 +625,8 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     latest_attack_text = latest_attack_ax.text(0.05, 0.90, "", fontsize=10, va="top", family="DejaVu Sans Mono", transform=latest_attack_ax.transAxes)
     sharing_ax.text(
         0.01, 0.50,
-        "Valid known FREE paints white; gray is unknown or expired. "
-        "Operationally active attacker BLOCKED claims use Robot 0 purple; Source Memory hides them while IGNORED.",
+        "Accepted local or peer FREE paints white; gray is unknown or expired. "
+        "Accepted peer BLOCKED uses the reporter's color; Source Memory hides reports while IGNORED.",
         fontsize=8.5, va="center", transform=sharing_ax.transAxes,
     )
     legend_ax.legend(
@@ -714,7 +736,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
             belief_attack_outlines[rid] = []
             if selected_view == "combined" and rid != attacker:
                 latest = _latest_attack(log, frame)
-                if latest is not None and latest.attack_type != AttackType.FALSE_CLEARANCE:
+                if latest is not None:
                     belief_attack_outlines[rid] = draw_attack_outlines(belief_axes[rid], latest.cells)
                     artists.extend(belief_attack_outlines[rid])
 
@@ -753,8 +775,8 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
             memory_value = float((memory_snapshot.get(observer_id) or {}).get(sender_id, value))
             effective = min(value, memory_value) if source_memory_table else value
             state = ("ACTIVE" if effective >= threshold else "IGNORED") if source_memory_table else ("TRUSTED" if value >= threshold else "DISTRUSTED")
-            trust_table[(row, 0)].get_text().set_text(f"R{observer_id}")
-            trust_table[(row, 1)].get_text().set_text(f"R{sender_id}")
+            trust_table[(row, 0)].get_text().set_text(f"R{sender_id}")
+            trust_table[(row, 1)].get_text().set_text(f"R{observer_id}")
             trust_table[(row, 2)].get_text().set_text(f"{value:.2f}")
             state_col = 3
             if source_memory_table:

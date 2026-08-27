@@ -1,0 +1,84 @@
+{
+  "attacks": {
+    "broadcast": true,
+    "candidate_top_k": 12,
+    "enabled": [
+      "fake_obstacle",
+      "false_clearance",
+      "stale_reassertion"
+    ],
+    "global_awareness": true,
+    "interval_max": 40,
+    "interval_min": 35,
+    "max_uses_per_footprint": 20,
+    "min_center_spacing": 3,
+    "min_unique_footprints": 3,
+    "visibility_delay_max": 40,
+    "visibility_delay_min": 15
+  },
+  "code_revision_hash": "f77833d46df239b7a840b1a1f525b3f7f42b9db492b89bda9c6164995bab4504",
+  "communication_period_steps": 4,
+  "comparison_methods": [
+    "source_memory"
+  ],
+  "confidence_resend_delta": 0.1,
+  "deliveries_per_robot": 100,
+  "effective_method": "majority_vote",
+  "engine": "modular_native",
+  "experiment_config_hash": "3598c0f3c8bc4aa53386c88086c3137dc1838574e6bf22af73e68b18b96be964",
+  "fusion": {
+    "admission_policy": "accept_all",
+    "blocked_probability_threshold": 0.7,
+    "congested_impact": 0.5,
+    "cost_exponent": 1.5,
+    "cost_scale": 40.0,
+    "decay_rate": 0.006,
+    "duplicate_window_steps": 0,
+    "majority_unknown_cost": 3.0,
+    "max_claim_age": 300,
+    "method": "majority_vote"
+  },
+  "git_commit": "unknown",
+  "git_dirty": false,
+  "lidar_range_cells": 5,
+  "logging": {
+    "generate_plots": false,
+    "output_directory": "verification/latest_report_peer_fusion_heldout_16_17/seed_0017/majority_vote",
+    "plot_format": "png",
+    "timeseries_period_steps": 5
+  },
+  "manifest_path": "verification/latest_report_peer_fusion_heldout_16_17/seed_0017/scenario_manifest.json",
+  "map_movingai": null,
+  "map_npy": null,
+  "max_steps": null,
+  "method": "majority_vote",
+  "observation_lifetime_steps": 300,
+  "periodic_route_check_steps": 25,
+  "periodic_route_improvement_epsilon": 0.01,
+  "phases": {
+    "attack_steps": 1700,
+    "recon_steps": 300,
+    "recovery_steps": 500
+  },
+  "scenario_manifest_hash": "dc14bf5d7743261e15527432a2611d84ee52b2a011e33079c9ce097006f1aebd",
+  "scenario_preset": null,
+  "seed": 17,
+  "temporary_blockage_change_period_steps": 150,
+  "trust": {
+    "confirmation_multiplier": 0.25,
+    "contradiction_multiplier": 6.0,
+    "evidence_cap": 12.0,
+    "model": "bayesian",
+    "prior_alpha": 9.0,
+    "prior_beta": 1.0,
+    "source_memory_recovery_rate": 0.05,
+    "threshold": 0.5
+  },
+  "visualization": {
+    "animation": false,
+    "fake_influence_min_cost_delta": 0.1,
+    "map_view": "combined",
+    "route_impact_eval_period_steps": 25,
+    "route_impact_min_cost_delta": 0.1
+  }
+}

@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import threading
-import tkinter as tk
-from tkinter import messagebox, ttk
 
 from .application import run
 from .cli import config_from_args, result_location_message, suggested_output_directory
@@ -58,6 +56,11 @@ def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None
 
 def launch(args) -> None:
     """Show the interactive run configuration window."""
+    # Keep map/preset validation importable on headless Python builds. Tk is
+    # required only when the user actually launches the interactive window.
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
     root = tk.Tk()
     root.title("Modular Map-Poisoning Simulator")
     root.geometry("820x900")
@@ -107,6 +110,8 @@ def launch(args) -> None:
         "max_steps": tk.StringVar(value="" if args.max_steps is None else str(args.max_steps)),
         "interval_min": tk.StringVar(value=str(args.attack_interval_min)),
         "interval_max": tk.StringVar(value=str(args.attack_interval_max)),
+        "visibility_min": tk.StringVar(value=str(getattr(args, "attack_visibility_min", 15))),
+        "visibility_max": tk.StringVar(value=str(getattr(args, "attack_visibility_max", 40))),
         "temp_interval": tk.StringVar(value=str(getattr(args, "temp_obstacle_interval", 150))),
         "map_view": tk.StringVar(
             value=("Combined observations" if getattr(args, "map_view", "combined") == "combined" else "Local observations")
@@ -202,14 +207,16 @@ def launch(args) -> None:
     entry("Maximum steps (optional)", "max_steps", 20)
     entry("Attack interval: minimum steps", "interval_min", 21)
     entry("Attack interval: maximum steps", "interval_max", 22)
-    entry("Temporary obstacle movement interval", "temp_interval", 23)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 24)
-    entry("Trust threshold", "trust_threshold", 25)
+    entry("Fake target: minimum steps to visibility", "visibility_min", 23)
+    entry("Fake target: maximum steps to visibility", "visibility_max", 24)
+    entry("Temporary obstacle movement interval", "temp_interval", 25)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 26)
+    entry("Trust threshold", "trust_threshold", 27)
     dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 26
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 28
     )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=27, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=29, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame, text=attack.value.replace("_", " ").title(),
@@ -252,6 +259,8 @@ def launch(args) -> None:
             args.max_steps = int(max_steps) if max_steps else None
             args.attack_interval_min = int(values["interval_min"].get())
             args.attack_interval_max = int(values["interval_max"].get())
+            args.attack_visibility_min = int(values["visibility_min"].get())
+            args.attack_visibility_max = int(values["visibility_max"].get())
             args.temp_obstacle_interval = int(values["temp_interval"].get())
             args.trust_model = values["trust_model"].get()
             args.trust_threshold = float(values["trust_threshold"].get())

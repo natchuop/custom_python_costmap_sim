@@ -2,7 +2,7 @@
 
 The simulator supplies callbacks for current source trust and Source Memory.
 Primary comparison methods are ordered as:
-    majority_vote, full_trust, trust_fused, source_memory
+    latest_report, majority_vote, full_trust, trust_fused, source_memory
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ BLOCKED_CLAIM = 1
 CONGESTED_CLAIM = 2
 
 DEFENSE_METHODS = (
+    "latest_report",
     "majority_vote",
     "full_trust",
     "trust_fused",
@@ -207,6 +208,8 @@ class DefenseMethodRunner:
     def _method_weight(self, claim: StoredClaim, timestamp: int, trust_override: Optional[float] = None) -> float:
         method = self.method
         c = claim.sensor_confidence
+        if method == "latest_report":
+            return 1.0
         if method == "majority_vote":
             return 1.0
         if method == "full_trust":
@@ -260,8 +263,39 @@ class DefenseMethodRunner:
                 continue
             yield claim
 
+    def _latest_claim_state(
+        self,
+        cell: Cell,
+        now: int,
+        excluded_sender_id=None,
+        excluded_claim_predicate=None,
+    ) -> tuple[int | None, tuple[StoredClaim, ...]]:
+        """Return categorical newest-report state and the reports supporting it.
+
+        Newest means greatest observation timestamp. Conflicting claims with the
+        exact same newest timestamp are UNKNOWN rather than depending on inbox or
+        sender iteration order. Multiple matching newest reports do not accumulate.
+        """
+        active = tuple(self._active_iter(
+            cell,
+            now,
+            excluded_sender_id=excluded_sender_id,
+            excluded_claim_predicate=excluded_claim_predicate,
+        ))
+        if not active:
+            return None, ()
+        newest = max(claim.timestamp for claim in active)
+        latest = tuple(claim for claim in active if claim.timestamp == newest)
+        states = {claim.claim for claim in latest}
+        if len(states) != 1:
+            return None, latest
+        return next(iter(states)), latest
+
     def evidence(self, cell: Cell, timestamp: Optional[int] = None, excluded_sender_id=None, excluded_claim_predicate=None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "latest_report":
+            state, _ = self._latest_claim_state(cell, now, excluded_sender_id, excluded_claim_predicate)
+            return 1.0 if state == BLOCKED_CLAIM else -1.0 if state == FREE_CLAIM else 0.0
         if self.method == "majority_vote":
             votes = 0
             for claim in self._active_iter(cell, now, excluded_sender_id, excluded_claim_predicate):
@@ -278,10 +312,20 @@ class DefenseMethodRunner:
         claim = self.active_claims.get((int(sender_id), tuple(cell)))
         if claim is None or now - claim.timestamp >= self.config.max_claim_age:
             return 0.0
+        if self.method == "latest_report":
+            state, latest = self._latest_claim_state(cell, now)
+            return 1.0 if state is not None and claim in latest else 0.0
         return self._method_weight(claim, now)
 
     def sender_route_risk(self, sender_id: int, cells: Iterable[Cell], timestamp: Optional[int] = None, trust_override: Optional[float] = None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "latest_report":
+            total = 0.0
+            for cell in {tuple(cell) for cell in cells}:
+                state, latest = self._latest_claim_state(cell, now)
+                if state == BLOCKED_CLAIM and any(claim.sender_id == int(sender_id) for claim in latest):
+                    total += 1.0
+            return total
         total = 0.0
         for cell in {tuple(cell) for cell in cells}:
             for claim in self._active_iter(cell, now):
@@ -294,6 +338,9 @@ class DefenseMethodRunner:
 
     def occupancy_probability(self, cell: Cell, timestamp: Optional[int] = None, excluded_sender_id=None, excluded_claim_predicate=None) -> float:
         now = self.current_timestamp if timestamp is None else int(timestamp)
+        if self.method == "latest_report":
+            state, _ = self._latest_claim_state(cell, now, excluded_sender_id, excluded_claim_predicate)
+            return 1.0 if state == BLOCKED_CLAIM else 0.0 if state == FREE_CLAIM else 0.5
         claims = tuple(self._active_iter(cell, now, excluded_sender_id, excluded_claim_predicate))
         if not claims:
             return 0.0
@@ -305,6 +352,14 @@ class DefenseMethodRunner:
         return min(1.0, max(0.0, 2.0 * (probability - 0.5)))
 
     def routing_cost(self, cell: Cell, timestamp: Optional[int] = None, excluded_sender_id=None, excluded_claim_predicate=None) -> float:
+        if self.method == "latest_report":
+            now = self.current_timestamp if timestamp is None else int(timestamp)
+            state, _ = self._latest_claim_state(cell, now, excluded_sender_id, excluded_claim_predicate)
+            if state == BLOCKED_CLAIM:
+                return math.inf
+            if state == FREE_CLAIM:
+                return 1.0
+            return self.config.majority_unknown_cost
         if self.method == "hard_threshold":
             return math.inf if self.is_hard_blocked(cell, timestamp, excluded_sender_id=excluded_sender_id, excluded_claim_predicate=excluded_claim_predicate) else 1.0
         if self.method == "majority_vote":
@@ -318,6 +373,10 @@ class DefenseMethodRunner:
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
     def is_hard_blocked(self, cell: Cell, timestamp: Optional[int] = None, excluded_sender_id=None, excluded_claim_predicate=None) -> bool:
+        if self.method == "latest_report":
+            now = self.current_timestamp if timestamp is None else int(timestamp)
+            state, _ = self._latest_claim_state(cell, now, excluded_sender_id, excluded_claim_predicate)
+            return state == BLOCKED_CLAIM
         if self.method == "majority_vote":
             return self.evidence(cell, timestamp, excluded_sender_id=excluded_sender_id, excluded_claim_predicate=excluded_claim_predicate) > 0.0
         if self.method == "trust_threshold":

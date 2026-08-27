@@ -7,7 +7,7 @@ from typing import Any
 from .models import AttackType
 
 # Keep this order everywhere user-facing and in comparison output.
-PRIMARY_METHODS = ("majority_vote", "full_trust", "trust_fused", "source_memory")
+PRIMARY_METHODS = ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory")
 ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay", "trust_threshold")
 ALL_METHODS = PRIMARY_METHODS + ADDITIONAL_METHODS
 MAP_VIEWS = ("combined", "local")
@@ -35,6 +35,8 @@ class AttackConfig:
     max_uses_per_footprint: int = 20
     min_center_spacing: int = 3
     min_unique_footprints: int = 3
+    visibility_delay_min: int = 15
+    visibility_delay_max: int = 40
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,9 @@ class TrustConfig:
     prior_beta: float = 1.0
     threshold: float = 0.50
     evidence_cap: float = 12.0
-    confirmation_multiplier: float = 1.0
+    # Positive evidence is intentionally slower than contradiction evidence so
+    # an attacker cannot regain full trust after only a few honest reports.
+    confirmation_multiplier: float = 0.25
     contradiction_multiplier: float = 6.0
     source_memory_recovery_rate: float = 0.05
 
@@ -53,7 +57,7 @@ class TrustConfig:
 class FusionConfig:
     method: str = "source_memory"
     admission_policy: str = "accept_all"
-    # Retained for the legacy/additional time_decay method. The four primary
+    # Retained for the legacy/additional time_decay method. The five primary
     # methods use common linear aging over max_claim_age.
     decay_rate: float = 0.006
     cost_scale: float = 40.0
@@ -117,6 +121,8 @@ class SimulationConfig:
             raise ValueError("attack candidate_top_k must be positive")
         if self.attacks.max_uses_per_footprint < 1 or self.attacks.min_center_spacing < 0 or self.attacks.min_unique_footprints < 1:
             raise ValueError("invalid attack diversity settings")
+        if self.attacks.visibility_delay_min < 1 or self.attacks.visibility_delay_max < self.attacks.visibility_delay_min:
+            raise ValueError("invalid attack visibility-delay window")
         if self.trust.model not in {"bayesian", "scalar"}:
             raise ValueError("trust model must be bayesian or scalar")
         if self.trust.prior_alpha <= 0 or self.trust.prior_beta <= 0:

@@ -5,7 +5,7 @@ import numpy as np
 from map_poisoning.audit import audit_manifest
 from map_poisoning.config import AttackConfig, PhaseConfig, SimulationConfig
 from map_poisoning.map_io import default_warehouse_map
-from map_poisoning.models import AttackType
+from map_poisoning.models import AttackType, ClaimType, TemporaryObstacleEpisode
 from map_poisoning.obstacles import FAKE_MIN_REPORT_CELLS, TEMP_ACTIVE_COUNT, TEMP_MIN_AREA
 from map_poisoning.scenario import author_manifest
 from map_poisoning.world import World
@@ -36,6 +36,22 @@ def test_authored_temporary_obstacles_are_multi_cell_and_concurrent():
     world = World(np.asarray(manifest.static_grid, dtype=np.uint8), manifest.obstacle_episodes)
     dynamic = int((world.truth_grid(0) != np.asarray(manifest.static_grid)).sum())
     assert dynamic >= TEMP_MIN_AREA * 2
+
+
+def test_temporary_obstacle_activation_yields_until_robot_leaves_footprint():
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    episode = TemporaryObstacleEpisode("moving", ((3, 3), (3, 4)), 1, 4)
+    world = World(grid, (episode,))
+
+    assert world.begin_step(1, ((3, 3),))[3, 3] == 0
+    assert world.state((3, 4), 1) == ClaimType.FREE
+    assert world.deferred_activation_steps == 1
+    assert world.deferred_episode_ids == {"moving"}
+
+    assert world.begin_step(2, ((2, 3),))[3, 3] == 1
+    assert world.state((3, 4), 2) == ClaimType.BLOCKED
+    assert world.activation_step("moving") == 2
+    assert world.begin_step(4, ((2, 3),))[3, 3] == 0
 
 
 def test_authored_fake_obstacles_cover_a_rectangle_of_free_cells():

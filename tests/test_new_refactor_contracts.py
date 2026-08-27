@@ -15,7 +15,7 @@ from map_poisoning.robot import ModularRobot
 
 
 def test_primary_method_order_and_headless_compare_defaults():
-    assert PRIMARY_METHODS == ("majority_vote", "full_trust", "trust_fused", "source_memory")
+    assert PRIMARY_METHODS == ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory")
     args = parser().parse_args(["--headless", "--compare", "--no-plots"])
     config = config_from_args(args)
     assert config.comparison_methods == PRIMARY_METHODS

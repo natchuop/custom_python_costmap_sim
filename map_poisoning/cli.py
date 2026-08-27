@@ -109,13 +109,15 @@ def parser():
     p.add_argument("--trust-model",choices=("bayesian","scalar"),default="bayesian"); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
     p.add_argument("--trust-threshold",type=float,default=0.50)
     p.add_argument("--trust-evidence-cap",type=float,default=12.0)
-    p.add_argument("--trust-confirmation-multiplier",type=float,default=1.0)
+    p.add_argument("--trust-confirmation-multiplier",type=float,default=0.25)
     p.add_argument("--trust-contradiction-multiplier",type=float,default=6.0)
     p.add_argument("--source-memory-recovery-rate",type=float,default=0.05)
     p.add_argument("--attacks",default="fake_obstacle,false_clearance,stale_reassertion",help="comma separated, or 'none'")
     p.add_argument("--recon-steps",type=int,default=300); p.add_argument("--attack-steps",type=int,default=1700); p.add_argument("--recovery-steps",type=int,default=500); p.add_argument("--max-steps",type=int)
     p.add_argument("--deliveries-per-robot",type=int,default=100)
     p.add_argument("--attack-interval-min",type=int,default=35); p.add_argument("--attack-interval-max",type=int,default=40)
+    p.add_argument("--attack-visibility-min",type=int,default=15,help="minimum clean-reference steps before a fake footprint becomes visible")
+    p.add_argument("--attack-visibility-max",type=int,default=40,help="maximum clean-reference steps before a fake footprint becomes visible")
     p.add_argument("--map-view", choices=MAP_VIEWS, default="combined", help="belief visualization: combined peer/local or local observations")
     p.add_argument("--temp-obstacle-interval", type=int, default=150, help="steps between temporary-obstacle movements")
     p.add_argument("--observation-lifetime", type=int, default=300)
@@ -140,7 +142,13 @@ def config_from_args(args):
     return SimulationConfig(
         seed=args.seed,
         phases=PhaseConfig(args.recon_steps,args.attack_steps,args.recovery_steps),
-        attacks=AttackConfig(enabled=enabled,interval_min=args.attack_interval_min,interval_max=args.attack_interval_max),
+        attacks=AttackConfig(
+            enabled=enabled,
+            interval_min=args.attack_interval_min,
+            interval_max=args.attack_interval_max,
+            visibility_delay_min=args.attack_visibility_min,
+            visibility_delay_max=args.attack_visibility_max,
+        ),
         trust=TrustConfig(
             model=args.trust_model,
             threshold=float(args.trust_threshold),

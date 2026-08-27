@@ -91,3 +91,14 @@ def test_scalar_batch_validation_changes_trust_once_per_sender():
     robot.verify(observations, 1)
     assert len(robot.last_trust_batches) == 1
     assert robot.trust.score(0) > .80
+def test_default_positive_trust_recovery_is_deliberately_gradual():
+    bayesian = BayesianTrustModel()
+    bayesian.values[0] = [1.0, 9.0]
+    for _ in range(10):
+        bayesian.update_batch(0, 1.0, 0.0)
+    assert bayesian.score(0) < 0.30
+
+    scalar = ScalarTrustModel(initial=0.10)
+    for _ in range(10):
+        scalar.update_batch(0, 1.0, 0.0)
+    assert scalar.score(0) < 0.20

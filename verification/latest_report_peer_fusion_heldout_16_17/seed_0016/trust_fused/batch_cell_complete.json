@@ -1,0 +1,9 @@
+{
+  "code_revision_hash": "f77833d46df239b7a840b1a1f525b3f7f42b9db492b89bda9c6164995bab4504",
+  "experiment_config_hash": "3598c0f3c8bc4aa53386c88086c3137dc1838574e6bf22af73e68b18b96be964",
+  "git_commit": "unknown",
+  "git_dirty": false,
+  "method": "trust_fused",
+  "scenario_manifest_hash": "8f51e48d53b50e083aecde798931828e956ae68b98f17982cc6f2ceb6ec9e161",
+  "seed": 16
+}

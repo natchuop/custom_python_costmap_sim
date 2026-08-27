@@ -1,0 +1,10 @@
+{
+  "attacker_report_count": 900,
+  "errors": [],
+  "passed": true,
+  "protocol_id": "modular_v1",
+  "scenario_id": "warehouse-15",
+  "warnings": [
+    "visibility_window_attack_candidate_unavailable"
+  ]
+}

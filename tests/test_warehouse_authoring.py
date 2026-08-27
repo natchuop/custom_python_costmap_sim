@@ -38,6 +38,8 @@ def test_default_warehouse_manifest_includes_reconnaissance_heatmap():
     assert all(item.get("reference_step") >= config.phases.recon_steps for item in manifest.candidate_metadata)
     assert all(item.get("target_visible_to_victim") is False for item in manifest.candidate_metadata)
     assert all(item.get("intended_victim_id") in manifest.benign_robot_ids for item in manifest.candidate_metadata)
+    assert all(15 <= item["first_visibility_delay"] <= 40 for item in manifest.candidate_metadata)
+    assert all(item["expected_visibility_step"] == item["reference_step"] + item["first_visibility_delay"] for item in manifest.candidate_metadata)
 
 
 def test_attack_free_warehouse_manifest_skips_candidate_requirement():
@@ -79,6 +81,19 @@ def test_warehouse_layout_and_candidates_are_reachable():
         require_route_overlap=False,
     )
     assert isinstance(candidates, list)
+
+
+def test_seeded_warehouse_deliveries_are_reproducible_but_not_fixed():
+    grid = default_warehouse_map()
+    same_a = build_warehouse_layout(grid, deliveries_per_robot=20, seed=23)
+    same_b = build_warehouse_layout(grid, deliveries_per_robot=20, seed=23)
+    other = build_warehouse_layout(grid, deliveries_per_robot=20, seed=24)
+    assert same_a == same_b
+    assert (same_a[1], same_a[2]) != (other[1], other[2])
+    for queue in same_a[2].values():
+        assert len(queue) == 20
+        assert all(task.pickup != task.dropoff for task in queue)
+        assert sum("long_cross" in task.task_id for task in queue) >= 8
 
 
 def test_warehouse_temporary_obstacles_keep_the_corridor_open():

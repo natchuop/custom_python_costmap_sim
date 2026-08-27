@@ -1,0 +1,14 @@
+Multi-seed results
+
+Requested seeds: 18, 19
+Requested methods: latest_report, majority_vote, full_trust, trust_fused, source_memory
+Batch valid: True
+
+Raw runs: verification/latest_report_peer_fusion_heldout_18_19_corrected/seed_XXXX/<method>
+Statistics: verification/latest_report_peer_fusion_heldout_18_19_corrected/aggregate
+Aggregate report: verification/latest_report_peer_fusion_heldout_18_19_corrected/aggregate/multiseed_report.txt
+Aggregate plots: verification/latest_report_peer_fusion_heldout_18_19_corrected/aggregate/plots
+
+Per-run plots are disabled by default for multi-seed runs; use --per-run-plots to enable them.
+Individual report example: python -m map_poisoning.reporting outputs/map005_30seed_comparison/seed_0001/source_memory --run
+Aggregate regeneration: python -m map_poisoning.reporting outputs/map005_30seed_comparison --multiseed

@@ -70,6 +70,31 @@ def test_majority_is_one_vote_per_sender_discrete_and_tie_unknown():
     assert engine.vote((2, 2), 301) == 0
 
 
+def test_latest_report_is_categorical_trust_agnostic_and_tie_unknown():
+    trust = {0: .01, 1: .99}
+    engine = FusionEngine("latest_report", lambda sender: trust[sender], max_claim_age=300, majority_unknown_cost=3)
+    engine.add(report("old-free", 1, ClaimType.FREE, 4))
+    engine.add(report("new-blocked", 0, ClaimType.BLOCKED, 5))
+    assert math.isinf(engine.routing_cost((2, 2), 5))
+    trust[0] = 0.0
+    assert math.isinf(engine.routing_cost((2, 2), 5))
+    engine.add(report("newer-free", 1, ClaimType.FREE, 6))
+    assert engine.routing_cost((2, 2), 6) == 1.0
+    engine.add(report("same-time-blocked", 0, ClaimType.BLOCKED, 6))
+    assert engine.routing_cost((2, 2), 6) == 3.0
+    assert not engine.blocked((2, 2), 6)
+    assert engine.evidence((2, 2), 306) == 0.0
+
+
+def test_current_lidar_overrides_latest_report():
+    belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=300)
+    fusion = FusionEngine("latest_report", lambda _: 0.0)
+    fusion.add(report("blocked", 0, ClaimType.BLOCKED, 1))
+    belief.begin_scan(1)
+    belief.observe(DirectObservation(1, (2, 2), ClaimType.FREE, 1, 1.0))
+    assert belief.traversal_cost((2, 2), 1, fusion) == 1.0
+
+
 def test_current_direct_observation_is_authoritative_then_becomes_memory():
     belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=300)
     fusion = FusionEngine("full_trust", lambda _: 1.)

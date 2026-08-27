@@ -20,11 +20,11 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 
-METHOD_ORDER = ("majority_vote", "full_trust", "trust_fused", "source_memory", "soft_probability")
+METHOD_ORDER = ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory", "soft_probability")
 
 
 def _ordered_methods(values):
-    """Return unique method names with the four primary methods first."""
+    """Return unique method names with the five primary methods first."""
     unique = list(dict.fromkeys(value for value in values if value))
     rank = {method: index for index, method in enumerate(METHOD_ORDER)}
     return sorted(unique, key=lambda method: (rank.get(method, len(METHOD_ORDER)), method))
@@ -1289,7 +1289,7 @@ def _paired_seed_plot(raw, path):
 
 def _experiment_design_plot(path, methods=None):
     fig, ax = plt.subplots(figsize=(10, 5)); ax.axis("off")
-    method_label = "   ".join(methods) if methods else "majority_vote   full_trust   trust_fused   source_memory"
+    method_label = "   ".join(methods) if methods else "latest_report   majority_vote   full_trust   trust_fused   source_memory"
     for index, seed in enumerate(("Seed 1", "Seed 2", "...")):
         y = .8 - index * .28; ax.text(.02, y, seed, fontsize=11, weight="bold", va="center")
         ax.text(.18, y, "one scenario manifest", bbox=dict(boxstyle="round", facecolor="#e8f1fb"), va="center")

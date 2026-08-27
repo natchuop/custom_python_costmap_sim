@@ -56,21 +56,31 @@ The public entry point is the native modular package (`main.py` and
 `map_poisoning/`). It owns manifest authoring, sensing, peer delivery, fusion,
 planning, and metric collection.
 
-The primary comparison methods are `majority_vote`, `full_trust`, `trust_fused`,
-and `source_memory`. Optional additional methods are `hard_threshold`,
-`soft_probability`, and `time_decay`; they are only run when explicitly selected.
+The primary comparison methods are `latest_report`, `majority_vote`, `full_trust`,
+`trust_fused`, and `source_memory`. `latest_report` is the categorical auto-accept
+baseline: the newest active peer report determines FREE or BLOCKED regardless of
+trust, with an exact-timestamp conflict treated as unknown. It does not compute an
+occupancy probability. Current local LiDAR remains authoritative for every method.
+Optional additional methods are `hard_threshold`, `soft_probability`, `time_decay`,
+and `trust_threshold`; they are only run when explicitly selected.
 
 Current primary defaults are 300 reconnaissance steps, 1700 attack steps, and
 500 recovery steps (2500 total), with attacks scheduled every 35--40 steps.
 Manifest authoring first runs one deterministic attack-free 2500-step reference.
 Its benign traffic produces the one shared heatmap, while each proposed attack
-uses the position, visibility, and route from the matching reference step. The
-authored manifest is then replayed unchanged by every defense method. Robots use
+uses the position, visibility, and route from the matching reference step. Fake
+footprints must have a positive finite clean-reference detour and first enter the
+intended victim's LiDAR 15--40 future steps later. Strategic pickup/dropoff points
+and a fixed mix of long, medium, short, and corridor routes are seed-dependent.
+The authored manifest is then replayed unchanged by every defense method. Robots use
 a 360-degree Euclidean line-of-sight
 LiDAR with a five-cell range; observation confidence falls from 1.0 near the robot
 to 0.60 at range five. Direct and peer occupancy memories use a shared 300-step
 linear lifetime, with current LiDAR observations authoritative. Bayesian trust is
-the default (`alpha=9`, `beta=1`, evidence cap 12, contradiction multiplier 6.0, distrust threshold 0.50).
+the default (`alpha=9`, `beta=1`, evidence cap 12, confirmation multiplier 0.25,
+contradiction multiplier 6.0, distrust threshold 0.50). The reduced positive
+multiplier slows recovery after detected deception; scalar trust likewise uses a
+0.005 positive reward.
 `source_memory` applies immediate trust loss to historical reports but rehabilitates
 them gradually with a default trust-memory recovery rate of 0.05. Reports are still
 received for audit under `accept_all`, but Source Memory gives a distrusted source zero
@@ -78,8 +88,14 @@ operational map influence; Trust Fused similarly ignores new reports received wh
 the sender is below the threshold. Majority Vote and Full Trust remain trust-agnostic
 baselines by design.
 
+Temporary physical obstacles use collision-safe onset: if any robot already
+occupies a scheduled footprint, that obstacle yields until the complete footprint
+is empty while retaining its authored clearance time. Outputs record deferred
+activation steps and verify that no false-clearance attack was injected before its
+referenced physical obstacle actually activated.
+
 Navigation replans immediately for real route-invalidating events and also performs
-a common 25-step route-optimization check for all four primary methods so gradual
+a common 25-step route-optimization check for all five primary methods so gradual
 age/trust changes can reveal a better path. `planning_checks` and actual
 `path_changes` are logged separately. Run summaries also separate route changes
 caused by temporary physical obstacles, other robots, malicious reports, and each

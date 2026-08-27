@@ -11,6 +11,7 @@ from .map_io import (
 )
 from .models import DeliveryTask
 from .planning import astar
+from .rng import named_rng
 
 DEFAULT_NUM_ROBOTS = 3
 DEFAULT_NUM_ACTION_POINTS = 14
@@ -126,7 +127,7 @@ def is_good_action_point_candidate(grid, cell: tuple[int, int], forbidden=None) 
     return True
 
 
-def choose_strategic_action_points(grid, count: int, forbidden=None) -> list[tuple[int, int]]:
+def choose_strategic_action_points(grid, count: int, forbidden=None, *, rng=None) -> list[tuple[int, int]]:
     forbidden = set(forbidden or ())
     candidates = []
     rows, cols = grid.shape
@@ -149,8 +150,7 @@ def choose_strategic_action_points(grid, count: int, forbidden=None) -> list[tup
     used = set(forbidden)
     min_spacing = max(2, int(min(rows, cols) * ACTION_POINT_MIN_SPACING_RATIO))
     while candidates and len(selected) < count:
-        best_index = None
-        best_total = -math.inf
+        ranked = []
         for index, (base_score, cell) in enumerate(candidates):
             if cell in used:
                 continue
@@ -158,14 +158,24 @@ def choose_strategic_action_points(grid, count: int, forbidden=None) -> list[tup
             if nearest < min_spacing:
                 continue
             total = base_score + ACTION_POINT_SPREAD_WEIGHT * nearest
-            if total > best_total:
-                best_total = total
-                best_index = index
-        if best_index is None:
+            ranked.append((total, index))
+        if not ranked:
             min_spacing = max(1, min_spacing - 1)
             if min_spacing <= 1:
                 break
             continue
+        ranked.sort(reverse=True)
+        shortlist = ranked[: min(3, len(ranked))]
+        if rng is None or len(shortlist) == 1:
+            best_index = shortlist[0][1]
+        else:
+            # Seeded choice among only the strongest strategic candidates.
+            # Endpoints vary across seeds without allowing arbitrary floor cells.
+            best_index = rng.choices(
+                [item[1] for item in shortlist],
+                weights=list(range(len(shortlist), 0, -1)),
+                k=1,
+            )[0]
         _, chosen = candidates.pop(best_index)
         selected.append(chosen)
         used.add(chosen)
@@ -219,6 +229,95 @@ def build_delivery_tasks(
             if pickup == dropoff:
                 dropoff = robot_points[(dropoff_index + 1) % len(robot_points)]
             tasks.append(DeliveryTask(f"r{robot_id}-task-{task_idx}", pickup, dropoff))
+        tasks_by_robot[robot_id] = tuple(tasks)
+    return tasks_by_robot
+
+
+def build_seeded_delivery_tasks(
+    grid,
+    action_points,
+    num_robots=DEFAULT_NUM_ROBOTS,
+    tasks_per_robot=100,
+    *,
+    starts_by_robot: dict[int, tuple[int, int]] | None = None,
+    seed: int = 0,
+):
+    """Build reachable, seed-dependent deliveries with fixed route-length quotas.
+
+    The seed changes endpoints and ordering, while every selected pair remains
+    drawn from the strategic action-point pool. Long cross-warehouse routes
+    dominate so attacks encounter meaningful future navigation decisions;
+    medium and short routes remain to avoid training on one trip geometry.
+    """
+    if len(action_points) < 2:
+        raise ValueError("Need at least two action points to build delivery tasks.")
+    tasks_by_robot = {}
+    for robot_id in range(num_robots):
+        robot_points = _robot_action_points(
+            action_points,
+            start=(starts_by_robot or {}).get(robot_id),
+        )
+        pairs = []
+        for pickup in robot_points:
+            for dropoff in robot_points:
+                if pickup == dropoff:
+                    continue
+                path = astar(pickup, dropoff, lambda cell: float("inf") if not _is_free(grid, cell) else 1.0)
+                if path is None:
+                    continue
+                distance = max(0, len(path) - 1)
+                crosses_region = (
+                    (pickup[1] < grid.shape[1] // 3 and dropoff[1] > 2 * grid.shape[1] // 3)
+                    or (dropoff[1] < grid.shape[1] // 3 and pickup[1] > 2 * grid.shape[1] // 3)
+                    or ((pickup[0] < grid.shape[0] // 2) != (dropoff[0] < grid.shape[0] // 2))
+                )
+                uses_corridor = bool(set(path).intersection(WAREHOUSE_NARROW_CORRIDOR_CELLS))
+                if distance >= 45 and crosses_region:
+                    category = "long_cross"
+                elif uses_corridor and distance >= 15:
+                    category = "corridor"
+                elif distance >= 25:
+                    category = "medium"
+                elif distance >= 12:
+                    category = "short"
+                else:
+                    continue
+                pairs.append((category, distance, pickup, dropoff))
+        if not pairs:
+            raise RuntimeError(f"Robot {robot_id} has no reachable seeded delivery pairs")
+        by_category = {
+            category: [item for item in pairs if item[0] == category]
+            for category in ("long_cross", "corridor", "medium", "short")
+        }
+        available = [name for name, items in by_category.items() if items]
+        # 55% long cross-map, 20% corridor, 15% medium, 10% short.
+        schedule = (["long_cross"] * 11) + (["corridor"] * 4) + (["medium"] * 3) + (["short"] * 2)
+        rng = named_rng(seed, f"delivery_tasks_robot_{robot_id}")
+        tasks = []
+        endpoint_use = {point: 0 for point in robot_points}
+        last_pair = None
+        for task_idx in range(tasks_per_robot):
+            if task_idx % len(schedule) == 0:
+                rng.shuffle(schedule)
+            desired = schedule[task_idx % len(schedule)]
+            pool = by_category.get(desired) or [item for name in available for item in by_category[name]]
+            ranked = sorted(
+                pool,
+                key=lambda item: (
+                    endpoint_use[item[2]] + endpoint_use[item[3]],
+                    item[2] == (last_pair[0] if last_pair else None),
+                    rng.random(),
+                ),
+            )
+            selected = next(
+                (item for item in ranked if last_pair is None or (item[2], item[3]) != last_pair),
+                ranked[0],
+            )
+            category, _, pickup, dropoff = selected
+            endpoint_use[pickup] += 1
+            endpoint_use[dropoff] += 1
+            last_pair = (pickup, dropoff)
+            tasks.append(DeliveryTask(f"r{robot_id}-{category}-{task_idx}", pickup, dropoff))
         tasks_by_robot[robot_id] = tuple(tasks)
     return tasks_by_robot
 
@@ -371,13 +470,13 @@ def choose_spread_out_starts(grid, count: int, forbidden=None) -> list[tuple[int
     return chosen
 
 
-def refine_action_points(grid, action_points, forbidden, target_count, excluded) -> list[tuple[int, int]]:
+def refine_action_points(grid, action_points, forbidden, target_count, excluded, *, rng=None) -> list[tuple[int, int]]:
     """Drop excluded cells and refill to the target count with strategic picks."""
     excluded_set = frozenset(tuple(cell) for cell in excluded)
     points = [tuple(cell) for cell in action_points if tuple(cell) not in excluded_set]
     blocked = set(forbidden).union(points).union(excluded_set)
     while len(points) < target_count:
-        extra = choose_strategic_action_points(grid, target_count - len(points), forbidden=blocked)
+        extra = choose_strategic_action_points(grid, target_count - len(points), forbidden=blocked, rng=rng)
         added = False
         for point in extra:
             cell = tuple(point)
@@ -393,15 +492,17 @@ def refine_action_points(grid, action_points, forbidden, target_count, excluded)
     return points
 
 
-def build_warehouse_layout(grid, deliveries_per_robot: int):
+def build_warehouse_layout(grid, deliveries_per_robot: int, *, seed: int = 0):
     """Return starts, goals, and task queues for the default warehouse map."""
     start_cells = choose_spread_out_starts(grid, DEFAULT_NUM_ROBOTS)
     starts = {robot_id: start_cells[robot_id] for robot_id in range(DEFAULT_NUM_ROBOTS)}
     used_starts = set(start_cells)
+    endpoint_rng = named_rng(seed, "warehouse_action_points")
     action_points = choose_strategic_action_points(
         grid,
         DEFAULT_NUM_ACTION_POINTS,
         forbidden=used_starts | set(WAREHOUSE_EXCLUDED_ACTION_POINTS),
+        rng=endpoint_rng,
     )
     action_points = refine_action_points(
         grid,
@@ -409,6 +510,7 @@ def build_warehouse_layout(grid, deliveries_per_robot: int):
         used_starts,
         DEFAULT_NUM_ACTION_POINTS,
         WAREHOUSE_EXCLUDED_ACTION_POINTS,
+        rng=endpoint_rng,
     )
     if _is_free(grid, WAREHOUSE_CORRIDOR_DELIVERY) and WAREHOUSE_CORRIDOR_DELIVERY not in action_points:
         mouth = (13, 8)
@@ -421,11 +523,13 @@ def build_warehouse_layout(grid, deliveries_per_robot: int):
         else:
             action_points.append(WAREHOUSE_CORRIDOR_DELIVERY)
     goals = list(action_points)
-    tasks = build_delivery_tasks(
+    tasks = build_seeded_delivery_tasks(
+        grid,
         action_points,
         DEFAULT_NUM_ROBOTS,
         deliveries_per_robot,
         starts_by_robot=starts,
+        seed=seed,
     )
     tasks = repair_delivery_tasks(grid, tasks, starts, action_points)
     return starts, goals, tasks
