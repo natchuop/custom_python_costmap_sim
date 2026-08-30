@@ -1305,13 +1305,19 @@ def _batch_completion_plot(root, path):
     except (OSError, json.JSONDecodeError): pass
     seeds = [int(value) for value in config.get("seeds", sorted({parse_int(row.get("seed")) for row in status}))]
     methods = list(config.get("methods", _ordered_methods(row.get("method") for row in status)))
+    methods = sorted(methods, key=lambda method: (PAPER_METHOD_ORDER.index(method) if method in PAPER_METHOD_ORDER else len(PAPER_METHOD_ORDER), method))
     state = {(parse_int(row.get("seed")), row.get("method")): row.get("status") for row in status}
     values = [[{"completed": 1, "skipped_resume": 1, "failed": 0, "pending": -1}.get(state.get((seed, method), "pending"), -1) for method in methods] for seed in seeds]
-    fig, ax = plt.subplots(figsize=(max(6, len(methods) * 1.5), max(5, len(seeds) * .25)))
-    ax.imshow(values, cmap=plt.get_cmap("RdYlGn", 3), vmin=-1, vmax=1, aspect="auto")
-    ax.set(xticks=range(len(methods)), xticklabels=methods, yticks=range(len(seeds)), yticklabels=seeds, xlabel="Method", ylabel="Seed", title="Batch completion audit")
+    from matplotlib.colors import ListedColormap
+    fig, ax = plt.subplots(figsize=(max(6, len(methods) * 1.25), max(3.5, len(seeds) * .24)))
+    ax.imshow(values, cmap=ListedColormap(["#f3cccc", "#f3f3f3", "#d9ead3"]), vmin=-1, vmax=1, aspect="auto")
+    ax.set(xticks=range(len(methods)), xticklabels=[_paper_method_label(method) for method in methods], yticks=range(len(seeds)), yticklabels=seeds, xlabel="Method", ylabel="Seed", title="Batch completion audit")
     for row_index, seed in enumerate(seeds):
-        for col_index, method in enumerate(methods): ax.text(col_index, row_index, state.get((seed, method), "missing"), ha="center", va="center", fontsize=7)
+        for col_index, method in enumerate(methods):
+            status_label = state.get((seed, method), "missing")
+            short_label = "OK" if status_label in {"completed", "skipped_resume"} else status_label
+            color = "#1b5e20" if short_label == "OK" else "#9b1c1c"
+            ax.text(col_index, row_index, short_label, ha="center", va="center", fontsize=7, color=color, weight="bold" if short_label == "OK" else "normal")
     fig.tight_layout(); _save(fig, path)
 
 
@@ -1325,11 +1331,19 @@ PAPER_METHOD_LABELS = {
     "soft_probability": "Soft probability", "time_decay": "Time decay",
     "trust_threshold": "Trust threshold",
 }
-PAPER_METHOD_ORDER = ("full_trust", "majority_vote", "trust_fused", "source_linked", "source_memory")
+PAPER_METHOD_COLORS = {
+    "full_trust": "#7f8794", "majority_vote": "#756bb1", "trust_fused": "#d95f02",
+    "source_memory": "#1f77b4", "latest_report": "#66a98f", "soft_probability": "#8c6d31",
+}
+PAPER_METHOD_ORDER = ("full_trust", "majority_vote", "trust_fused", "source_memory", "source_linked", "latest_report", "soft_probability")
 
 
 def _paper_method_label(method):
     return PAPER_METHOD_LABELS.get(method, str(method).replace("_", " ").title())
+
+
+def _paper_color(method):
+    return PAPER_METHOD_COLORS.get(method, "#4c4c4c")
 
 
 def _paper_methods(raw):
@@ -1383,6 +1397,14 @@ def _paper_axes(ax, *, grid_axis="y"):
         ax.spines[spine].set_visible(False)
 
 
+def _plot_seed_points(ax, index, values, *, color="#444444", size=26, alpha=.55):
+    ax.scatter(index + _deterministic_jitter(len(values)), values, s=size, color=color, alpha=alpha, edgecolors="none", zorder=3)
+
+
+def _add_sample_size(ax, index, values, y):
+    ax.text(index, y, f"n={len(values)}", ha="center", va="bottom", fontsize=8, color="0.35")
+
+
 def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, include_no_attack=False, no_attack_category=True):
     methods = _paper_methods(raw)
     groups = [(method, _valid_values([row for row in raw if not (include_no_attack and parse_float(row.get("attack_actions")) == 0)], method, field, transform)) for method in methods]
@@ -1402,19 +1424,20 @@ def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, inc
         return False
     fig, ax = plt.subplots(figsize=(max(7, len(groups) * 1.45), 5.4))
     x = np.arange(len(groups)); means = [_mean_ci(values)["mean"] for _, values in groups]
-    colors = [f"C{index % 10}" for index in range(len(groups))]
+    colors = [_paper_color(method) if method else "#9a9a9a" for method, _ in groups]
     ax.bar(x, means, color=colors, alpha=.72, width=.62, edgecolor="0.25", linewidth=.6)
     for index, (method, values) in enumerate(groups):
         stats = _mean_ci(values)
-        ax.scatter(index + _deterministic_jitter(len(values)), values, s=20, color="0.15", alpha=.48, zorder=3)
+        _plot_seed_points(ax, index, values)
         if stats["ci95_low"] is not None:
             ax.errorbar(index, stats["mean"], yerr=[[stats["mean"] - stats["ci95_low"]], [stats["ci95_high"] - stats["mean"]]], fmt="none", ecolor="0.12", capsize=4, linewidth=1.1, zorder=4)
     labels = [_paper_method_label(method) if method else "No attack" for method, _ in groups]
     ax.set(xticks=x, xticklabels=labels, ylabel=ylabel)
+    ax.set_ylim(bottom=0)
     if ylabel == "False reports accepted (%)":
         ax.set_ylim(bottom=0)
         if all(value <= 100 for _, group_values in groups for value in group_values):
-            ax.set_ylim(0, 100)
+            ax.set_ylim(0, 102)
     if no_attack_values and not no_attack_category:
         ax.axhline(_mean_ci(no_attack_values)["mean"], color="0.25", linestyle="--", linewidth=1, label="No attack")
     if title:
@@ -1430,12 +1453,16 @@ def _plot_paper_a2(raw, path):
     if not groups:
         return False
     fig, ax = plt.subplots(figsize=(max(7, len(groups) * 1.45), 5.2))
+    minimum = min(value for _, values in groups for value in values); maximum = max(value for _, values in groups for value in values)
+    span = max(maximum - minimum, 1.0); label_y = minimum - span * .12
     for index, (method, values) in enumerate(groups):
-        ax.scatter(index + _deterministic_jitter(len(values)), values, s=27, color=f"C{index % 10}", alpha=.52, edgecolors="none")
-        ax.scatter(index, np.median(values), marker="D", s=70, color="black", zorder=4)
-        ax.text(index, ax.get_ylim()[0] if ax.get_ylim()[1] else 0, f"n={len(values)}", ha="center", va="bottom", fontsize=8, color="0.35")
+        _plot_seed_points(ax, index, values, color=_paper_color(method), size=30)
+        ax.scatter(index, np.median(values), marker="D", s=88, color="black", zorder=4)
+        _add_sample_size(ax, index, values, label_y)
     ax.set(xticks=range(len(groups)), xticklabels=[_paper_method_label(m) for m, _ in groups], ylabel="Attack-affected route duration (steps)")
-    _paper_axes(ax); fig.tight_layout(); _save(fig, path); return True
+    ax.set_ylim(min(label_y - span * .02, minimum - span * .02), maximum + span * .08)
+    fig.text(.5, .01, "Circles show individual runs; diamonds show medians.", ha="center", fontsize=8, color="0.35")
+    _paper_axes(ax); fig.tight_layout(rect=(0, .04, 1, 1)); _save(fig, path); return True
 
 
 def _plot_paper_a3(raw, path):
@@ -1457,9 +1484,13 @@ def _plot_paper_a3(raw, path):
         return False
     fig, ax = plt.subplots(figsize=(8, 5.5))
     for index, (method, x, y) in enumerate(points):
-        ax.scatter(x, y, s=100, color=f"C{index % 10}", edgecolor="black", linewidth=.6, zorder=3)
+        ax.scatter(x, y, s=100, color=_paper_color(method), edgecolor="black", linewidth=.6, zorder=3)
         ax.annotate(_paper_method_label(method), (x, y), xytext=(7, 5), textcoords="offset points", fontsize=9)
     ax.set(xlabel="False reports accepted (%)", ylabel="Mean delivery-cycle duration (steps)", title="Security/performance tradeoff")
+    x_values = [x for _, x, _ in points]
+    x_min, x_max = min(x_values), max(x_values)
+    x_padding = max((x_max - x_min) * .12, 2.0)
+    ax.set_xlim(max(0.0, x_min - x_padding), x_max + x_padding)
     _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 
@@ -1481,12 +1512,15 @@ def _plot_paper_delivery_time(raw, path):
 
 def _gaussian_kde_numpy(values, grid):
     values = np.asarray(values, dtype=float)
-    if len(values) < 2:
+    if len(values) == 0:
         return np.zeros_like(grid)
-    std = float(np.std(values, ddof=1)); bandwidth = 1.06 * std * len(values) ** (-.2)
-    span = float(np.ptp(values)); bandwidth = max(bandwidth, span / 50.0, 1e-6)
-    density = np.exp(-0.5 * ((grid[:, None] - values[None, :]) / bandwidth) ** 2).sum(axis=1)
-    density /= len(values) * bandwidth * math.sqrt(2 * math.pi)
+    std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    span = float(np.ptp(values)); bandwidth = 1.06 * std * max(len(values), 2) ** (-.2)
+    bandwidth = max(bandwidth, span / 50.0, 1.0)
+    # Reflection at zero avoids assigning mass to impossible negative ages.
+    samples = np.concatenate((values, -values))
+    density = np.exp(-0.5 * ((grid[:, None] - samples[None, :]) / bandwidth) ** 2).sum(axis=1)
+    density /= len(samples) * bandwidth * math.sqrt(2 * math.pi)
     return density
 
 
@@ -1495,43 +1529,70 @@ def _plot_paper_a5(raw, path):
     groups = [(m, values) for m, values in groups if values]
     if not groups or not any(len(values) >= 5 for _, values in groups):
         return False
-    all_values = np.concatenate([np.asarray(values) for _, values in groups]); lo, hi = float(all_values.min()), float(all_values.max())
-    if lo == hi: lo, hi = lo - 1, hi + 1
-    grid = np.linspace(lo, hi, 300); fig, ax = plt.subplots(figsize=(9, max(4.5, len(groups) * .85)))
+    all_values = np.concatenate([np.asarray(values) for _, values in groups]); lo, hi = max(0.0, float(all_values.min())), max(0.0, float(all_values.max()))
+    grid_hi = max(hi * 1.08, 2.0 if hi == 0 else hi + max(1.0, hi * .04))
+    grid = np.linspace(0.0, grid_hi, 300); fig, ax = plt.subplots(figsize=(8, 4.8))
     for index, (method, values) in enumerate(groups):
         baseline = len(groups) - index
         if len(values) >= 5:
             density = _gaussian_kde_numpy(values, grid); height = density / density.max() * .72 if density.max() else density
-            ax.fill_between(grid, baseline, baseline + height, color=f"C{index % 10}", alpha=.48)
-            ax.plot(grid, baseline + height, color=f"C{index % 10}", linewidth=1.1)
+            ax.fill_between(grid, baseline, baseline + height, color=_paper_color(method), alpha=.48)
+            ax.plot(grid, baseline + height, color=_paper_color(method), linewidth=1.1)
         else:
-            ax.scatter(values, np.full(len(values), baseline + .04), color=f"C{index % 10}", s=28, zorder=3)
-        ax.text(hi + (hi - lo) * .02, baseline + .25, _paper_method_label(method), va="center", fontsize=9)
-    ax.set(xlim=(lo, hi * 1.12 if hi >= 0 else hi), yticks=[], xlabel="Time until normal routing resumes (steps)")
+            ax.scatter(values, np.full(len(values), baseline + .04), color=_paper_color(method), s=28, zorder=3)
+        ax.text(grid[-1] + (grid[-1] - grid[0]) * .02, baseline + .25, _paper_method_label(method), va="center", fontsize=9)
+    ax.set(xlim=(grid[0], grid[-1] * 1.18 if grid[-1] > 0 else 1), yticks=[], xlabel="Time until normal routing resumes (steps)")
     _paper_axes(ax, grid_axis="x"); fig.tight_layout(); _save(fig, path); return True
 
 
-def _plot_paper_map_error_sweep(raw, path):
+def _controlled_attack_setting(row):
+    for field in ("attack_intensity", "attack_rate", "attack_rate_per_1000_steps", "attack_reports_per_1000_steps", "malicious_reports_per_1000_steps"):
+        value = parse_float(row.get(field))
+        if value is not None and math.isfinite(value):
+            return round(value, 6)
+    return None
+
+
+def _plot_paper_map_error_sweep(raw, path, warnings=None):
     points = {}
+    controlled = {}
     for row in raw:
         actions = parse_float(row.get("attack_actions")); steps = parse_float(row.get("steps_completed")); error = parse_float(row.get("map_error_mean"))
         if actions is None or steps is None or steps <= 0 or error is None:
             continue
-        key = (row.get("method"), round(actions / steps * 1000.0, 6)); points.setdefault(key, []).append(error * 100.0)
-    x_values = sorted({key[1] for key in points})
-    if len(x_values) < 2:
-        return False
+        observed = round(actions / steps * 1000.0, 6); setting = _controlled_attack_setting(row)
+        points.setdefault((row.get("method"), observed), []).append(error * 100.0)
+        if setting is not None:
+            controlled.setdefault((row.get("method"), setting), []).append(error * 100.0)
+    controlled_x = sorted({key[1] for key in controlled})
+    use_controlled = len(controlled_x) >= 2 and all(len(values) >= 2 for values in controlled.values())
+    if use_controlled:
+        groups = controlled; x_values = controlled_x; xlabel = "Malicious reports per 1000 simulation steps"; title = None
+    else:
+        if warnings is not None:
+            warnings.append("04_map_error_vs_attack_intensity.png: controlled attack-intensity sweep not detected; generated exploratory observed-load scatter instead")
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        for index, method in enumerate(_paper_methods(raw)):
+            values = [(x, y) for (m, x), ys in points.items() if m == method for y in ys]
+            if not values:
+                continue
+            ax.scatter([x for x, _ in values], [y for _, y in values], s=30, alpha=.6, color=_paper_color(method), label=_paper_method_label(method))
+        if not points:
+            return False
+        ax.set(xlabel="Observed malicious reports per 1000 simulation steps", ylabel="Map error (%)", title="Map error vs observed attack load")
+        ax.text(.01, .97, "Observed attack load varies naturally across seeds; not a controlled sweep", transform=ax.transAxes, fontsize=8, color="0.35", va="top")
+        _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
     fig, ax = plt.subplots(figsize=(8, 5.5))
     for index, method in enumerate(_paper_methods(raw)):
-        method_points = [(x, _mean_ci(points[(method, x)])) for x in x_values if (method, x) in points]
+        method_points = [(x, _mean_ci(groups[(method, x)])) for x in x_values if (method, x) in groups]
         if not method_points:
             continue
         xs = [x for x, _ in method_points]; ys = [stats["mean"] for _, stats in method_points]
-        ax.plot(xs, ys, marker="o", color=f"C{index % 10}", label=_paper_method_label(method))
+        ax.plot(xs, ys, marker="o", color=_paper_color(method), label=_paper_method_label(method))
         valid = [(x, stats) for x, stats in method_points if stats["ci95_low"] is not None]
         if len(valid) == len(method_points):
-            ax.fill_between(xs, [stats["ci95_low"] for _, stats in method_points], [stats["ci95_high"] for _, stats in method_points], color=f"C{index % 10}", alpha=.14)
-    ax.set(xlabel="Malicious reports per 1000 simulation steps", ylabel="Mean map error (%)")
+            ax.fill_between(xs, [stats["ci95_low"] for _, stats in method_points], [stats["ci95_high"] for _, stats in method_points], color=_paper_color(method), alpha=.14)
+    ax.set(xlabel=xlabel, ylabel="Mean map error (%)", title=title)
     _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 
@@ -1554,14 +1615,21 @@ def _plot_paper_influence_age(runs, raw, path):
     settings = {(decay, max_age) for _, decay, max_age in configs}
     if len(settings) != 1 or any(decay is None or max_age is None for _, decay, max_age in configs):
         return False
-    decay, max_age = next(iter(settings)); methods = _paper_methods(raw); ages = np.linspace(0, max_age, 250); fig, ax = plt.subplots(figsize=(8, 5.5))
+    decay, max_age = next(iter(settings)); methods = _paper_methods(raw); ages = np.linspace(0, max_age, 250); fig, ax = plt.subplots(figsize=(8, 4.8))
+    style = {"full_trust": "--", "majority_vote": "-.", "trust_fused": ":", "source_memory": "-", "source_linked": "-", "latest_report": (0, (8, 3)), "time_decay": "-", "trust_threshold": ":"}
+    curves = {}
     for method in methods:
-        if method in {"source_linked", "source_memory", "time_decay", "trust_threshold"}:
-            curve = np.exp(-decay * ages)
-        else:
-            curve = np.ones_like(ages)
-        ax.plot(ages, curve * 100.0, label=_paper_method_label(method))
-    ax.set(xlabel="Age of obstacle report (steps)", ylabel="Normalized influence remaining (%)", title="Age-only normalized mechanism curve")
+        exponential = method in {"source_linked", "source_memory", "time_decay", "trust_threshold"}
+        curve = np.exp(-decay * ages) if exponential else np.ones_like(ages)
+        curves.setdefault(tuple(np.round(curve, 12)), []).append(method)
+    for curve_values, curve_methods in curves.items():
+        primary = curve_methods[0]
+        label = " / ".join(_paper_method_label(method) for method in curve_methods)
+        kwargs = {"linestyle": style.get(primary, "-"), "label": label, "color": _paper_color(primary), "linewidth": 2 if primary in {"source_memory", "source_linked"} else 1.2}
+        if primary in {"source_memory", "source_linked"}:
+            kwargs.update(marker="o", markevery=35, markersize=3.5)
+        ax.plot(ages, np.asarray(curve_values) * 100.0, **kwargs)
+    ax.set(xlabel="Age of obstacle report (steps)", ylabel="Normalized influence remaining (%)", title="Report influence vs age", ylim=(0, 100))
     _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 
@@ -1576,7 +1644,7 @@ def _plot_paper_scalability(raw, path):
     for index, method in enumerate(_paper_methods(raw)):
         points = [(parse_float(row.get(count)), parse_float(row.get(runtime))) for row in raw if row.get("method") == method and parse_float(row.get(count)) is not None and parse_float(row.get(runtime)) is not None]
         if points:
-            points.sort(); ax.plot([x for x, _ in points], [y for _, y in points], marker="o", label=_paper_method_label(method), color=f"C{index % 10}")
+            points.sort(); ax.plot([x for x, _ in points], [y for _, y in points], marker="o", label=_paper_method_label(method), color=_paper_color(method))
     ax.set(xlabel="Stored evidence", ylabel="Map update runtime (ms)"); _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 
@@ -1601,7 +1669,7 @@ def _plot_paper_delay_tolerance(raw, path):
     for index, method in enumerate(_paper_methods(raw)):
         points = sorted((d, _mean_ci(values)) for (m, d), values in groups.items() if m == method)
         if points:
-            ax.plot([d for d, _ in points], [s["mean"] for _, s in points], marker="o", label=_paper_method_label(method), color=f"C{index % 10}")
+            ax.plot([d for d, _ in points], [s["mean"] for _, s in points], marker="o", label=_paper_method_label(method), color=_paper_color(method))
     ax.set(xlabel="Communication delay (steps)", ylabel="Legitimate reports rejected (%)"); _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
@@ -1668,7 +1736,7 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
             ("A5_navigation_recovery_distribution.png", lambda p: _plot_paper_a5(raw, p), "fewer than five recovery observations are available for every method"),
             ("01_mission_deliveries.png", lambda p: _paper_bar_plot(raw, "benign_total_deliveries_completed", "Deliveries completed", p, include_no_attack=True, no_attack_category=False), "delivery data are absent"),
             ("03_false_report_acceptance.png", lambda p: _paper_bar_plot(raw, "false_acceptance_rate", "False reports accepted (%)", p, transform=lambda value: value * 100.0), "false_acceptance_rate is absent"),
-            ("04_map_error_vs_attack_intensity.png", lambda p: _plot_paper_map_error_sweep(raw, p), "batch does not contain an attack-intensity sweep"),
+            ("04_map_error_vs_attack_intensity.png", lambda p: _plot_paper_map_error_sweep(raw, p, warnings), "batch does not contain usable attack-load data"),
             ("05_map_update_scalability.png", lambda p: _plot_paper_scalability(raw, p), "required runtime metrics are not present in existing outputs"),
             ("06_delivery_time.png", lambda p: _plot_paper_delivery_time(raw, p), "no common delivery-duration field is available"),
             ("07_replans_per_delivery.png", lambda p: _paper_bar_plot(raw, "replans_per_delivery", "Replans per delivery", p, include_no_attack=True), "replans_per_delivery is absent"),
