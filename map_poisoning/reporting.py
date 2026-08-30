@@ -1314,6 +1314,296 @@ def _batch_completion_plot(root, path):
         for col_index, method in enumerate(methods): ax.text(col_index, row_index, state.get((seed, method), "missing"), ha="center", va="center", fontsize=7)
     fig.tight_layout(); _save(fig, path)
 
+
+# Publication figures deliberately operate on one row per completed run.  Keep
+# these helpers local to this module so the simulator's output contract remains
+# unchanged.
+PAPER_METHOD_LABELS = {
+    "full_trust": "Full trust", "majority_vote": "Majority vote",
+    "trust_fused": "Trust-fused", "source_linked": "Proposed",
+    "source_memory": "Proposed", "latest_report": "Latest report",
+    "soft_probability": "Soft probability", "time_decay": "Time decay",
+    "trust_threshold": "Trust threshold",
+}
+PAPER_METHOD_ORDER = ("full_trust", "majority_vote", "trust_fused", "source_linked", "source_memory")
+
+
+def _paper_method_label(method):
+    return PAPER_METHOD_LABELS.get(method, str(method).replace("_", " ").title())
+
+
+def _paper_methods(raw):
+    present = list(dict.fromkeys(row.get("method") for row in raw if row.get("method")))
+    rank = {name: index for index, name in enumerate(PAPER_METHOD_ORDER)}
+    return sorted(present, key=lambda name: (rank.get(name, len(rank)), name))
+
+
+def _valid_values(raw, method, field, transform=None):
+    values = []
+    for row in raw:
+        if row.get("method") != method:
+            continue
+        value = parse_float(row.get(field))
+        if value is None or not math.isfinite(value):
+            continue
+        if transform is not None:
+            value = transform(value)
+        if value is not None and math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _deterministic_jitter(count, width=0.16):
+    return np.zeros(count) if count < 2 else np.linspace(-width, width, count)
+
+
+def _mean_ci(values):
+    from .statistics import summarize
+    return summarize(values)
+
+
+def _record_plot_warning(warnings, filename, message):
+    warnings.append(f"{filename}: {message}")
+
+
+def _annotate_batch_validation(fig, path):
+    try:
+        validation = json.loads((Path(path).parent.parent / "batch_validation.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not validation.get("valid", True):
+        fig.text(.99, .01, "Incomplete batch: failed cells excluded", ha="right", fontsize=8, color="firebrick")
+
+
+def _paper_axes(ax, *, grid_axis="y"):
+    ax.set_facecolor("white")
+    ax.grid(axis=grid_axis, color="0.88", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+
+def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, include_no_attack=False, no_attack_category=True):
+    methods = _paper_methods(raw)
+    groups = [(method, _valid_values([row for row in raw if not (include_no_attack and parse_float(row.get("attack_actions")) == 0)], method, field, transform)) for method in methods]
+    no_attack_values = []
+    if include_no_attack:
+        values = []
+        for row in raw:
+            if parse_float(row.get("attack_actions")) == 0:
+                value = parse_float(row.get(field))
+                if value is not None and (transform is None or (value := transform(value)) is not None):
+                    values.append(value)
+        no_attack_values = values
+        if values and no_attack_category:
+            groups.append((None, values))
+    groups = [(method, values) for method, values in groups if values]
+    if not groups:
+        return False
+    fig, ax = plt.subplots(figsize=(max(7, len(groups) * 1.45), 5.4))
+    x = np.arange(len(groups)); means = [_mean_ci(values)["mean"] for _, values in groups]
+    colors = [f"C{index % 10}" for index in range(len(groups))]
+    ax.bar(x, means, color=colors, alpha=.72, width=.62, edgecolor="0.25", linewidth=.6)
+    for index, (method, values) in enumerate(groups):
+        stats = _mean_ci(values)
+        ax.scatter(index + _deterministic_jitter(len(values)), values, s=20, color="0.15", alpha=.48, zorder=3)
+        if stats["ci95_low"] is not None:
+            ax.errorbar(index, stats["mean"], yerr=[[stats["mean"] - stats["ci95_low"]], [stats["ci95_high"] - stats["mean"]]], fmt="none", ecolor="0.12", capsize=4, linewidth=1.1, zorder=4)
+    labels = [_paper_method_label(method) if method else "No attack" for method, _ in groups]
+    ax.set(xticks=x, xticklabels=labels, ylabel=ylabel)
+    if ylabel == "False reports accepted (%)":
+        ax.set_ylim(bottom=0)
+        if all(value <= 100 for _, group_values in groups for value in group_values):
+            ax.set_ylim(0, 100)
+    if no_attack_values and not no_attack_category:
+        ax.axhline(_mean_ci(no_attack_values)["mean"], color="0.25", linestyle="--", linewidth=1, label="No attack")
+    if title:
+        ax.set_title(title)
+    _paper_axes(ax); fig.tight_layout(); _annotate_batch_validation(fig, path); _save(fig, path)
+    return True
+
+
+def _plot_paper_a2(raw, path):
+    methods = _paper_methods(raw)
+    groups = [(method, _valid_values(raw, method, "steps_route_affected_by_attacker")) for method in methods]
+    groups = [(method, values) for method, values in groups if values]
+    if not groups:
+        return False
+    fig, ax = plt.subplots(figsize=(max(7, len(groups) * 1.45), 5.2))
+    for index, (method, values) in enumerate(groups):
+        ax.scatter(index + _deterministic_jitter(len(values)), values, s=27, color=f"C{index % 10}", alpha=.52, edgecolors="none")
+        ax.scatter(index, np.median(values), marker="D", s=70, color="black", zorder=4)
+        ax.text(index, ax.get_ylim()[0] if ax.get_ylim()[1] else 0, f"n={len(values)}", ha="center", va="bottom", fontsize=8, color="0.35")
+    ax.set(xticks=range(len(groups)), xticklabels=[_paper_method_label(m) for m, _ in groups], ylabel="Attack-affected route duration (steps)")
+    _paper_axes(ax); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_paper_a3(raw, path):
+    methods = _paper_methods(raw); points = []
+    for method in methods:
+        xs = _valid_values(raw, method, "false_acceptance_rate", lambda value: value * 100.0)
+        ys = []
+        for row in raw:
+            if row.get("method") != method:
+                continue
+            value = parse_float(row.get("benign_delivery_cycle_duration_mean_steps"))
+            if value is None:
+                value = parse_float(row.get("benign_delivery_time_mean_steps"))
+            if value is not None and math.isfinite(value):
+                ys.append(value)
+        if xs and ys:
+            points.append((method, sum(xs) / len(xs), sum(ys) / len(ys)))
+    if not points:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for index, (method, x, y) in enumerate(points):
+        ax.scatter(x, y, s=100, color=f"C{index % 10}", edgecolor="black", linewidth=.6, zorder=3)
+        ax.annotate(_paper_method_label(method), (x, y), xytext=(7, 5), textcoords="offset points", fontsize=9)
+    ax.set(xlabel="False reports accepted (%)", ylabel="Mean delivery-cycle duration (steps)", title="Security/performance tradeoff")
+    _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_paper_delivery_time(raw, path):
+    methods = _paper_methods(raw)
+    fields = ("benign_delivery_cycle_duration_mean_steps", "benign_delivery_time_mean_steps", "benign_loaded_delivery_duration_mean_steps")
+    selected = next((field for field in fields if all(_valid_values(raw, method, field) for method in methods)), None)
+    if selected is None:
+        selected = next((field for field in fields if any(_valid_values(raw, method, field) for method in methods)), None)
+    if selected is None:
+        return False
+    labels = {
+        "benign_delivery_cycle_duration_mean_steps": "Mean delivery-cycle duration (steps)",
+        "benign_delivery_time_mean_steps": "Mean delivery time (steps)",
+        "benign_loaded_delivery_duration_mean_steps": "Mean loaded-delivery duration (steps)",
+    }
+    return _paper_bar_plot(raw, selected, labels[selected], path, include_no_attack=True)
+
+
+def _gaussian_kde_numpy(values, grid):
+    values = np.asarray(values, dtype=float)
+    if len(values) < 2:
+        return np.zeros_like(grid)
+    std = float(np.std(values, ddof=1)); bandwidth = 1.06 * std * len(values) ** (-.2)
+    span = float(np.ptp(values)); bandwidth = max(bandwidth, span / 50.0, 1e-6)
+    density = np.exp(-0.5 * ((grid[:, None] - values[None, :]) / bandwidth) ** 2).sum(axis=1)
+    density /= len(values) * bandwidth * math.sqrt(2 * math.pi)
+    return density
+
+
+def _plot_paper_a5(raw, path):
+    methods = _paper_methods(raw); groups = [(m, _valid_values(raw, m, "recovery_time_steps")) for m in methods]
+    groups = [(m, values) for m, values in groups if values]
+    if not groups or not any(len(values) >= 5 for _, values in groups):
+        return False
+    all_values = np.concatenate([np.asarray(values) for _, values in groups]); lo, hi = float(all_values.min()), float(all_values.max())
+    if lo == hi: lo, hi = lo - 1, hi + 1
+    grid = np.linspace(lo, hi, 300); fig, ax = plt.subplots(figsize=(9, max(4.5, len(groups) * .85)))
+    for index, (method, values) in enumerate(groups):
+        baseline = len(groups) - index
+        if len(values) >= 5:
+            density = _gaussian_kde_numpy(values, grid); height = density / density.max() * .72 if density.max() else density
+            ax.fill_between(grid, baseline, baseline + height, color=f"C{index % 10}", alpha=.48)
+            ax.plot(grid, baseline + height, color=f"C{index % 10}", linewidth=1.1)
+        else:
+            ax.scatter(values, np.full(len(values), baseline + .04), color=f"C{index % 10}", s=28, zorder=3)
+        ax.text(hi + (hi - lo) * .02, baseline + .25, _paper_method_label(method), va="center", fontsize=9)
+    ax.set(xlim=(lo, hi * 1.12 if hi >= 0 else hi), yticks=[], xlabel="Time until normal routing resumes (steps)")
+    _paper_axes(ax, grid_axis="x"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_paper_map_error_sweep(raw, path):
+    points = {}
+    for row in raw:
+        actions = parse_float(row.get("attack_actions")); steps = parse_float(row.get("steps_completed")); error = parse_float(row.get("map_error_mean"))
+        if actions is None or steps is None or steps <= 0 or error is None:
+            continue
+        key = (row.get("method"), round(actions / steps * 1000.0, 6)); points.setdefault(key, []).append(error * 100.0)
+    x_values = sorted({key[1] for key in points})
+    if len(x_values) < 2:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for index, method in enumerate(_paper_methods(raw)):
+        method_points = [(x, _mean_ci(points[(method, x)])) for x in x_values if (method, x) in points]
+        if not method_points:
+            continue
+        xs = [x for x, _ in method_points]; ys = [stats["mean"] for _, stats in method_points]
+        ax.plot(xs, ys, marker="o", color=f"C{index % 10}", label=_paper_method_label(method))
+        valid = [(x, stats) for x, stats in method_points if stats["ci95_low"] is not None]
+        if len(valid) == len(method_points):
+            ax.fill_between(xs, [stats["ci95_low"] for _, stats in method_points], [stats["ci95_high"] for _, stats in method_points], color=f"C{index % 10}", alpha=.14)
+    ax.set(xlabel="Malicious reports per 1000 simulation steps", ylabel="Mean map error (%)")
+    _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _load_effective_config(data):
+    try:
+        return json.loads((data.directory / "effective_config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _plot_paper_influence_age(runs, raw, path):
+    configs = []
+    for _, _, data in runs:
+        config = _load_effective_config(data)
+        if config:
+            fusion = config.get("fusion", {})
+            configs.append((config.get("method", data.summary.get("method")), parse_float(fusion.get("decay_rate")), parse_float(fusion.get("max_claim_age"))))
+    if not configs:
+        return False
+    settings = {(decay, max_age) for _, decay, max_age in configs}
+    if len(settings) != 1 or any(decay is None or max_age is None for _, decay, max_age in configs):
+        return False
+    decay, max_age = next(iter(settings)); methods = _paper_methods(raw); ages = np.linspace(0, max_age, 250); fig, ax = plt.subplots(figsize=(8, 5.5))
+    for method in methods:
+        if method in {"source_linked", "source_memory", "time_decay", "trust_threshold"}:
+            curve = np.exp(-decay * ages)
+        else:
+            curve = np.ones_like(ages)
+        ax.plot(ages, curve * 100.0, label=_paper_method_label(method))
+    ax.set(xlabel="Age of obstacle report (steps)", ylabel="Normalized influence remaining (%)", title="Age-only normalized mechanism curve")
+    _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_paper_scalability(raw, path):
+    runtime_fields = ("map_update_time_ms", "map_update_runtime_ms", "map_update_time")
+    count_fields = ("stored_report_count", "stored_evidence_count")
+    runtime = next((field for field in runtime_fields if any(parse_float(row.get(field)) is not None for row in raw)), None)
+    count = next((field for field in count_fields if any(parse_float(row.get(field)) is not None for row in raw)), None)
+    if runtime is None or count is None:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for index, method in enumerate(_paper_methods(raw)):
+        points = [(parse_float(row.get(count)), parse_float(row.get(runtime))) for row in raw if row.get("method") == method and parse_float(row.get(count)) is not None and parse_float(row.get(runtime)) is not None]
+        if points:
+            points.sort(); ax.plot([x for x, _ in points], [y for _, y in points], marker="o", label=_paper_method_label(method), color=f"C{index % 10}")
+    ax.set(xlabel="Stored evidence", ylabel="Map update runtime (ms)"); _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_paper_delay_tolerance(raw, path):
+    delay_fields = ("communication_delay_steps", "report_age_steps", "delay_steps")
+    accepted_fields = ("honest_reports_accepted", "legitimate_reports_accepted")
+    rejected_fields = ("honest_reports_rejected", "legitimate_reports_rejected")
+    delay = next((field for field in delay_fields if any(parse_float(row.get(field)) is not None for row in raw)), None)
+    accepted = next((field for field in accepted_fields if any(parse_float(row.get(field)) is not None for row in raw)), None)
+    rejected = next((field for field in rejected_fields if any(parse_float(row.get(field)) is not None for row in raw)), None)
+    if not all((delay, accepted, rejected)):
+        return False
+    # Future-compatible only: each input row must already represent a delay bin.
+    groups = {}
+    for row in raw:
+        d, a, r = parse_float(row.get(delay)), parse_float(row.get(accepted)), parse_float(row.get(rejected))
+        if d is not None and a is not None and r is not None and a + r > 0:
+            groups.setdefault((row.get("method"), d), []).append(r / (a + r) * 100.0)
+    if not groups:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for index, method in enumerate(_paper_methods(raw)):
+        points = sorted((d, _mean_ci(values)) for (m, d), values in groups.items() if m == method)
+        if points:
+            ax.plot([d for d, _ in points], [s["mean"] for _, s in points], marker="o", label=_paper_method_label(method), color=f"C{index % 10}")
+    ax.set(xlabel="Communication delay (steps)", ylabel="Legitimate reports rejected (%)"); _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
 def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     root=Path(root); runs=_multiseed_runs(root)
     if not runs: raise ValueError(f"no completed multi-seed runs found under {root}")
@@ -1369,37 +1659,35 @@ def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
                        "failed_seed_count": len({seed for seed, _ in failed_cells}),
                        "failure_reason_counts": {reason: sum(1 for row in status if row.get("status") == "failed" and row.get("error") == reason) for reason in sorted({row.get("error") for row in status if row.get("status") == "failed" and row.get("error")})}})
     (aggregate / "batch_validation.json").write_text(json.dumps(validation, indent=2), encoding="utf-8")
-    jobs=[("01_deliveries_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_total_deliveries_completed","benign_deliveries_after_attack","benign_deliveries_after_distrust"],"Deliveries by method (seed points and 95% CI)",p)),("02_mission_efficiency_by_method.png",lambda p:_multiseed_point_plot(raw,["distance_per_delivery","replans_per_delivery","traffic_waits_per_delivery"],"Mission efficiency by method",p)),("03_attack_influence_by_method.png",lambda p:_multiseed_point_plot(raw,["attack_mean_influential_fake_cells","attack_fraction_samples_influenced","attack_mean_attacker_route_cost","attack_fraction_route_affected"],"Attack influence by method",p)),("04_trust_diagnostics_by_method.png",lambda p:_multiseed_point_plot(raw,["time_to_distrust_malicious_robot","time_to_all_benign_distrust","attacker_min_trust_mean","final_attacker_trust_mean"],"Trust diagnostics",p)),("05_traffic_burden_by_method.png",lambda p:_multiseed_point_plot(raw,["benign_traffic_wait_steps","deadlocks_detected","traffic_replans","robot_overlap_violations"],"Traffic burden by method",p)),("06_fake_influence_over_time.png",lambda p:_multiseed_timeseries(runs,"influential_fake_claim_count",p,"Fake influence over time","benign_mean")),("07_delivery_progress_over_time.png",lambda p:_multiseed_timeseries(runs,"deliveries_completed",p,"Benign delivery progress over time","benign_sum")),("08_replans_over_time.png",lambda p:_multiseed_timeseries(runs,"benign_total_replans",p,"Benign replans over time","benign_sum")),("14_route_cause_attribution.png",lambda p:_multiseed_point_plot(raw,["malicious_report_path_changes","fake_obstacle_path_changes","stale_reassertion_path_changes","temporary_obstacle_path_changes"],"Path changes by attributable cause",p))]
+    skipped = []
     if "png" in formats:
-        jobs.insert(0, ("00_batch_completion.png", lambda p: _batch_completion_plot(root, p)))
-        for name,job in jobs:
-            try: job(plots/name); generated.append(name)
+        jobs = (
+            ("00_batch_completion.png", lambda p: _batch_completion_plot(root, p), "audit plot"),
+            ("A2_false_blockage_duration.png", lambda p: _plot_paper_a2(raw, p), "steps_route_affected_by_attacker is absent"),
+            ("A3_security_performance_tradeoff.png", lambda p: _plot_paper_a3(raw, p), "false-acceptance and delivery-duration data are absent"),
+            ("A5_navigation_recovery_distribution.png", lambda p: _plot_paper_a5(raw, p), "fewer than five recovery observations are available for every method"),
+            ("01_mission_deliveries.png", lambda p: _paper_bar_plot(raw, "benign_total_deliveries_completed", "Deliveries completed", p, include_no_attack=True, no_attack_category=False), "delivery data are absent"),
+            ("03_false_report_acceptance.png", lambda p: _paper_bar_plot(raw, "false_acceptance_rate", "False reports accepted (%)", p, transform=lambda value: value * 100.0), "false_acceptance_rate is absent"),
+            ("04_map_error_vs_attack_intensity.png", lambda p: _plot_paper_map_error_sweep(raw, p), "batch does not contain an attack-intensity sweep"),
+            ("05_map_update_scalability.png", lambda p: _plot_paper_scalability(raw, p), "required runtime metrics are not present in existing outputs"),
+            ("06_delivery_time.png", lambda p: _plot_paper_delivery_time(raw, p), "no common delivery-duration field is available"),
+            ("07_replans_per_delivery.png", lambda p: _paper_bar_plot(raw, "replans_per_delivery", "Replans per delivery", p, include_no_attack=True), "replans_per_delivery is absent"),
+            ("08_report_influence_vs_age.png", lambda p: _plot_paper_influence_age(runs, raw, p), "compatible effective fusion configuration is absent or mixed"),
+            ("09_delay_tolerance.png", lambda p: _plot_paper_delay_tolerance(raw, p), "honest-report delay-bin totals are not present in existing outputs"),
+        )
+        for name, job, reason in jobs:
+            try:
+                result = job(plots / name)
+                if result is True and (plots / name).exists():
+                    generated.append(name)
+                elif result is False:
+                    skipped.append({"filename": name, "reason": reason})
+                    _record_plot_warning(warnings, name, f"skipped: {reason}")
             except Exception as exc:
-                plot_failures.append({"filename": name, "error": str(exc)}); print(f"[report] FAILED {name}: {exc}")
-    if "png" in formats:
-        fig, ax=plt.subplots(figsize=(10,6)); selected=[row for row in paired if row["metric"] in {"benign_deliveries_after_attack","deliveries_per_1000_steps","replans_per_delivery","traffic_waits_per_delivery","attack_mean_influential_fake_cells","attack_fraction_route_affected"} and row["improvement_difference"] is not None]; labels=[f"{row['baseline_method']} / {row['metric']}" for row in selected]; means=[row["improvement_difference"] for row in selected]; lows=[row["improvement_ci95_low"] for row in selected]; highs=[row["improvement_ci95_high"] for row in selected]; y=np.arange(len(labels));
-        if labels: ax.errorbar(means,y,xerr=[[m-l if l is not None else 0 for m,l in zip(means,lows)],[h-m if h is not None else 0 for m,h in zip(means,highs)]],fmt="o")
-        focal_label = focal or "focal method"
-        ax.axvline(0,color="0.4"); ax.set(yticks=y,yticklabels=labels or ["(no paired methods)"],title=f"{focal_label} paired improvement",xlabel=f"Positive means {focal_label} better"); ax.grid(axis="x",alpha=.25); _save(fig,plots/"09_paired_method_differences.png"); generated.append("09_paired_method_differences.png")
-        if focal == "source_memory":
-            import shutil
-            shutil.copyfile(plots/"09_paired_method_differences.png", plots/"09_source_memory_paired_differences.png")
-            generated.append("09_source_memory_paired_differences.png")
-        from .statistics import summarize
-        methods=_ordered_methods(row["method"] for row in raw); fig, ax=plt.subplots(figsize=(8,6))
-        for method in methods:
-            xvals=[row["replans_per_delivery"] for row in raw if row["method"]==method and row.get("replans_per_delivery") is not None]; yvals=[row["benign_deliveries_after_attack"] for row in raw if row["method"]==method and row.get("benign_deliveries_after_attack") is not None]
-            if xvals and yvals:
-                xs=summarize(xvals); ys=summarize(yvals); ax.errorbar(xs["mean"],ys["mean"],xerr=None if xs["ci95_low"] is None else [[xs["mean"]-xs["ci95_low"]],[xs["ci95_high"]-xs["mean"]]],yerr=None if ys["ci95_low"] is None else [[ys["mean"]-ys["ci95_low"]],[ys["ci95_high"]-ys["mean"]]],fmt="o",label=method,capsize=4)
-        ax.set(xlabel="Replans per delivery",ylabel="Deliveries after attack",title="Delivery vs replan tradeoff"); _safe_legend(ax); ax.grid(alpha=.25); _save(fig,plots/"10_delivery_vs_replan_tradeoff.png"); generated.append("10_delivery_vs_replan_tradeoff.png")
-        try:
-            _paired_seed_plot(raw, plots / "11_paired_seed_outcomes.png"); generated.append("11_paired_seed_outcomes.png")
-            _multiseed_point_plot(raw, ["deliveries_during_attack", "deliveries_during_recovery", "traffic_wait_steps_during_attack", "replans_during_attack"], "Phase outcomes by method", plots / "12_phase_outcomes_by_method.png"); generated.append("12_phase_outcomes_by_method.png")
-            _experiment_design_plot(plots / "13_experiment_design.png", requested_methods or _ordered_methods(row["method"] for row in raw)); generated.append("13_experiment_design.png")
-        except Exception as exc:
-            plot_failures.append({"filename": "11-13 aggregate plots", "error": str(exc)}); print(f"[report] FAILED 11-13 aggregate plots: {exc}")
+                plot_failures.append({"filename": name, "error": str(exc)})
+                print(f"[report] FAILED {name}: {exc}")
     _write_multiseed_report(aggregate, raw, paired, focal)
-    manifest={"directory":str(root),"generated":generated,"failed":plot_failures,"warnings":[],"runs":len(runs)}; (aggregate/"aggregate_plot_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8"); return manifest
+    manifest={"directory":str(root),"generated":generated,"skipped":skipped,"failed":plot_failures,"warnings":warnings,"runs":len(runs)}; (aggregate/"aggregate_plot_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8"); return manifest
 
 def _write_multiseed_report(aggregate, raw, paired, focal=None):
     methods=_ordered_methods(row["method"] for row in raw)
