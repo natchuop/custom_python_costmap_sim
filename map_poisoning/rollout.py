@@ -256,6 +256,7 @@ def run_manifest_rollout(
         "malicious_reports_influential": 0,
         "malicious_reports_operationally_ignored": 0,
         "traffic_events": [],
+        "attack_relevance": [],
         # Populated only by the attack-free authoring rollout.  It is not
         # written to result CSVs and cannot influence a defense replay.
         "reference_states": {} if capture_reference_state else None,
@@ -275,6 +276,11 @@ def run_manifest_rollout(
     }
     attacks_by_step: dict[int, list] = {}
     attack_type_by_report_id: dict[str, str] = {}
+    attack_metadata_by_event_id = {
+        str(item.get("event_id", item.get("candidate_id"))): item
+        for item in (manifest.candidate_metadata or ())
+        if item.get("event_id") or item.get("candidate_id")
+    }
     for event in manifest.attack_events:
         attacks_by_step.setdefault(int(event.step), []).append(event)
         for report_id in event.report_ids:
@@ -410,12 +416,32 @@ def run_manifest_rollout(
                     if recipient.robot_id != robot.robot_id:
                         deliveries[recipient.robot_id].append(report)
 
-        # Attack reports retain the manifest's observation_step. Attack targeting
-        # itself is intentionally left to the separate attack-authoring work.
+        # Attack reports retain the manifest's observation_step; stale attacks
+        # therefore carry their original blocked-observation timestamp.
         for event in manifest.attack_events:
             if event.step != step:
                 continue
             log["attack_injection_steps"].append(step)
+            relevance = dict(attack_metadata_by_event_id.get(event.event_id, {}))
+            for field in (
+                "route_overlap",
+                "victim_distance",
+                "remaining_obstacle_lifetime",
+                "age_since_clearance",
+                "target_visible_to_victim",
+            ):
+                relevance.setdefault(field, None)
+            relevance.update({
+                "step": step,
+                "kind": "attack_relevance",
+                "method": method,
+                "scenario_event_id": event.event_id,
+                "attack_type": event.attack_type.value,
+                "observation_step": event.observation_step,
+                "target_visible_to_victim": relevance["target_visible_to_victim"],
+            })
+            log["events"].append(relevance)
+            log["attack_relevance"].append(relevance)
             for cell, report_id in zip(event.cells, event.report_ids):
                 report = ClaimReport(
                     report_id,

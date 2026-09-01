@@ -14,6 +14,7 @@ from .obstacles import (
     FAKE_MIN_REPORT_CELLS,
     author_temporary_obstacle_episodes,
     fake_report_cells,
+    footprint_center,
     sample_fake_obstacle_dimensions,
 )
 from .rng import derived_seed, named_rng
@@ -27,7 +28,16 @@ ATTACK_REQUIRE_CURRENT_ROUTE_OVERLAP = True
 ATTACK_MIN_DISTANCE_FROM_GOAL = 2
 ATTACK_MIN_DISTANCE_FROM_ANY_BENIGN_ROBOT = 2
 MALICIOUS_FAKE_OBJECT_CENTER_MIN_SPACING = 3
+ATTACK_NEAR_FUTURE_ROUTE_STEPS = 80
+ATTACK_MAX_ROUTE_DISTANCE = 3
+FALSE_CLEARANCE_MIN_REMAINING_STEPS = 20
+STALE_REASSERTION_PREFERRED_AGE = (30, 100)
 SCHEMA_VERSION = 3
+
+
+def _center_cell(cells) -> tuple[int, int]:
+    center = footprint_center(cells)
+    return int(round(center[0])), int(round(center[1]))
 
 
 def _build_attacker_route_cells(
@@ -134,6 +144,104 @@ def _reference_detour_score(grid, victim, report_cells, active_temp_cells=()) ->
         # runtime interactions, but it is not deliberately authored here.
         return None
     return float(max(0, len(attacked) - len(baseline)))
+
+
+def _episode_route_candidate(episode, victim, step, visible_cells, *, stale=False):
+    """Describe how strongly an episode can affect a clean-reference victim."""
+    remaining = list(victim.path or ())[:ATTACK_NEAR_FUTURE_ROUTE_STEPS]
+    if not remaining:
+        return None
+    footprint = {tuple(cell) for cell in episode.cells}
+    visible = {tuple(cell) for cell in visible_cells}
+    if footprint.intersection(visible):
+        return None
+    overlap = len(set(remaining).intersection(footprint))
+    min_distance = min(
+        manhattan(path_cell, footprint_cell)
+        for path_cell in remaining
+        for footprint_cell in footprint
+    )
+    nearest_index = min(
+        range(len(remaining)),
+        key=lambda index: min(manhattan(remaining[index], cell) for cell in footprint),
+    )
+    age = max(0, step - episode.clearance_step) if stale else None
+    remaining_lifetime = max(0, episode.clearance_step - step) if not stale else None
+    # Direct overlap is strongest; nearby traffic is still useful when a
+    # moving robot is about to enter the footprint.
+    relevance = (100.0 + overlap * 10.0) if overlap else (20.0 / (1.0 + min_distance))
+    center = footprint_center(episode.cells)
+    center_cell = (int(round(center[0])), int(round(center[1])))
+    return {
+        "victim_id": int(victim.robot_id),
+        "route_overlap": int(overlap),
+        "victim_distance": int(manhattan(tuple(victim.position), center_cell)),
+        "route_distance_steps": int(nearest_index),
+        "min_route_distance": int(min_distance),
+        "remaining_obstacle_lifetime": remaining_lifetime,
+        "age_since_clearance": age,
+        "target_visible_to_victim": False,
+        "relevance_score": relevance,
+    }
+
+
+def _select_episode_attack_target(episodes, reference_states, step, attack_type, benign_ids):
+    """Choose an active/cleared physical obstacle that matters to a victim."""
+    stale = attack_type == AttackType.STALE_REASSERTION
+    active_cells = {
+        tuple(cell)
+        for current in episodes
+        if current.appearance_step <= step < current.clearance_step
+        for cell in current.cells
+    }
+    candidates = []
+    for episode in episodes:
+        if stale:
+            age = step - episode.clearance_step
+            if not (STALE_REASSERTION_PREFERRED_AGE[0] <= age <= STALE_REASSERTION_PREFERRED_AGE[1]):
+                continue
+            if set(episode.cells).intersection(active_cells):
+                continue
+        elif not (episode.appearance_step <= step < episode.clearance_step):
+            continue
+        for victim_id in benign_ids:
+            state = reference_states.get(step, {}).get(victim_id)
+            if not state or state.get("goal") is None:
+                continue
+            victim = SimpleNamespace(
+                robot_id=int(victim_id),
+                position=tuple(state["position"]),
+                path=list(state.get("path") or ()),
+            )
+            candidate = _episode_route_candidate(
+                episode,
+                victim,
+                step,
+                state.get("visible_cells") or (),
+                stale=stale,
+            )
+            if candidate is None:
+                continue
+            if not stale and candidate["remaining_obstacle_lifetime"] < FALSE_CLEARANCE_MIN_REMAINING_STEPS:
+                continue
+            # A footprint on the route is strongest, but a footprint within a
+            # few cells of near-future traffic can also force a detour/replan.
+            if candidate["route_overlap"] <= 0 and candidate["min_route_distance"] > ATTACK_MAX_ROUTE_DISTANCE:
+                continue
+            candidates.append((candidate, episode))
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            item[0]["route_overlap"],
+            item[0]["relevance_score"],
+            -item[0]["route_distance_steps"],
+            -item[0]["victim_distance"],
+        ),
+        reverse=True,
+    )
+    candidate, episode = candidates[0]
+    return episode, candidate
 
 
 def _is_valid_recon_attack_cell(
@@ -245,6 +353,7 @@ def recon_heatmap_attack_candidates(
                 victim_options.append({
                     "victim_id": victim.robot_id,
                     "path_overlap": overlap,
+                    "victim_distance": manhattan(tuple(victim.position), cell),
                     "path_proximity_score": proximity,
                     "route_distance_steps": nearest_index,
                     "reference_detour_score": detour,
@@ -276,6 +385,7 @@ def recon_heatmap_attack_candidates(
                     "path_proximity_score": victim["path_proximity_score"],
                     "affected_victims": len(victim_options),
                     "victim_id": victim["victim_id"],
+                    "victim_distance": victim["victim_distance"],
                     "route_distance_steps": victim["route_distance_steps"],
                     "reference_detour_score": victim["reference_detour_score"],
                     "target_visible_to_victim": False,
@@ -483,61 +593,65 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     step = config.phases.recon_steps + rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     index = 0
     while step < config.phases.recon_steps + config.phases.attack_steps and enabled_types:
-        active_temp_now = set(_active_temp_cells(episodes, step))
-        feasible = [
-            kind
-            for kind in enabled_types
-            if kind == AttackType.FAKE_OBSTACLE
-            or (
-                kind == AttackType.FALSE_CLEARANCE
-                and any(episode.appearance_step <= step < episode.clearance_step for episode in episodes)
+        episode_targets = {
+            kind: _select_episode_attack_target(
+                episodes, reference_states, step, kind, benign
             )
-            or (
-                kind == AttackType.STALE_REASSERTION
-                and any(
-                    episode.clearance_step <= step
-                    and not set(episode.cells).intersection(active_temp_now)
-                    for episode in episodes
-                )
-            )
-        ]
+            for kind in (AttackType.FALSE_CLEARANCE, AttackType.STALE_REASSERTION)
+        }
+        feasible = [kind for kind in enabled_types if (
+            kind == AttackType.FAKE_OBSTACLE
+            or episode_targets.get(kind) is not None
+        )]
         if not feasible:
             break
         selected_attack = feasible[rng.randrange(len(feasible))]
         if selected_attack != AttackType.FAKE_OBSTACLE:
-            eligible = [
-                episode
-                for episode in episodes
-                if (
-                    selected_attack == AttackType.FALSE_CLEARANCE
-                    and episode.appearance_step <= step < episode.clearance_step
-                )
-                or (
-                    selected_attack == AttackType.STALE_REASSERTION
-                    and episode.clearance_step <= step
-                    and not set(episode.cells).intersection(active_temp_now)
-                )
-            ]
-            if not eligible:
+            target = episode_targets.get(selected_attack)
+            if target is None:
                 step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
                 continue
-            episode = eligible[rng.randrange(len(eligible))]
+            episode, relevance = target
             claim = ClaimType.FREE if selected_attack == AttackType.FALSE_CLEARANCE else ClaimType.BLOCKED
             cells = tuple(episode.cells)
+            observation_step = (
+                step
+                if selected_attack == AttackType.FALSE_CLEARANCE
+                else max(0, episode.clearance_step - 1)
+            )
+            event_id = f"attack-{index:04}"
             events.append(
                 AttackEvent(
-                    f"attack-{index:04}",
+                    event_id,
                     step,
                     selected_attack,
                     cells,
                     claim,
-                    step,
+                    observation_step,
                     sender,
                     benign,
                     tuple(f"report-{index:04}-{cell_index:02}" for cell_index in range(len(cells))),
                     episode.episode_id,
                 )
             )
+            metadata.append({
+                "candidate_id": event_id,
+                "event_id": event_id,
+                "attack_type": selected_attack.value,
+                "center": _center_cell(cells),
+                "footprint_cells": cells,
+                "intended_victim_id": relevance["victim_id"],
+                "reference_step": step,
+                "observation_step": observation_step,
+                "route_overlap": relevance["route_overlap"],
+                "victim_distance": relevance["victim_distance"],
+                "reference_route_distance_steps": relevance["route_distance_steps"],
+                "min_route_distance": relevance["min_route_distance"],
+                "remaining_obstacle_lifetime": relevance["remaining_obstacle_lifetime"],
+                "age_since_clearance": relevance["age_since_clearance"],
+                "target_visible_to_victim": relevance["target_visible_to_victim"],
+                "selection_basis": "clean_reference_route_overlap",
+            })
             index += 1
             step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
             continue
@@ -593,16 +707,21 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         metadata.append(
             {
                 "candidate_id": f"warehouse-{index:04}",
+                "event_id": f"attack-{index:04}",
+                "attack_type": AttackType.FAKE_OBSTACLE.value,
                 "center": center,
                 "footprint_cells": cells,
                 "footprint_height": candidate.get("footprint_height"),
                 "footprint_width": candidate.get("footprint_width"),
                 "route_overlap": candidate["path_overlap"],
+                "victim_distance": candidate.get("victim_distance"),
                 "intended_victim_id": candidate.get("victim_id"),
                 "reference_step": step,
                 "reference_route_distance_steps": candidate.get("route_distance_steps"),
                 "reference_detour_score": candidate.get("reference_detour_score"),
                 "target_visible_to_victim": candidate.get("target_visible_to_victim", False),
+                "remaining_obstacle_lifetime": None,
+                "age_since_clearance": None,
                 "first_visibility_delay": candidate.get("first_visibility_delay"),
                 "expected_visibility_step": step + int(candidate["first_visibility_delay"]),
                 "visibility_delay_window": [
@@ -630,7 +749,9 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             True,
             event.attack_type,
             event.obstacle_episode_id,
-            ClaimType.BLOCKED if event.attack_type == AttackType.FALSE_CLEARANCE else ClaimType.FREE,
+            ClaimType.BLOCKED
+            if event.attack_type in {AttackType.FALSE_CLEARANCE, AttackType.STALE_REASSERTION}
+            else ClaimType.FREE,
         )
         for event in events
         for report_id in event.report_ids

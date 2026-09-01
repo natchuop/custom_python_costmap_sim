@@ -146,7 +146,9 @@ def _instantiate_attack(kind, *, step, rng, episodes, route_cells, use_count, se
     if not cleared:
         return None
     episode = _cell_choice(rng, cleared)
-    return tuple(episode.cells), ClaimType.BLOCKED, step, episode, _center_cell(episode.cells)
+    # Reassert the original blocked observation, not a new observation made at
+    # the attack step after the physical obstacle has already cleared.
+    return tuple(episode.cells), ClaimType.BLOCKED, max(0, episode.clearance_step - 1), episode, _center_cell(episode.cells)
 
 def _nominal_route_cells(grid, starts, targets) -> list[tuple[int, int]]:
     """Clean-rollout corridor candidates shared by the manifest and robot tasks."""
@@ -302,7 +304,9 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
             True,
             event.attack_type,
             event.obstacle_episode_id,
-            ClaimType.BLOCKED if event.attack_type == AttackType.FALSE_CLEARANCE else ClaimType.FREE,
+            ClaimType.BLOCKED
+            if event.attack_type in {AttackType.FALSE_CLEARANCE, AttackType.STALE_REASSERTION}
+            else ClaimType.FREE,
         )
         for event in events for report_id in event.report_ids
     )
