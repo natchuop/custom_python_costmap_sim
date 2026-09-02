@@ -604,7 +604,12 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             or episode_targets.get(kind) is not None
         )]
         if not feasible:
-            break
+            # An unavailable target at one slot must not terminate the whole
+            # attack stream. This is especially important when Fake Obstacle
+            # attacks are disabled, because they otherwise keep the scheduler
+            # moving through ineligible physical-obstacle windows.
+            step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
+            continue
         selected_attack = feasible[rng.randrange(len(feasible))]
         if selected_attack != AttackType.FAKE_OBSTACLE:
             target = episode_targets.get(selected_attack)
