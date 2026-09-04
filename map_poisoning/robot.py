@@ -263,7 +263,7 @@ class ModularRobot:
             return True
         return step - self.last_path_invalid_replan_step >= PATH_INVALID_REPLAN_COOLDOWN_STEPS
 
-    def process_inbox(self, step: int, malicious_ids: FrozenSet[str] = frozenset()):
+    def process_inbox(self, step: int, malicious_ids: FrozenSet[str] = frozenset(), runtime_observer=None):
         accepted = []
         self.last_route_affecting_report_ids.clear()
         remaining = set(self.path or ())
@@ -278,7 +278,13 @@ class ModularRobot:
             # The malicious label is passed only for offline counterfactual
             # metrics; it never changes fusion weighting or robot decisions.
             is_malicious = report.report_id in malicious_ids
+            before_count = self.fusion.active_claim_count() if runtime_observer is not None else None
+            if runtime_observer is not None:
+                import time
+                started_ns = time.perf_counter_ns()
             previous = self.fusion.add(report, policy.influence, is_malicious=is_malicious)
+            if runtime_observer is not None:
+                runtime_observer(report, started_ns, time.perf_counter_ns(), before_count, self.fusion.active_claim_count())
             if previous is not None:
                 self._remove_pending(previous.report.report_id)
             self._add_pending(report)

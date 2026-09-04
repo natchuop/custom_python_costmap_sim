@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import threading
 
 from .application import run
 from .cli import config_from_args, result_location_message, suggested_output_directory
-from .config import ALL_METHODS, PRIMARY_METHODS
+from .config import ALL_METHODS
 from .map_io import load_npy
 from .models import AttackType
+from .reporting import REFERENCE_FIGURE_METHODS, generate_reference_report
 from .scenario_presets import PRESETS, map_path_for_preset, preset_for_hash, preset_for_id, validate_fixed_preset
 
 
@@ -52,6 +54,47 @@ def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None
     if not path.exists():
         raise ValueError(f"selected map does not exist: {map_path}")
     validate_fixed_preset(load_npy(path), preset_for_id(preset_id))
+
+
+def is_physical_ai_method_selection(methods) -> bool:
+    """Return whether the UI selection is the four-method reference workflow."""
+    return set(methods) == set(REFERENCE_FIGURE_METHODS)
+
+
+def generate_physical_ai_report(output_directory: str | Path) -> dict:
+    """Delegate UI reporting to the canonical aggregate reference reporter."""
+    return generate_reference_report(output_directory)
+
+
+def run_physical_ai_workflow(config, seeds, *, full_suite=False):
+    """Run the selected Physical AI workflow and render its current batch."""
+    from .batch import run_multiseed
+
+    root = config.logging.output_directory
+    if full_suite:
+        from .reference_experiments import run_reference_suite
+
+        run_reference_suite(
+            config,
+            tuple(seeds),
+            root,
+            include_sweeps=True,
+            measure_runtime=config.logging.measure_fusion_runtime,
+            generate_report=False,
+        )
+    else:
+        report_config = replace(
+            config,
+            logging=replace(config.logging, generate_plots=False),
+        )
+        run_multiseed(
+            report_config,
+            tuple(seeds),
+            methods=REFERENCE_FIGURE_METHODS,
+            comparison=True,
+            generate_per_run_plots=False,
+        )
+    return generate_physical_ai_report(root)
 
 
 def launch(args) -> None:
@@ -119,6 +162,7 @@ def launch(args) -> None:
         "multi_seed": tk.BooleanVar(value=bool(getattr(args, "seeds", None))),
         "seeds": tk.StringVar(value=getattr(args, "seeds", None) or "1-3"),
         "live_view": tk.BooleanVar(value=False),
+        "full_physical_ai_suite": tk.BooleanVar(value=False),
     }
     initial_methods = {args.defense_method}
     extra = getattr(args, "comparison_methods", None)
@@ -126,7 +170,7 @@ def launch(args) -> None:
         if extra:
             initial_methods.update(item.strip() for item in str(extra).split(",") if item.strip())
         else:
-            initial_methods.update(PRIMARY_METHODS)
+            initial_methods.update(REFERENCE_FIGURE_METHODS)
     method_enabled = {
         method: tk.BooleanVar(value=method in initial_methods)
         for method in ALL_METHODS
@@ -185,7 +229,12 @@ def launch(args) -> None:
         text="Show live maps (recon heatmap first, then 4 belief windows)",
         variable=values["live_view"],
     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=2)
-    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 12)
+    ttk.Checkbutton(
+        form,
+        text="Run full Physical AI suite (includes Fig. 4 and Fig. 9 sweeps; may take hours)",
+        variable=values["full_physical_ai_suite"],
+    ).grid(row=12, column=0, columnspan=3, sticky="w", pady=2)
+    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 13)
     ttk.Label(
         form,
         text=(
@@ -194,7 +243,7 @@ def launch(args) -> None:
         ),
         wraplength=650,
         justify="left",
-    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
+    ).grid(row=14, column=0, columnspan=3, sticky="w", pady=3)
 
     ttk.Separator(form).grid(row=14, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
@@ -246,9 +295,12 @@ def launch(args) -> None:
             args.defense_method = selected_methods[0]
             args.compare = len(selected_methods) > 1
             args.comparison_methods = ",".join(selected_methods) if args.compare else None
+            full_suite = bool(values["full_physical_ai_suite"].get())
+            if full_suite and not is_physical_ai_method_selection(selected_methods):
+                raise ValueError("Run full Physical AI suite requires exactly the four Physical AI methods.")
             args.output_directory = values["output"].get().strip() or None
             args.manifest_path = values["manifest"].get().strip() or None
-            args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
+            args.seeds = values["seeds"].get().strip() if (values["multi_seed"].get() or full_suite) else None
             args.no_animation = (not values["live_view"].get()) or args.compare
             args.map_view = "combined" if values["map_view"].get() == "Combined observations" else "local"
             args.recon_steps = int(values["recon"].get())
@@ -292,6 +344,7 @@ def launch(args) -> None:
         )
         compare = bool(args.compare)
         multi_seed = bool(args.seeds)
+        physical_ai_workflow = is_physical_ai_method_selection(selected_methods)
 
         def finish(error=None) -> None:
             run_button.configure(state="normal")
@@ -299,16 +352,30 @@ def launch(args) -> None:
                 status_label.configure(text="Run failed.")
                 messagebox.showerror("Unable to run", str(error))
                 return
-            message = result_location_message(
-                config.logging.output_directory, compare=compare, multi_seed=multi_seed,
+            plot_directory = (
+                Path(config.logging.output_directory) / "aggregate" / "plots"
+                if physical_ai_workflow
+                else Path(config.logging.output_directory) / "plots"
             )
-            status_label.configure(text=f"Done. Diagrams: {config.logging.output_directory}\\plots")
+            message = (
+                f"Created results in {config.logging.output_directory}\n\n"
+                f"Physical AI aggregate diagrams:\n{plot_directory}"
+                if physical_ai_workflow
+                else result_location_message(
+                    config.logging.output_directory, compare=compare, multi_seed=multi_seed,
+                )
+            )
+            status_label.configure(text=f"Done. Diagrams: {plot_directory}")
             print(message, flush=True)
             messagebox.showinfo("Completed", message)
 
         def work() -> None:
             try:
-                if args.seeds:
+                if physical_ai_workflow:
+                    from .batch import parse_seed_spec
+                    seeds = parse_seed_spec(args.seeds) if args.seeds else (config.seed,)
+                    run_physical_ai_workflow(config, seeds, full_suite=full_suite)
+                elif args.seeds:
                     from .batch import parse_seed_spec, run_multiseed
                     methods = config.comparison_methods if compare else (config.fusion.method,)
                     run_multiseed(config, parse_seed_spec(args.seeds), methods=methods, comparison=compare, generate_per_run_plots=False)
@@ -342,7 +409,7 @@ def launch(args) -> None:
             seed = int(values["seed"].get().strip() or "15")
         except ValueError:
             seed = 15
-        seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
+        seeds = values["seeds"].get().strip() if (values["multi_seed"].get() or values["full_physical_ai_suite"].get()) else None
         return suggested_output_directory(
             method=next((method for method in ALL_METHODS if method_enabled[method].get()), "source_memory"),
             seed=seed,
@@ -376,7 +443,8 @@ def launch(args) -> None:
             from .batch import parse_seed_spec
             count = len(parse_seed_spec(values["seeds"].get()))
             methods = sum(1 for variable in method_enabled.values() if variable.get()) or 1
-            seed_preview.configure(text=f"{count} seeds x {methods} methods = {count * methods} simulations" if values["multi_seed"].get() else "")
+            active = values["multi_seed"].get() or values["full_physical_ai_suite"].get()
+            seed_preview.configure(text=f"{count} seeds x {methods} methods = {count * methods} simulations" if active else "")
         except Exception:
             seed_preview.configure(text="")
     values["seeds"].trace_add("write", update_preview)

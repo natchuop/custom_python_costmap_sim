@@ -75,6 +75,7 @@ class LoggingConfig:
     timeseries_period_steps: int = 5
     generate_plots: bool = True
     plot_format: str = "png"
+    measure_fusion_runtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,10 @@ class SimulationConfig:
     confidence_resend_delta: float = 0.10
     periodic_route_check_steps: int = 25
     periodic_route_improvement_epsilon: float = 0.01
+    condition_type: str = "baseline"
+    honest_report_delay_steps: int = 0
+    attack_intensity_condition: str | None = None
+    configured_attack_injections_per_1000_steps: float | None = None
 
     def validate(self) -> None:
         if self.seed < 0:
@@ -165,6 +170,10 @@ class SimulationConfig:
             raise ValueError("periodic route check must be positive")
         if self.periodic_route_improvement_epsilon < 0:
             raise ValueError("periodic route improvement epsilon must be nonnegative")
+        if self.honest_report_delay_steps < 0:
+            raise ValueError("honest report delay must be nonnegative")
+        if self.condition_type not in {"baseline", "no_attack", "attack_intensity", "honest_delay", "scalability"}:
+            raise ValueError("unknown experiment condition type")
         if self.visualization.map_view not in MAP_VIEWS:
             raise ValueError("map_view must be combined or local")
         if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:

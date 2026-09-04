@@ -112,6 +112,10 @@ class FusionEngine:
         """
         return int(self._active_malicious_claim_count)
 
+    def active_claim_count(self) -> int:
+        """Return the number of active stored claims without changing state."""
+        return len(self._active)
+
     def operational_weight(self, report: ClaimReport, step: int | None = None) -> float:
         """Operational fusion weight for an active report, after trust gating."""
         now = self._runner.current_timestamp if step is None else int(step)

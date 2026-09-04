@@ -255,6 +255,14 @@ def run_manifest_rollout(
         "malicious_reports_accepted": 0,
         "malicious_reports_influential": 0,
         "malicious_reports_operationally_ignored": 0,
+        "honest_reports_generated": 0,
+        "honest_report_deliveries": 0,
+        "honest_reports_accepted": 0,
+        "honest_reports_rejected": 0,
+        "honest_reports_operationally_ignored": 0,
+        "honest_report_ages": [],
+        "honest_report_outcomes": [],
+        "fusion_runtime_samples": [],
         "traffic_events": [],
         # Populated only by the attack-free authoring rollout.  It is not
         # written to result CSVs and cannot influence a defense replay.
@@ -275,6 +283,7 @@ def run_manifest_rollout(
     }
     attacks_by_step: dict[int, list] = {}
     attack_type_by_report_id: dict[str, str] = {}
+    pending_honest: dict[int, list[tuple[int, ClaimReport]]] = {}
     for event in manifest.attack_events:
         attacks_by_step.setdefault(int(event.step), []).append(event)
         for report_id in event.report_ids:
@@ -386,6 +395,11 @@ def run_manifest_rollout(
 
         deliveries: dict[int, list[ClaimReport]] = {robot.robot_id: [] for robot in robots}
 
+        for recipient_id, report in pending_honest.pop(step, ()):
+            deliveries[recipient_id].append(report)
+            log["honest_report_deliveries"] += 1
+            log["honest_report_ages"].append(step - report.observation_step)
+
         # Honest sharing. Sensor confidence is inherited from the LiDAR reading.
         for robot in robots:
             for observation in observations_by_robot[robot.robot_id]:
@@ -406,9 +420,16 @@ def run_manifest_rollout(
                     sensor_confidence=observation.sensor_confidence,
                 )
                 log["report_count_total"] += 1
+                log["honest_reports_generated"] += 1
                 for recipient in robots:
                     if recipient.robot_id != robot.robot_id:
-                        deliveries[recipient.robot_id].append(report)
+                        delivery_step = step + config.honest_report_delay_steps
+                        if delivery_step == step:
+                            deliveries[recipient.robot_id].append(report)
+                            log["honest_report_deliveries"] += 1
+                            log["honest_report_ages"].append(0)
+                        else:
+                            pending_honest.setdefault(delivery_step, []).append((recipient.robot_id, report))
 
         # Attack reports retain the manifest's observation_step. Attack targeting
         # itself is intentionally left to the separate attack-authoring work.
@@ -448,10 +469,41 @@ def run_manifest_rollout(
         for robot in robots:
             for report in deliveries[robot.robot_id]:
                 robot.receive(report)
-            accepted = robot.process_inbox(step, malicious_ids)
+            def runtime_observer(report, started_ns, finished_ns, before_count, after_count):
+                log["fusion_runtime_samples"].append({
+                    "step": step, "seed": config.seed, "method": method,
+                    "robot_id": robot.robot_id, "report_id": report.report_id,
+                    "report_is_malicious": report.report_id in malicious_ids,
+                    "fusion_update_runtime_ms": (finished_ns - started_ns) / 1_000_000.0,
+                    "update_runtime_ns": finished_ns - started_ns,
+                    "update_runtime_ms": (finished_ns - started_ns) / 1_000_000.0,
+                    "stored_evidence_count": after_count,
+                    "reports_considered": 1,
+                    "stored_evidence_count_before": before_count,
+                    "stored_evidence_count_after": after_count,
+                })
+            accepted = robot.process_inbox(
+                step,
+                malicious_ids,
+                runtime_observer=runtime_observer if config.logging.measure_fusion_runtime else None,
+            )
             accepted_ids = {report.report_id for report, _ in accepted}
             for report in deliveries[robot.robot_id]:
                 if report.report_id not in malicious_ids:
+                    accepted_here = report.report_id in accepted_ids
+                    operational_weight = robot.fusion.operational_weight(report, step) if accepted_here else 0.0
+                    log["honest_report_outcomes"].append({
+                        "step": step, "seed": config.seed, "method": method,
+                        "report_id": report.report_id, "source_id": report.sender_id,
+                        "created_step": report.observation_step, "delivered_step": step,
+                        "age_at_evaluation_steps": step - report.observation_step,
+                        "accepted": accepted_here, "rejected": not accepted_here,
+                        "operationally_ignored": bool(accepted_here and operational_weight <= 1e-12),
+                        "rejection_reason": "admission_rejected" if not accepted_here else "",
+                    })
+                    log["honest_reports_accepted"] += int(accepted_here)
+                    log["honest_reports_rejected"] += int(not accepted_here)
+                    log["honest_reports_operationally_ignored"] += int(accepted_here and operational_weight <= 1e-12)
                     continue
                 accepted_here = report.report_id in accepted_ids
                 evidence = robot.fusion.evidence(report.target_cell, step) if accepted_here else None
@@ -696,6 +748,10 @@ def _persist_event(event: dict, attacker_id: int) -> bool:
 
 def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest, method: str, world, robots, log: dict) -> tuple[dict, CsvMetrics]:
     collector = CsvMetrics()
+    for sample in log.get("fusion_runtime_samples", ()):
+        collector.fusion_runtime(**sample)
+    for outcome in log.get("honest_report_outcomes", ()):
+        collector.honest_report_outcome(**outcome)
     attacker_id = log.get("malicious_robot_id", manifest.malicious_robot_id)
     for event in log["events"]:
         if not _persist_event(event, attacker_id):
@@ -713,12 +769,37 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
     last_injection = max(log["attack_injection_steps"], default=None)
     ever_affected = any(sample["route_affected_by_attacker"] for sample in benign_samples)
     recovery = None
+    recovery_step = None
     if ever_affected and last_injection is not None:
-        for step in range(last_injection, config.total_steps):
+        for step in sorted({int(sample["step"]) for sample in benign_samples if int(sample["step"]) >= last_injection}):
             step_samples = [sample for sample in benign_samples if sample["step"] == step]
             if step_samples and all(not sample["route_affected_by_attacker"] for sample in step_samples):
                 recovery = step - last_injection
+                recovery_step = step
                 break
+    if last_injection is None:
+        recovery_status = "no_attack_injection"
+    elif not ever_affected:
+        recovery_status = "never_affected"
+    elif recovery_step is None:
+        recovery_status = "not_recovered_by_end"
+    else:
+        recovery_status = "recovered"
+    affected_steps = {
+        int(sample["step"])
+        for sample in benign_samples
+        if bool(sample.get("route_affected_by_attacker"))
+    }
+    recovery_episode = {
+        "seed": config.seed, "method": method,
+        "manifest_hash": scenario_manifest_hash(manifest),
+        "attack_episode_id": "aggregate_attack_episode",
+        "effect_start_step": min(affected_steps) if affected_steps else None,
+        "recovery_step": recovery_step,
+        "recovery_duration_steps": recovery,
+        "recovery_status": recovery_status,
+    }
+    collector.reference_recovery_episode(**recovery_episode)
     trust_events = log["trust_events"]
     traffic_counts = summarize_traffic_events(log.get("traffic_events", []))
     initial_trust = config.trust.prior_alpha / max(1e-12, config.trust.prior_alpha + config.trust.prior_beta)
@@ -764,6 +845,9 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
     def percentile(values, quantile):
         return float(np.percentile(values, quantile)) if values else None
 
+    runtime_values = [float(row["fusion_update_runtime_ms"]) for row in log.get("fusion_runtime_samples", [])]
+    honest_ages = [float(value) for value in log.get("honest_report_ages", [])]
+
     impact_events = [event for event in log["events"] if event.get("kind") == "attack_route_impact"]
     benign_replan_events = [
         event for event in log["events"]
@@ -792,11 +876,6 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
             per_attack_extra_lengths.append(max(extra_lengths))
         if any(bool(event.get("attack_induced_path_change")) for event in events):
             attack_ids_with_path_change.add(attack_id)
-    affected_steps = {
-        int(sample["step"])
-        for sample in benign_samples
-        if bool(sample.get("route_affected_by_attacker"))
-    }
     summary = {
         "method": method, "engine": "modular_native", "seed": config.seed,
         "steps_completed": config.total_steps, "attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
@@ -921,6 +1000,32 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "attacks_evaluated_for_route_impact": len(impacts_by_attack),
         "steps_route_affected_by_attacker": len(affected_steps),
         "recovery_time_steps": recovery,
+        "recovery_status": recovery_status,
+        "recovery_origin_step": last_injection,
+        "recovery_step": recovery_step,
+        "last_attack_injection_step": last_injection,
+        "configured_honest_report_delay_steps": config.honest_report_delay_steps,
+        "honest_reports_generated": log["honest_reports_generated"],
+        "honest_report_deliveries": log["honest_report_deliveries"],
+        "honest_reports_accepted": log["honest_reports_accepted"],
+        "honest_reports_rejected": log["honest_reports_rejected"],
+        "honest_reports_operationally_ignored": log["honest_reports_operationally_ignored"],
+        "honest_rejection_rate": log["honest_reports_rejected"] / log["honest_report_deliveries"] if log["honest_report_deliveries"] else None,
+        "honest_operational_ignore_rate": log["honest_reports_operationally_ignored"] / log["honest_report_deliveries"] if log["honest_report_deliveries"] else None,
+        "honest_report_age_mean_steps": sum(honest_ages) / len(honest_ages) if honest_ages else None,
+        "honest_report_age_p95_steps": percentile(honest_ages, 95),
+        "fusion_update_runtime_mean_ms": sum(runtime_values) / len(runtime_values) if runtime_values else None,
+        "fusion_update_runtime_median_ms": percentile(runtime_values, 50),
+        "fusion_update_runtime_p95_ms": percentile(runtime_values, 95),
+        "fusion_update_runtime_max_ms": max(runtime_values) if runtime_values else None,
+        "fusion_update_sample_count": len(runtime_values),
+        "max_stored_evidence_count": max((int(row["stored_evidence_count_after"]) for row in log.get("fusion_runtime_samples", [])), default=0),
+        "condition_type": config.condition_type,
+        "attack_intensity_condition": config.attack_intensity_condition,
+        "configured_attack_interval_min_steps": config.attacks.interval_min if config.condition_type == "attack_intensity" else None,
+        "configured_attack_interval_max_steps": config.attacks.interval_max if config.condition_type == "attack_intensity" else None,
+        "configured_attack_injections_per_1000_steps": config.configured_attack_injections_per_1000_steps,
+        "actual_attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
         "manifest_hash": manifest.map_hash, "map_hash": manifest.map_hash,
         "scenario_manifest_hash": scenario_manifest_hash(manifest),
     }

@@ -10,6 +10,7 @@ import ast
 import csv
 import json
 import math
+import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,27 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
+
+REFERENCE_FIGURE_METHODS = ("full_trust", "majority_vote", "trust_fused", "source_memory")
+REFERENCE_METHOD_LABELS = {
+    "full_trust": "Full trust", "majority_vote": "Majority vote",
+    "trust_fused": "Trust-fused", "source_memory": "Proposed",
+}
+REFERENCE_DELAY_PUBLICATION_METRIC = "honest_operational_ignore_rate"
+REFERENCE_DELAY_PUBLICATION_LABEL = "Legitimate reports operationally ignored (%)"
+PHYSICAL_AI_FIGURES = (
+    "A2_false_blockage_duration.png",
+    "A3_security_performance_tradeoff.png",
+    "A5_navigation_recovery_distribution.png",
+    "01_mission_deliveries.png",
+    "03_false_report_acceptance.png",
+    "04_map_error_vs_attack_intensity.png",
+    "05_computational_scalability.png",
+    "06_delivery_time.png",
+    "07_replans_per_delivery.png",
+    "08_report_influence_vs_age.png",
+    "09_legitimate_operational_ignore_vs_delay.png",
+)
 
 
 METHOD_ORDER = ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory", "soft_probability")
@@ -1332,14 +1354,16 @@ PAPER_METHOD_LABELS = {
     "trust_threshold": "Trust threshold",
 }
 PAPER_METHOD_COLORS = {
-    "full_trust": "#7f8794", "majority_vote": "#756bb1", "trust_fused": "#d95f02",
-    "source_memory": "#1f77b4", "latest_report": "#66a98f", "soft_probability": "#8c6d31",
+    "full_trust": "#aab4c0", "majority_vote": "#756bb1", "trust_fused": "#d95f02",
+    "source_memory": "#1776b6", "latest_report": "#66a98f", "soft_probability": "#8c6d31",
 }
+PHYSICAL_LINE_STYLES = {"full_trust": "--", "majority_vote": "-.", "trust_fused": ":", "source_memory": "-"}
+PHYSICAL_MARKERS = {"full_trust": "o", "majority_vote": "^", "trust_fused": "s", "source_memory": "D"}
 PAPER_METHOD_ORDER = ("full_trust", "majority_vote", "trust_fused", "source_memory", "source_linked", "latest_report", "soft_probability")
 
 
 def _paper_method_label(method):
-    return PAPER_METHOD_LABELS.get(method, str(method).replace("_", " ").title())
+    return REFERENCE_METHOD_LABELS.get(method, PAPER_METHOD_LABELS.get(method, str(method).replace("_", " ").title()))
 
 
 def _paper_color(method):
@@ -1348,7 +1372,8 @@ def _paper_color(method):
 
 def _paper_methods(raw):
     present = list(dict.fromkeys(row.get("method") for row in raw if row.get("method")))
-    rank = {name: index for index, name in enumerate(PAPER_METHOD_ORDER)}
+    order = REFERENCE_FIGURE_METHODS if present and all(name in REFERENCE_FIGURE_METHODS for name in present) else PAPER_METHOD_ORDER
+    rank = {name: index for index, name in enumerate(order)}
     return sorted(present, key=lambda name: (rank.get(name, len(rank)), name))
 
 
@@ -1405,7 +1430,7 @@ def _add_sample_size(ax, index, values, y):
     ax.text(index, y, f"n={len(values)}", ha="center", va="bottom", fontsize=8, color="0.35")
 
 
-def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, include_no_attack=False, no_attack_category=True):
+def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, include_no_attack=False, no_attack_category=True, no_attack_reference_values=None):
     methods = _paper_methods(raw)
     groups = [(method, _valid_values([row for row in raw if not (include_no_attack and parse_float(row.get("attack_actions")) == 0)], method, field, transform)) for method in methods]
     no_attack_values = []
@@ -1440,9 +1465,62 @@ def _paper_bar_plot(raw, field, ylabel, path, *, title=None, transform=None, inc
             ax.set_ylim(0, 102)
     if no_attack_values and not no_attack_category:
         ax.axhline(_mean_ci(no_attack_values)["mean"], color="0.25", linestyle="--", linewidth=1, label="No attack")
+    if no_attack_reference_values:
+        baseline = [float(value) for value in no_attack_reference_values if value is not None and math.isfinite(float(value))]
+        if baseline:
+            ax.axhline(_mean_ci(baseline)["mean"], color="0.25", linestyle="--", linewidth=1, label="No attack mean")
     if title:
         ax.set_title(title)
     _paper_axes(ax); fig.tight_layout(); _annotate_batch_validation(fig, path); _save(fig, path)
+    return True
+
+
+def _condition_values_by_seed(raw, field, transform=None):
+    grouped = {}
+    for row in raw:
+        value = parse_float(row.get(field))
+        if value is None or not math.isfinite(value):
+            continue
+        if transform is not None:
+            value = transform(value)
+        grouped.setdefault(row.get("seed"), []).append(value)
+    return [sum(values) / len(values) for _, values in sorted(grouped.items(), key=lambda item: str(item[0]))]
+
+
+def _physical_bar_plot(raw, field, ylabel, path, *, transform=None, no_attack_raw=None,
+                       no_attack_mode=None, show_points=True):
+    groups = [(method, _valid_values(raw, method, field, transform)) for method in REFERENCE_FIGURE_METHODS]
+    if any(not values for _, values in groups):
+        return False
+    no_attack_values = _condition_values_by_seed(no_attack_raw or [], field, transform)
+    if no_attack_mode and not no_attack_values:
+        return False
+    plotted = list(groups)
+    if no_attack_mode == "bar":
+        plotted.append((None, no_attack_values))
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    x = np.arange(len(plotted))
+    colors = [_paper_color(method) if method else "#b8d8b0" for method, _ in plotted]
+    means = [_mean_ci(values)["mean"] for _, values in plotted]
+    ax.bar(x, means, width=.56, color=colors, edgecolor="0.28", linewidth=.6, alpha=.86)
+    for index, (_, values) in enumerate(plotted):
+        stats = _mean_ci(values)
+        if show_points and index < len(groups):
+            _plot_seed_points(ax, index, values, color="#424242", size=24, alpha=.56)
+        if stats["ci95_low"] is not None:
+            ax.errorbar(index, stats["mean"], yerr=[[stats["mean"] - stats["ci95_low"]], [stats["ci95_high"] - stats["mean"]]], fmt="none", ecolor="0.12", capsize=4, linewidth=1.1, zorder=4)
+    labels = [_paper_method_label(method) if method else "No attack" for method, _ in plotted]
+    ax.set(xticks=x, xticklabels=labels, ylabel=ylabel)
+    ax.set_ylim(bottom=0)
+    if ylabel == "False reports accepted (%)":
+        ax.set_ylim(0, 102)
+    if no_attack_mode == "reference":
+        stats = _mean_ci(no_attack_values)
+        if stats["ci95_low"] is not None and stats["ci95_high"] is not None:
+            ax.axhspan(stats["ci95_low"], stats["ci95_high"], color="#78a878", alpha=.12)
+        ax.axhline(stats["mean"], color="#3e8c82", linestyle="--", linewidth=1.4, label="No-attack reference")
+        _safe_legend(ax, loc="best")
+    _paper_axes(ax); fig.tight_layout(); _save(fig, path)
     return True
 
 
@@ -1452,16 +1530,16 @@ def _plot_paper_a2(raw, path):
     groups = [(method, values) for method, values in groups if values]
     if not groups:
         return False
-    fig, ax = plt.subplots(figsize=(max(7, len(groups) * 1.45), 5.2))
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
     minimum = min(value for _, values in groups for value in values); maximum = max(value for _, values in groups for value in values)
     span = max(maximum - minimum, 1.0); label_y = minimum - span * .12
     for index, (method, values) in enumerate(groups):
-        _plot_seed_points(ax, index, values, color=_paper_color(method), size=30)
-        ax.scatter(index, np.median(values), marker="D", s=88, color="black", zorder=4)
+        _plot_seed_points(ax, index, values, color=_paper_color(method), size=28, alpha=.62)
+        ax.scatter(index, np.median(values), marker="D", s=68, color="black", zorder=4)
         _add_sample_size(ax, index, values, label_y)
-    ax.set(xticks=range(len(groups)), xticklabels=[_paper_method_label(m) for m, _ in groups], ylabel="Attack-affected route duration (steps)")
+    ax.set(xticks=range(len(groups)), xticklabels=[_paper_method_label(m) for m, _ in groups], ylabel="False-blockage duration (steps)")
     ax.set_ylim(min(label_y - span * .02, minimum - span * .02), maximum + span * .08)
-    fig.text(.5, .01, "Circles show individual runs; diamonds show medians.", ha="center", fontsize=8, color="0.35")
+    fig.text(.5, .012, "Circles show individual runs; diamonds show medians.", ha="center", fontsize=8, color="0.35")
     _paper_axes(ax); fig.tight_layout(rect=(0, .04, 1, 1)); _save(fig, path); return True
 
 
@@ -1482,15 +1560,29 @@ def _plot_paper_a3(raw, path):
             points.append((method, sum(xs) / len(xs), sum(ys) / len(ys)))
     if not points:
         return False
-    fig, ax = plt.subplots(figsize=(8, 5.5))
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    label_offsets = {
+        "full_trust": (-10, -10),
+        "majority_vote": (-10, 10),
+        "trust_fused": (8, 8),
+        "source_memory": (8, -9),
+    }
     for index, (method, x, y) in enumerate(points):
-        ax.scatter(x, y, s=100, color=_paper_color(method), edgecolor="black", linewidth=.6, zorder=3)
-        ax.annotate(_paper_method_label(method), (x, y), xytext=(7, 5), textcoords="offset points", fontsize=9)
+        ax.scatter(x, y, s=100, marker=PHYSICAL_MARKERS[method], color=_paper_color(method), edgecolor="black", linewidth=.6, zorder=3)
+        offset = label_offsets[method]
+        ax.annotate(_paper_method_label(method), (x, y), xytext=offset, textcoords="offset points",
+                    ha="right" if offset[0] < 0 else "left", fontsize=9)
     ax.set(xlabel="False reports accepted (%)", ylabel="Mean delivery-cycle duration (steps)", title="Security/performance tradeoff")
-    x_values = [x for _, x, _ in points]
-    x_min, x_max = min(x_values), max(x_values)
-    x_padding = max((x_max - x_min) * .12, 2.0)
-    ax.set_xlim(max(0.0, x_min - x_padding), x_max + x_padding)
+    ax.set_xlim(0, 102)
+    ax.set_xticks((0, 20, 40, 60, 80, 100))
+    y_values = [y for _, _, y in points]
+    y_center = float(np.median(y_values)); minimum_span = max(14.0, abs(y_center) * .14)
+    y_min, y_max = min(y_values), max(y_values); span = max(y_max - y_min, minimum_span)
+    lower = max(0.0, y_min - span * .25); upper = lower + span * 1.25
+    ax.set_ylim(lower, upper)
+    ax.axvspan(0, 20, color="#dcefd8", alpha=.18, zorder=0)
+    ax.axhspan(lower, lower + span * .25, color="#dcefd8", alpha=.18, zorder=0)
+    ax.text(.02, .04, "Preferred direction", transform=ax.transAxes, fontsize=8, color="#47704a")
     _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
 
@@ -1516,6 +1608,8 @@ def _gaussian_kde_numpy(values, grid):
         return np.zeros_like(grid)
     std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
     span = float(np.ptp(values)); bandwidth = 1.06 * std * max(len(values), 2) ** (-.2)
+    # Deterministic Scott bandwidth with a small floor. The caller clips the
+    # support to observed values plus capped, modest right padding.
     bandwidth = max(bandwidth, span / 50.0, 1.0)
     # Reflection at zero avoids assigning mass to impossible negative ages.
     samples = np.concatenate((values, -values))
@@ -1524,23 +1618,28 @@ def _gaussian_kde_numpy(values, grid):
     return density
 
 
-def _plot_paper_a5(raw, path):
-    methods = _paper_methods(raw); groups = [(m, _valid_values(raw, m, "recovery_time_steps")) for m in methods]
-    groups = [(m, values) for m, values in groups if values]
-    if not groups or not any(len(values) >= 5 for _, values in groups):
+def _plot_paper_a5(raw, path, *, annotate_status=False):
+    methods = _paper_methods(raw)
+    groups = []
+    for method in methods:
+        recovered = [row for row in raw if row.get("method") == method and row.get("recovery_status") == "recovered"]
+        groups.append((method, _valid_values(recovered, method, "recovery_time_steps")))
+    if len(groups) != len(REFERENCE_FIGURE_METHODS) or any(len(values) < 5 for _, values in groups):
         return False
-    all_values = np.concatenate([np.asarray(values) for _, values in groups]); lo, hi = max(0.0, float(all_values.min())), max(0.0, float(all_values.max()))
-    grid_hi = max(hi * 1.08, 2.0 if hi == 0 else hi + max(1.0, hi * .04))
-    grid = np.linspace(0.0, grid_hi, 300); fig, ax = plt.subplots(figsize=(8, 4.8))
+    all_values = np.concatenate([np.asarray(values) for _, values in groups]); hi = max(0.0, float(all_values.max()))
+    padding = max(2.0, min(12.0, hi * .04))
+    grid_hi = max(2.0, hi + padding)
+    grid = np.linspace(0.0, grid_hi, 300); fig, ax = plt.subplots(figsize=(7.8, 4.6))
     for index, (method, values) in enumerate(groups):
         baseline = len(groups) - index
         if len(values) >= 5:
             density = _gaussian_kde_numpy(values, grid); height = density / density.max() * .72 if density.max() else density
-            ax.fill_between(grid, baseline, baseline + height, color=_paper_color(method), alpha=.48)
-            ax.plot(grid, baseline + height, color=_paper_color(method), linewidth=1.1)
+            ax.fill_between(grid, baseline, baseline + height, color=_paper_color(method), alpha=.42)
+            ax.plot(grid, baseline + height, color=_paper_color(method), linewidth=1.25)
         else:
             ax.scatter(values, np.full(len(values), baseline + .04), color=_paper_color(method), s=28, zorder=3)
-        ax.text(grid[-1] + (grid[-1] - grid[0]) * .02, baseline + .25, _paper_method_label(method), va="center", fontsize=9)
+        label = f"{_paper_method_label(method)}  n={len(values)}"
+        ax.text(grid[-1] + (grid[-1] - grid[0]) * .02, baseline + .25, label, va="center", fontsize=8)
     ax.set(xlim=(grid[0], grid[-1] * 1.18 if grid[-1] > 0 else 1), yticks=[], xlabel="Time until normal routing resumes (steps)")
     _paper_axes(ax, grid_axis="x"); fig.tight_layout(); _save(fig, path); return True
 
@@ -1672,6 +1771,548 @@ def _plot_paper_delay_tolerance(raw, path):
             ax.plot([d for d, _ in points], [s["mean"] for _, s in points], marker="o", label=_paper_method_label(method), color=_paper_color(method))
     ax.set(xlabel="Communication delay (steps)", ylabel="Legitimate reports rejected (%)"); _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
 
+
+def _reference_filter_runs(runs):
+    return [(seed, method, data) for seed, method, data in runs if method in REFERENCE_FIGURE_METHODS]
+
+
+def _reference_condition_runs(root):
+    return [run for batch_root in _reference_batch_roots(root) for run in _multiseed_runs(batch_root)]
+
+
+def _reference_raw(runs):
+    raw = []
+    for seed, method, data in _reference_filter_runs(runs):
+        row = dict(data.summary); row.update({"seed": seed, "method": method})
+        for field in MULTISEED_DIRECTIONS:
+            row[field] = _seed_metric(data, field)
+        raw.append(row)
+    return raw
+
+
+def _reference_manifest_hashes(runs, *, group_by=None):
+    """Validate method pairing per seed, optionally scoped to a treatment."""
+    grouped = {}
+    for seed, method, data in _reference_filter_runs(runs):
+        key = group_by(seed, method, data) if group_by is not None else seed
+        grouped.setdefault(key, {})[method] = data.summary.get("scenario_manifest_hash", data.summary.get("manifest_hash", ""))
+    mismatches = {key: values for key, values in grouped.items() if set(values) != set(REFERENCE_FIGURE_METHODS) or len(set(values.values())) != 1}
+    return grouped, mismatches
+
+
+def _reference_batch_roots(root):
+    root = Path(root)
+    if (root / "batch_status.csv").exists():
+        return (root,)
+    if not root.exists():
+        return ()
+    active_treatments = None
+    try:
+        active_treatments = set(json.loads((root / "reference_sweep.json").read_text(encoding="utf-8")).get("treatments", ()))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return tuple(
+        child for child in sorted(root.iterdir())
+        if child.is_dir() and (child / "batch_status.csv").exists()
+        and (active_treatments is None or child.name in active_treatments)
+    )
+
+
+def _reference_treatment_pairing(root):
+    """Validate every treatment directory independently across the four methods."""
+    details = {}
+    for batch_root in _reference_batch_roots(root):
+        grouped, mismatches = _reference_manifest_hashes(_multiseed_runs(batch_root))
+        metadata = {}
+        try:
+            metadata = json.loads((batch_root / "reference_condition.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        treatment = metadata.get("attack_intensity_condition")
+        if treatment is None and metadata.get("condition_type") == "honest_delay":
+            treatment = f"delay_{metadata.get('configured_honest_report_delay_steps')}"
+        label = str(treatment if treatment is not None else batch_root.name)
+        details[label] = {
+            "paired": not mismatches,
+            "seed_count": len(grouped),
+            "mismatched_seeds": sorted(map(str, mismatches)),
+            "hashes_by_seed": {str(seed): values for seed, values in grouped.items()},
+        }
+    return details
+
+
+def _runtime_plot_rows(runs):
+    filtered = _reference_filter_runs(runs)
+    maximum = max((parse_int(data.summary.get("max_stored_evidence_count"), 0) or 0 for _, _, data in filtered), default=0)
+    if maximum <= 0:
+        return []
+    bin_count = 5
+    states = {}
+    sample_limit = 20_000
+    for _, method, data in filtered:
+        path = data.directory / "fusion_runtime_samples.csv"
+        if not path.exists():
+            continue
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                evidence = parse_float(row.get("stored_evidence_count") or row.get("stored_evidence_count_after"))
+                runtime = parse_float(row.get("update_runtime_ms") or row.get("fusion_update_runtime_ms"))
+                if evidence is None or runtime is None or not math.isfinite(runtime):
+                    continue
+                index = min(bin_count - 1, int(max(0.0, evidence - 1.0) * bin_count / maximum))
+                state = states.setdefault((method, index), {"n": 0, "mean": 0.0, "m2": 0.0, "max": 0.0, "stride": 1, "runtime_sample": [], "evidence_sample": []})
+                state["n"] += 1
+                delta = runtime - state["mean"]
+                state["mean"] += delta / state["n"]
+                state["m2"] += delta * (runtime - state["mean"])
+                state["max"] = max(state["max"], runtime)
+                if state["n"] % state["stride"] == 0:
+                    state["runtime_sample"].append(runtime); state["evidence_sample"].append(evidence)
+                    if len(state["runtime_sample"]) > sample_limit:
+                        state["runtime_sample"] = state["runtime_sample"][::2]
+                        state["evidence_sample"] = state["evidence_sample"][::2]
+                        state["stride"] *= 2
+    rows = []
+    for method in REFERENCE_FIGURE_METHODS:
+        for index in range(bin_count):
+            state = states.get((method, index))
+            if not state:
+                continue
+            values = state["runtime_sample"]; evidence = state["evidence_sample"]
+            low = int(index * maximum / bin_count) + 1
+            high = int((index + 1) * maximum / bin_count)
+            sample_std = math.sqrt(state["m2"] / (state["n"] - 1)) if state["n"] > 1 else None
+            ci = 1.96 * sample_std / math.sqrt(state["n"]) if sample_std is not None else None
+            rows.append({"method": method, "bin": index, "evidence_count_min": low, "evidence_count_max": high,
+                         "evidence_count_median": float(np.median(evidence)), "n": state["n"],
+                         "quantile_sample_count": len(values), "quantile_sample_stride": state["stride"],
+                         "runtime_mean_ms": state["mean"], "runtime_median_ms": float(np.median(values)),
+                         "runtime_p95_ms": float(np.percentile(values, 95)), "runtime_max_ms": state["max"],
+                         "runtime_ci95_low_ms": state["mean"] - ci if ci is not None else None,
+                         "runtime_ci95_high_ms": state["mean"] + ci if ci is not None else None})
+    return rows
+
+
+def _cached_runtime_plot_rows(runs, path):
+    path = Path(path)
+    sources = [data.directory / "fusion_runtime_samples.csv" for _, _, data in _reference_filter_runs(runs)]
+    sources = [source for source in sources if source.exists()]
+    if path.exists() and sources and path.stat().st_mtime >= max(source.stat().st_mtime for source in sources):
+        numeric = {"bin", "evidence_count_max", "evidence_count_median", "evidence_count_min", "n",
+                   "quantile_sample_count", "quantile_sample_stride", "runtime_ci95_high_ms",
+                   "runtime_ci95_low_ms", "runtime_max_ms", "runtime_mean_ms", "runtime_median_ms",
+                   "runtime_p95_ms"}
+        return [{key: parse_float(value) if key in numeric else value for key, value in row.items()} for row in read_csv_rows(path)]
+    return _runtime_plot_rows(runs)
+
+
+def _plot_reference_scalability(rows, path):
+    if not rows:
+        return False
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    for method in REFERENCE_FIGURE_METHODS:
+        method_rows = sorted((row for row in rows if row.get("method") == method), key=lambda row: row["evidence_count_median"])
+        if not method_rows:
+            continue
+        xs = [row["evidence_count_median"] for row in method_rows]; ys = [row["runtime_mean_ms"] for row in method_rows]
+        ax.plot(xs, ys, marker=PHYSICAL_MARKERS[method], linestyle=PHYSICAL_LINE_STYLES[method], label=_paper_method_label(method), color=_paper_color(method))
+        lows = [row["runtime_ci95_low_ms"] for row in method_rows]; highs = [row["runtime_ci95_high_ms"] for row in method_rows]
+        if all(value is not None for value in lows + highs):
+            ax.fill_between(xs, lows, highs, color=_paper_color(method), alpha=.10)
+    ax.set(xlabel="Stored evidence count", ylabel="Map update time (ms)", title="Map update cost")
+    ax.text(.99, .02, "20 ms update budget (above measured scale)", transform=ax.transAxes, ha="right", fontsize=8, color="#3e8c82")
+    _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _write_influence_probe(path, *, decay_rate, max_claim_age, threshold):
+    from .fusion import FusionEngine
+    from .models import ClaimReport, ClaimType
+    from .trust import make_trust_model
+    rows = []
+    ages = range(max_claim_age + 1)
+    for method in REFERENCE_FIGURE_METHODS:
+        trust = make_trust_model("bayesian", 9.0, 1.0, evidence_cap=12.0, confirmation_multiplier=.25, contradiction_multiplier=6.0, memory_recovery_rate=.05)
+        fusion = FusionEngine(method, trust.score, trust_memory_score=trust.memory_score, decay_rate=decay_rate, max_claim_age=max_claim_age, trust_threshold=threshold)
+        report = ClaimReport("reference-probe", 7, (2, 2), ClaimType.BLOCKED, 0, sensor_confidence=1.0)
+        fusion.add(report)
+        raw_values = [fusion.operational_weight(report, age) for age in ages]
+        origin = raw_values[0] or 1.0
+        for age, raw_value in zip(ages, raw_values):
+            rows.append({"method": method, "report_age": age, "report_age_steps": age,
+                         "raw_influence": raw_value,
+                         "normalized_influence_percent": raw_value / origin * 100.0,
+                         "normalized_influence": raw_value / origin * 100.0,
+                         "probe_source_trust": trust.score(7), "probe_source_memory": trust.memory_score(7),
+                         "probe_sensor_confidence": 1.0,
+                         "source_trust": trust.score(7), "source_memory": trust.memory_score(7),
+                         "sensor_confidence": 1.0, "max_claim_age": max_claim_age,
+                         "production_function_used": "FusionEngine.operational_weight -> DefenseMethodRunner.active_claim_weight"})
+    _write_rows(path, rows)
+    return rows
+
+
+def _plot_reference_intensity(raw, path):
+    groups = {}
+    for row in raw:
+        x = parse_float(row.get("configured_attack_injections_per_1000_steps")); y = parse_float(row.get("map_error_mean"))
+        if x is not None and y is not None:
+            groups.setdefault((row.get("method"), round(x, 6)), []).append(y * 100.0)
+    xs = sorted({x for _, x in groups})
+    if len(xs) < 2 or not all(any(method == m and x == target for method, x in groups) for target in xs for m in REFERENCE_FIGURE_METHODS):
+        return False
+    fig, ax = plt.subplots(figsize=(7.8, 4.6))
+    for method in REFERENCE_FIGURE_METHODS:
+        points = [(x, _mean_ci(groups[(method, x)])) for x in xs]
+        ax.plot(xs, [stats["mean"] for _, stats in points], marker=PHYSICAL_MARKERS[method], markersize=5,
+                linewidth=1.7, linestyle=PHYSICAL_LINE_STYLES[method], label=_paper_method_label(method), color=_paper_color(method))
+        if all(stats["ci95_low"] is not None for _, stats in points):
+            ax.fill_between(xs, [max(0.0, stats["ci95_low"]) for _, stats in points], [stats["ci95_high"] for _, stats in points], color=_paper_color(method), alpha=.14)
+    ax.set(xlabel="Configured attack injections per 1000 simulation steps", ylabel="Incorrect map cells (%)")
+    ax.set_ylim(bottom=0)
+    _safe_legend(ax, loc="upper left"); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_reference_delay(raw, path):
+    groups = {}
+    for row in raw:
+        delay = parse_float(row.get("configured_honest_report_delay_steps"))
+        rate = parse_float(row.get(REFERENCE_DELAY_PUBLICATION_METRIC))
+        if delay is not None and rate is not None:
+            groups.setdefault((row.get("method"), delay), []).append(rate * 100.0)
+    delays = sorted({delay for _, delay in groups})
+    if len(delays) < 2 or not all(any(method == m and delay == target for method, delay in groups) for target in delays for m in REFERENCE_FIGURE_METHODS):
+        return False
+    fig, ax = plt.subplots(figsize=(7.8, 4.6))
+    for method in REFERENCE_FIGURE_METHODS:
+        points = [(delay, _mean_ci(groups[(method, delay)])) for delay in delays]
+        ax.plot(delays, [stats["mean"] for _, stats in points], marker=PHYSICAL_MARKERS[method], markersize=5,
+                linewidth=1.7, linestyle=PHYSICAL_LINE_STYLES[method], label=_paper_method_label(method), color=_paper_color(method))
+        if all(stats["ci95_low"] is not None for _, stats in points):
+            ax.fill_between(delays, [max(0.0, stats["ci95_low"]) for _, stats in points],
+                            [min(100.0, stats["ci95_high"]) for _, stats in points],
+                            color=_paper_color(method), alpha=.14)
+    ax.set(ylabel=REFERENCE_DELAY_PUBLICATION_LABEL, title="Operationally ignored legitimate reports")
+    ax.set_xlabel("Communication delay (steps)")
+    ax.xaxis.set_label_coords(.5, -.10)
+    observed = [value for values in groups.values() for value in values]
+    ax.set_ylim(0, min(100.0, max(5.0, max(observed, default=0.0) * 1.08)))
+    _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path); return True
+
+
+def _plot_probe_rows(rows, path):
+    ages = sorted({parse_float(row.get("report_age_steps")) for row in rows})
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    for method in REFERENCE_FIGURE_METHODS:
+        values = [row for row in rows if row.get("method") == method]
+        if not values:
+            continue
+        curve = [parse_float(next(row["normalized_influence"] for row in values if parse_float(row["report_age_steps"]) == age)) for age in ages]
+        ax.plot(ages, curve, label=_paper_method_label(method), color=_paper_color(method),
+                linewidth=2 if method == "source_memory" else 1.4,
+                linestyle=PHYSICAL_LINE_STYLES[method], marker=PHYSICAL_MARKERS[method],
+                markevery=max(1, len(ages) // 10), markersize=3.5)
+    ax.set(xlabel="Age of obstacle report (steps)", ylabel="Normalized influence remaining (%)", title="Report influence vs age", ylim=(0, 100))
+    _safe_legend(ax); _paper_axes(ax, grid_axis="both"); fig.tight_layout(); _save(fig, path)
+
+
+def _reference_machine_metadata():
+    metadata = {
+        "os": platform.platform(),
+        "python_version": sys.version,
+        "cpu_model": platform.processor() or None,
+        "logical_cpu_count": __import__("os").cpu_count(),
+        "memory_bytes": None,
+    }
+    try:
+        import psutil
+        metadata["memory_bytes"] = int(psutil.virtual_memory().total)
+    except (ImportError, AttributeError, OSError):
+        pass
+    return metadata
+
+
+def _aggregate_treatment_rows(raw, x_field, y_field, *, transform=lambda value: value):
+    rows = []
+    for method in REFERENCE_FIGURE_METHODS:
+        levels = sorted({parse_float(row.get(x_field)) for row in raw if row.get("method") == method and parse_float(row.get(x_field)) is not None})
+        for level in levels:
+            values = [transform(parse_float(row.get(y_field))) for row in raw if row.get("method") == method and parse_float(row.get(x_field)) == level and parse_float(row.get(y_field)) is not None]
+            attack_actions = [parse_float(row.get("actual_attack_actions")) for row in raw if row.get("method") == method and parse_float(row.get(x_field)) == level and parse_float(row.get("actual_attack_actions")) is not None]
+            stats = _mean_ci(values)
+            rows.append({"method": method, "treatment_level": level, "n": stats["n"], "mean": stats["mean"],
+                         "ci95_low": stats["ci95_low"], "ci95_high": stats["ci95_high"], "median": stats["median"],
+                         "actual_attack_actions_mean": float(np.mean(attack_actions)) if attack_actions else None,
+                         "actual_attack_actions_min": min(attack_actions) if attack_actions else None,
+                         "actual_attack_actions_max": max(attack_actions) if attack_actions else None})
+    return rows
+
+
+def _treatment_diagnostics(raw, x_field):
+    """Keep configured treatment, sample counts, and observed attack load auditable."""
+    rows = []
+    for method in REFERENCE_FIGURE_METHODS:
+        levels = sorted({parse_float(row.get(x_field)) for row in raw if row.get("method") == method and parse_float(row.get(x_field)) is not None})
+        for level in levels:
+            matching = [row for row in raw if row.get("method") == method and parse_float(row.get(x_field)) == level]
+            actions = [parse_float(row.get("actual_attack_actions")) for row in matching if parse_float(row.get("actual_attack_actions")) is not None]
+            rows.append({
+                "method": method,
+                "treatment_level": level,
+                "run_count": len(matching),
+                "seed_count": len({row.get("seed") for row in matching}),
+                "actual_attack_actions_mean": float(np.mean(actions)) if actions else None,
+                "actual_attack_actions_min": min(actions) if actions else None,
+                "actual_attack_actions_max": max(actions) if actions else None,
+            })
+    return rows
+
+
+def _write_physical_plot_data(plot_data, *, raw, no_attack_raw, intensity_raw, delay_raw, runtime_rows, probe_rows):
+    plot_data.mkdir(parents=True, exist_ok=True)
+    _write_rows(plot_data / "A2_false_blockage_duration.csv", [{"seed": row.get("seed"), "method": row.get("method"), "duration_steps": row.get("steps_route_affected_by_attacker")} for row in raw])
+    a3 = []
+    for method in REFERENCE_FIGURE_METHODS:
+        x = _valid_values(raw, method, "false_acceptance_rate", lambda value: value * 100.0)
+        y = _valid_values(raw, method, "benign_delivery_cycle_duration_mean_steps")
+        if x and y:
+            a3.append({"method": method, "false_reports_accepted_percent": float(np.mean(x)), "delivery_cycle_duration_mean_steps": float(np.mean(y)), "n": min(len(x), len(y))})
+    _write_rows(plot_data / "A3_security_performance_tradeoff.csv", a3)
+    _write_rows(plot_data / "A5_navigation_recovery_distribution.csv", [{"seed": row.get("seed"), "method": row.get("method"), "recovery_status": row.get("recovery_status"), "recovery_time_steps": row.get("recovery_time_steps")} for row in raw])
+    for filename, field, transform in (("01_mission_deliveries.csv", "benign_total_deliveries_completed", None),
+                                       ("03_false_report_acceptance.csv", "false_acceptance_rate", lambda value: value * 100.0),
+                                       ("06_delivery_time.csv", "benign_delivery_cycle_duration_mean_steps", None),
+                                       ("07_replans_per_delivery.csv", "replans_per_delivery", None)):
+        rows = []
+        for condition, source in (("attack", raw), ("no_attack", no_attack_raw)):
+            for row in source:
+                value = parse_float(row.get(field))
+                if value is not None:
+                    rows.append({"seed": row.get("seed"), "method": row.get("method"), "condition": condition, "value": transform(value) if transform else value})
+        _write_rows(plot_data / filename, rows)
+    _write_rows(plot_data / "04_map_error_vs_attack_intensity.csv", _aggregate_treatment_rows(intensity_raw, "configured_attack_injections_per_1000_steps", "map_error_mean", transform=lambda value: value * 100.0))
+    _write_rows(plot_data / "05_computational_scalability.csv", runtime_rows)
+    _write_rows(plot_data / "08_report_influence_vs_age.csv", probe_rows)
+    _write_rows(plot_data / "09_legitimate_operational_ignore_vs_delay.csv", _aggregate_treatment_rows(
+        delay_raw, "configured_honest_report_delay_steps", REFERENCE_DELAY_PUBLICATION_METRIC,
+        transform=lambda value: value * 100.0,
+    ))
+    # Admission rejection is retained as a separate diagnostic; it is not the
+    # publication quantity because stale accepted reports are ignored later.
+    _write_rows(plot_data / "09_legitimate_rejection_vs_delay.csv", _aggregate_treatment_rows(delay_raw, "configured_honest_report_delay_steps", "honest_rejection_rate", transform=lambda value: value * 100.0))
+
+
+def _write_reference_validation(root, aggregate, output, *, runs, raw, no_attack_raw, intensity_raw, delay_raw,
+                                generated, skipped, failed, warnings, mismatches):
+    source_fields = {
+        "A2_false_blockage_duration.png": ["steps_route_affected_by_attacker"],
+        "A3_security_performance_tradeoff.png": ["false_acceptance_rate", "benign_delivery_cycle_duration_mean_steps"],
+        "A5_navigation_recovery_distribution.png": ["recovery_episodes.csv", "recovery_time_steps", "recovery_status"],
+        "01_mission_deliveries.png": ["benign_total_deliveries_completed", "no_attack condition"],
+        "03_false_report_acceptance.png": ["false_acceptance_rate", "malicious_report_deliveries"],
+        "04_map_error_vs_attack_intensity.png": ["configured_attack_injections_per_1000_steps", "map_error_mean"],
+        "05_computational_scalability.png": ["fusion_runtime_samples.csv", "stored_evidence_count", "update_runtime_ms"],
+        "06_delivery_time.png": ["benign_delivery_cycle_duration_mean_steps", "no_attack condition"],
+        "07_replans_per_delivery.png": ["replans_per_delivery", "no_attack condition"],
+        "08_report_influence_vs_age.png": ["production FusionEngine operational_weight probe"],
+        "09_legitimate_operational_ignore_vs_delay.png": [
+            "configured_honest_report_delay_steps",
+            "honest_operational_ignore_rate",
+            "honest_reports_operationally_ignored",
+            "honest_report_deliveries",
+            "honest_rejection_rate (diagnostic)",
+        ],
+    }
+    all_files = list(source_fields)
+    status = {}
+    for filename in all_files:
+        failure = next((item for item in failed if item["filename"] == filename), None)
+        if failure:
+            state = "FAIL"
+            note = failure["error"]
+        elif filename in generated:
+            figure_warnings = [warning for warning in warnings if warning.startswith(filename + ":")]
+            state = "PASS_WITH_WARNING" if figure_warnings else "PASS"
+            note = "; ".join(figure_warnings) if figure_warnings else "figure and source measurements are available"
+        else:
+            state = "BLOCKED"
+            note = next((item["reason"] for item in skipped if item["filename"] == filename), "source measurements are unavailable")
+        status[filename] = {
+            "status": state, "source_fields": source_fields[filename],
+            "methods_displayed": [REFERENCE_METHOD_LABELS[method] for method in REFERENCE_FIGURE_METHODS] if state.startswith("PASS") else [],
+            "seed_count": len({row.get("seed") for row in raw}), "note": note,
+            "confidence_interval_method": "two-sided 95% t interval for run-level means when n >= 2",
+            "units": "steps or native metric units; percentages are fractions multiplied by 100",
+            "manifest_pairing_passed": not mismatches,
+        }
+    baseline_pairing = _reference_treatment_pairing(root / "baseline_multiseed")
+    if not baseline_pairing:
+        baseline_pairing = {"baseline": {"paired": not mismatches, "seed_count": len({seed for seed, _, _ in runs}),
+                                          "mismatched_seeds": sorted(map(str, mismatches)), "hashes_by_seed": {}}}
+    condition_pairing = {"baseline": all(item["paired"] for item in baseline_pairing.values())}
+    pairing_details = {"baseline": baseline_pairing}
+    intensity_root = root / "sweeps" / "attack_intensity" if (root / "sweeps" / "attack_intensity").exists() else root / "attack_intensity_sweep"
+    delay_root = root / "sweeps" / "honest_delay" if (root / "sweeps" / "honest_delay").exists() else root / "delay_sweep"
+    for label, condition_root in (("no_attack", root / "no_attack"),
+                                  ("attack_intensity", intensity_root),
+                                  ("honest_delay", delay_root)):
+        details = _reference_treatment_pairing(condition_root)
+        if details:
+            pairing_details[label] = details
+            condition_pairing[label] = all(item["paired"] for item in details.values())
+    status["04_map_error_vs_attack_intensity.png"]["manifest_pairing_passed"] = condition_pairing.get("attack_intensity", False)
+    status["09_legitimate_operational_ignore_vs_delay.png"]["manifest_pairing_passed"] = condition_pairing.get("honest_delay", False)
+    for filename in ("01_mission_deliveries.png", "06_delivery_time.png", "07_replans_per_delivery.png"):
+        status[filename]["manifest_pairing_passed"] = condition_pairing["baseline"] and condition_pairing.get("no_attack", False)
+    configs = [_load_effective_config(data) for _, _, data in runs]
+    configs = [config for config in configs if config]
+    attack_types = sorted({attack_type for config in configs for attack_type in config.get("attacks", {}).get("enabled", ())})
+    validation = {
+        "status": "FAIL" if failed else ("PASS_WITH_WARNING" if warnings or skipped else "PASS"),
+        "methods_internal": list(REFERENCE_FIGURE_METHODS),
+        "method_display_names": [REFERENCE_METHOD_LABELS[method] for method in REFERENCE_FIGURE_METHODS],
+        "source_data_directory": str(root), "plot_directory": str(output),
+        "sample_size_run_rows": len(raw),
+        "seeds": sorted({row.get("seed") for row in raw}),
+        "maps": sorted({row.get("map_hash") or row.get("manifest_hash") for row in raw if row.get("map_hash") or row.get("manifest_hash")}),
+        "treatment_levels": {
+            "attack_intensity": sorted({parse_float(row.get("configured_attack_injections_per_1000_steps")) for row in intensity_raw if parse_float(row.get("configured_attack_injections_per_1000_steps")) is not None}),
+            "honest_delay_steps": sorted({parse_float(row.get("configured_honest_report_delay_steps")) for row in delay_raw if parse_float(row.get("configured_honest_report_delay_steps")) is not None}),
+        },
+        "enabled_attack_types": attack_types,
+        "all_four_methods_present": set(row.get("method") for row in raw) == set(REFERENCE_FIGURE_METHODS),
+        "same_manifest_pairing_passed": bool(condition_pairing) and all(condition_pairing.values()),
+        "pairing_by_condition": condition_pairing,
+        "pairing_by_treatment": pairing_details,
+        "attack_intensity_diagnostics": _treatment_diagnostics(intensity_raw, "configured_attack_injections_per_1000_steps"),
+        "honest_delay_diagnostics": _treatment_diagnostics(delay_raw, "configured_honest_report_delay_steps"),
+        "runtime_measurement": {
+            "timed_path": "ModularRobot.process_inbox -> FusionEngine.add -> DefenseMethodRunner.add_report",
+            "timer": "time.perf_counter_ns()",
+            "start_boundary": "immediately before FusionEngine.add(report, policy.influence)",
+            "end_boundary": "immediately after FusionEngine.add returns",
+            "changes_simulation_state": False,
+        },
+        "influence_probe_audit": {
+            "production_function": "FusionEngine.operational_weight -> DefenseMethodRunner.active_claim_weight -> DefenseMethodRunner._method_weight",
+            "probe_source_trust": 0.9,
+            "probe_source_memory": 0.9,
+            "probe_sensor_confidence": 1.0,
+            "max_claim_age_behavior": "all methods exclude active claims at age >= max_claim_age",
+            "full_trust": "sensor confidence multiplied by linear age weight",
+            "majority_vote": "unit vote before hard expiration",
+            "trust_fused": "linear age weight multiplied by trust frozen at report time",
+            "source_memory": "linear age weight multiplied by the minimum of report-time trust, current trust, and source memory",
+        },
+        "fig9_semantics": {
+            "publication_metric": REFERENCE_DELAY_PUBLICATION_METRIC,
+            "event": "delivered honest report passed admission but production operational weight was <= 1e-12",
+            "numerator": "honest_reports_operationally_ignored",
+            "denominator": "honest_report_deliveries",
+            "admission_rejection_metric_retained_as_diagnostic": "honest_rejection_rate",
+            "existing_metric_definition_changed": False,
+        },
+        "source_fields_by_figure": source_fields,
+        "figures": status,
+        "warnings": warnings,
+        "deviations_from_physical_ai_target": [
+            "Simulator time is reported in steps because no auditable seconds conversion is configured.",
+            "Recovery densities use recovered episodes only; never-affected and censored outcomes remain in plot data and validation.",
+            "Influence curves reflect production FusionEngine behavior even where curves overlap the document mockup differently.",
+        ],
+        "machine_metadata": _reference_machine_metadata(),
+    }
+    (aggregate / "physical_ai_validation.json").write_text(json.dumps(validation, indent=2), encoding="utf-8")
+    lines = ["Physical AI figure validation", "", f"Overall status: {validation['status']}",
+             f"Runs: {len(raw)}; seeds: {', '.join(map(str, validation['seeds'])) or 'none'}",
+             f"Maps: {len(validation['maps'])}; four methods present: {validation['all_four_methods_present']}",
+             f"Same-manifest pairing passed: {validation['same_manifest_pairing_passed']}", "", "Figures:"]
+    for filename in all_files:
+        item = status[filename]
+        lines.append(f"- {filename}: {item['status']} ({item['note']}); source: {', '.join(item['source_fields'])}")
+    lines += ["", "Attack types: " + (", ".join(attack_types) or "none"),
+              "Treatment levels: " + json.dumps(validation["treatment_levels"], sort_keys=True),
+              "Pairing by condition: " + json.dumps(condition_pairing, sort_keys=True),
+              "", "Deviations:"] + [f"- {item}" for item in validation["deviations_from_physical_ai_target"]]
+    if warnings:
+        lines += ["", "Warnings:"] + [f"- {item}" for item in warnings]
+    (aggregate / "physical_ai_validation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (aggregate / "physical_ai_machine_metadata.json").write_text(json.dumps(validation["machine_metadata"], indent=2), encoding="utf-8")
+    return validation
+
+
+def generate_reference_report(root: str | Path, *, formats=("png",)) -> dict:
+    """Generate the dedicated four-method reference figure suite.
+
+    ``root`` may be a reference-suite root containing condition directories or
+    a single completed multiseed batch for backwards-compatible smoke tests.
+    """
+    root = Path(root)
+    baseline_root = root / "baseline_multiseed" if (root / "baseline_multiseed").exists() else root
+    runs = _reference_filter_runs(_multiseed_runs(baseline_root))
+    if not runs:
+        raise ValueError(f"no completed reference-method runs found under {baseline_root}")
+    raw = _reference_raw(runs)
+    _, mismatches = _reference_manifest_hashes(runs)
+    aggregate = root / "aggregate"; output = aggregate / "plots"; plot_data = aggregate / "plot_data"
+    output.mkdir(parents=True, exist_ok=True); plot_data.mkdir(parents=True, exist_ok=True)
+    for path in output.iterdir():
+        if path.is_file() and path.suffix.lower() in {".png", ".pdf", ".svg"}:
+            path.unlink()
+    generated, skipped, failed, warnings = [], [], [], []
+    if mismatches:
+        warnings.append(f"paired scenario manifest mismatch for seeds: {sorted(mismatches)}")
+    no_attack_raw = _reference_raw(_reference_condition_runs(root / "no_attack")) if (root / "no_attack").exists() else []
+    intensity_root = root / "sweeps" / "attack_intensity" if (root / "sweeps" / "attack_intensity").exists() else root / "attack_intensity_sweep"
+    delay_root = root / "sweeps" / "honest_delay" if (root / "sweeps" / "honest_delay").exists() else root / "delay_sweep"
+    intensity_raw = _reference_raw(_reference_condition_runs(intensity_root)) if intensity_root.exists() else []
+    delay_raw = _reference_raw(_reference_condition_runs(delay_root)) if delay_root.exists() else []
+    intensity_levels = {parse_float(row.get("configured_attack_injections_per_1000_steps")) for row in intensity_raw if parse_float(row.get("configured_attack_injections_per_1000_steps")) is not None}
+    delay_levels = {parse_float(row.get("configured_honest_report_delay_steps")) for row in delay_raw if parse_float(row.get("configured_honest_report_delay_steps")) is not None}
+    if 2 <= len(intensity_levels) < 5:
+        warnings.append(f"04_map_error_vs_attack_intensity.png: smoke sweep has {len(intensity_levels)} configured levels; final target calls for 5-6")
+    if 2 <= len(delay_levels) < 5:
+        warnings.append(f"09_legitimate_operational_ignore_vs_delay.png: smoke sweep has {len(delay_levels)} configured levels; final target calls for at least 5")
+    runtime_rows = _cached_runtime_plot_rows(runs, plot_data / "05_computational_scalability.csv")
+    jobs = (
+        ("A2_false_blockage_duration.png", lambda p: _plot_paper_a2(raw, p)),
+        ("A3_security_performance_tradeoff.png", lambda p: _plot_paper_a3(raw, p)),
+        ("A5_navigation_recovery_distribution.png", lambda p: _plot_paper_a5(raw, p)),
+        ("01_mission_deliveries.png", lambda p: _physical_bar_plot(raw, "benign_total_deliveries_completed", "Deliveries completed", p, no_attack_raw=no_attack_raw, no_attack_mode="reference")),
+        ("03_false_report_acceptance.png", lambda p: _physical_bar_plot(raw, "false_acceptance_rate", "False reports accepted (%)", p, transform=lambda value: value * 100.0)),
+        ("04_map_error_vs_attack_intensity.png", lambda p: _plot_reference_intensity(intensity_raw, p)),
+        ("05_computational_scalability.png", lambda p: _plot_reference_scalability(runtime_rows, p)),
+        ("06_delivery_time.png", lambda p: _physical_bar_plot(raw, "benign_delivery_cycle_duration_mean_steps", "Delivery time (steps)", p, no_attack_raw=no_attack_raw, no_attack_mode="bar", show_points=False)),
+        ("07_replans_per_delivery.png", lambda p: _physical_bar_plot(raw, "replans_per_delivery", "Replans per delivery", p, no_attack_raw=no_attack_raw, no_attack_mode="bar", show_points=False)),
+        ("09_legitimate_operational_ignore_vs_delay.png", lambda p: _plot_reference_delay(delay_raw, p)),
+    )
+    if "png" in formats:
+        for name, job in jobs:
+            try:
+                if job(output / name) is True and (output / name).exists(): generated.append(name)
+                else:
+                    reason = "required reference condition or measurements are unavailable"
+                    skipped.append({"filename": name, "reason": reason})
+                    warnings.append(f"{name}: skipped: {reason}")
+            except Exception as exc:
+                failed.append({"filename": name, "error": str(exc)})
+        config = next((_load_effective_config(data) for _, _, data in runs if _load_effective_config(data)), {})
+        fusion = config.get("fusion", {})
+        probe_rows = _write_influence_probe(plot_data / "08_report_influence_vs_age.csv", decay_rate=float(fusion.get("decay_rate", .006)), max_claim_age=int(fusion.get("max_claim_age", 300)), threshold=float(config.get("trust", {}).get("threshold", .5)))
+        full_trust_curve = [row["normalized_influence_percent"] for row in probe_rows if row["method"] == "full_trust"]
+        if full_trust_curve and full_trust_curve[-1] < 99.0:
+            warnings.append("08_report_influence_vs_age.png: production Full trust influence ages out instead of remaining at 100% as illustrated in the document")
+        influence_path = output / "08_report_influence_vs_age.png"
+        _plot_probe_rows(probe_rows, influence_path); generated.append(influence_path.name)
+        _write_physical_plot_data(plot_data, raw=raw, no_attack_raw=no_attack_raw, intensity_raw=intensity_raw,
+                                  delay_raw=delay_raw, runtime_rows=runtime_rows, probe_rows=probe_rows)
+    manifest = {"directory": str(root), "plot_directory": str(output), "expected_figures": list(PHYSICAL_AI_FIGURES), "methods": list(REFERENCE_FIGURE_METHODS), "method_display_names": [REFERENCE_METHOD_LABELS[m] for m in REFERENCE_FIGURE_METHODS], "generated": generated, "skipped": skipped, "failed": failed, "warnings": warnings, "runs": len(runs)}
+    (aggregate / "physical_ai_figure_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_reference_validation(root, aggregate, output, runs=runs, raw=raw, no_attack_raw=no_attack_raw,
+                               intensity_raw=intensity_raw, delay_raw=delay_raw,
+                               generated=generated, skipped=skipped, failed=failed,
+                               warnings=warnings, mismatches=mismatches)
+    return manifest
+
 def generate_multiseed_report(root: str | Path, *, formats=("png",)) -> dict:
     root=Path(root); runs=_multiseed_runs(root)
     if not runs: raise ValueError(f"no completed multi-seed runs found under {root}")
@@ -1781,9 +2422,12 @@ def main(argv=None):
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--multiseed", action="store_true")
+    parser.add_argument("--reference", action="store_true")
     args = parser.parse_args(argv)
     root = Path(args.path)
-    if args.multiseed:
+    if args.reference:
+        result = generate_reference_report(root)
+    elif args.multiseed:
         result = generate_multiseed_report(root)
     elif args.compare or (not args.run and not (root / "run_summary.csv").exists() and discover_method_runs(root)):
         result = generate_comparison_report(root)

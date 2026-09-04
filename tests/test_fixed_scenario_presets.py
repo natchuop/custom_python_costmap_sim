@@ -9,7 +9,7 @@ from map_poisoning.cli import config_from_args, parser
 from map_poisoning.scenario import _nominal_route_cells, author_manifest
 from map_poisoning.scenario_presets import PRESETS, validate_fixed_preset
 from map_poisoning.map_io import load_npy
-from map_poisoning.ui import validate_gui_map_preset
+from map_poisoning.ui import is_physical_ai_method_selection, run_physical_ai_workflow, validate_gui_map_preset
 
 
 ROOT = Path(__file__).parents[1]
@@ -117,3 +117,58 @@ def test_gui_packaged_map_options_are_cwd_independent():
         assert Path(path).is_absolute()
         assert Path(path).exists()
         validate_fixed_preset(load_npy(path), PRESETS[preset_id])
+
+
+def test_gui_four_method_selection_identifies_physical_ai_reporting_workflow():
+    assert is_physical_ai_method_selection(("full_trust", "majority_vote", "trust_fused", "source_memory"))
+    assert not is_physical_ai_method_selection(("full_trust", "majority_vote"))
+    assert not is_physical_ai_method_selection(("full_trust", "majority_vote", "trust_fused", "source_memory", "latest_report"))
+
+
+def test_gui_physical_ai_report_delegates_to_canonical_reference_reporter(monkeypatch, tmp_path):
+    import map_poisoning.ui as ui
+
+    calls = []
+    monkeypatch.setattr(ui, "generate_reference_report", lambda path: calls.append(path) or {"generated": []})
+    result = ui.generate_physical_ai_report(tmp_path)
+    assert result == {"generated": []}
+    assert calls == [tmp_path]
+
+
+def test_gui_physical_ai_default_mode_runs_only_normal_batch(monkeypatch, tmp_path):
+    import map_poisoning.batch as batch
+    import map_poisoning.ui as ui
+
+    calls = []
+    monkeypatch.setattr(batch, "run_multiseed", lambda *args, **kwargs: calls.append(("normal", args, kwargs)))
+    monkeypatch.setattr(ui, "generate_physical_ai_report", lambda root: calls.append(("report", root)) or {})
+    config = SimulationConfig(logging=LoggingConfig(output_directory=str(tmp_path)))
+
+    run_physical_ai_workflow(config, (2, 7))
+
+    assert [call[0] for call in calls] == ["normal", "report"]
+    assert calls[0][1][1] == (2, 7)
+    assert calls[1][1] == str(tmp_path)
+
+
+def test_gui_full_physical_ai_mode_runs_sweeps_before_report(monkeypatch, tmp_path):
+    import map_poisoning.reference_experiments as experiments
+    import map_poisoning.ui as ui
+
+    calls = []
+    monkeypatch.setattr(
+        experiments,
+        "run_reference_suite",
+        lambda config, seeds, root, **kwargs: calls.append(("suite", config, seeds, root, kwargs)),
+    )
+    monkeypatch.setattr(ui, "generate_physical_ai_report", lambda root: calls.append(("report", root)) or {})
+    config = SimulationConfig(logging=LoggingConfig(output_directory=str(tmp_path)))
+
+    run_physical_ai_workflow(config, (3, 5), full_suite=True)
+
+    assert [call[0] for call in calls] == ["suite", "report"]
+    assert calls[0][2] == (3, 5)
+    assert calls[0][3] == str(tmp_path)
+    assert calls[0][4]["include_sweeps"] is True
+    assert calls[0][4]["generate_report"] is False
+    assert calls[1][1] == str(tmp_path)

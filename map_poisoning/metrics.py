@@ -5,6 +5,20 @@ from pathlib import Path
 
 class CsvMetrics:
     def __init__(self): self.events=[]; self.timeseries=[]
+    def fusion_runtime(self, **data):
+        if not hasattr(self, "fusion_runtime_samples"):
+            self.fusion_runtime_samples = []
+        self.fusion_runtime_samples.append(data)
+
+    def reference_recovery_episode(self, **data):
+        if not hasattr(self, "recovery_episodes"):
+            self.recovery_episodes = []
+        self.recovery_episodes.append(data)
+
+    def honest_report_outcome(self, **data):
+        if not hasattr(self, "honest_report_outcomes"):
+            self.honest_report_outcomes = []
+        self.honest_report_outcomes.append(data)
     def event(self, step, kind, **data): self.events.append({"step":step,"kind":kind,**data})
     def trust_update(self, step, *, method, report_id, sender_id, recipient_id, outcome, old_trust, new_trust):
         """Record every trust change with a stable report and recipient join key."""
@@ -30,6 +44,12 @@ class CsvMetrics:
     def write(self, directory, summary):
         root=Path(directory); root.mkdir(parents=True, exist_ok=True)
         self._write(root/"events.csv",self.events); self._write(root/"robot_timeseries.csv",self.timeseries); self._write(root/"run_summary.csv",[summary])
+        if getattr(self, "fusion_runtime_samples", None):
+            self._write(root/"fusion_runtime_samples.csv", self.fusion_runtime_samples)
+        if getattr(self, "recovery_episodes", None):
+            self._write(root/"recovery_episodes.csv", self.recovery_episodes)
+        if getattr(self, "honest_report_outcomes", None):
+            self._write(root/"honest_report_outcomes.csv", self.honest_report_outcomes)
     @staticmethod
     def _write(path, rows):
         keys=sorted({key for row in rows for key in row}) or ["empty"]

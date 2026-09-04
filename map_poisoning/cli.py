@@ -123,6 +123,8 @@ def parser():
     p.add_argument("--observation-lifetime", type=int, default=300)
     p.add_argument("--confidence-resend-delta", type=float, default=0.10)
     p.add_argument("--periodic-route-check", type=int, default=25)
+    p.add_argument("--honest-report-delay", type=int, default=0)
+    p.add_argument("--measure-fusion-runtime", action="store_true")
     p.add_argument("--no-animation",action="store_true"); p.add_argument("--no-plots",action="store_true",help="Do not generate PNG reports after CSV output"); return p
 
 def config_from_args(args):
@@ -158,7 +160,7 @@ def config_from_args(args):
             source_memory_recovery_rate=float(args.source_memory_recovery_rate),
         ),
         fusion=FusionConfig(method=args.defense_method, admission_policy=args.admission_policy, max_claim_age=int(getattr(args, "observation_lifetime", 300))),
-        logging=LoggingConfig(output_directory, generate_plots=not args.no_plots),
+        logging=LoggingConfig(output_directory, generate_plots=not args.no_plots, measure_fusion_runtime=args.measure_fusion_runtime),
         visualization=VisualizationConfig(
             animation=not args.no_animation and not args.headless,
             map_view=getattr(args, "map_view", "combined"),
@@ -174,4 +176,5 @@ def config_from_args(args):
         observation_lifetime_steps=int(getattr(args, "observation_lifetime", 300)),
         confidence_resend_delta=float(getattr(args, "confidence_resend_delta", 0.10)),
         periodic_route_check_steps=int(getattr(args, "periodic_route_check", 25)),
+        honest_report_delay_steps=int(getattr(args, "honest_report_delay", 0)),
     )

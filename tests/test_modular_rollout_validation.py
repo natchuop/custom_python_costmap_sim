@@ -4,7 +4,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, TrustConfig
+from map_poisoning.config import AttackConfig, FusionConfig, LoggingConfig, PhaseConfig, SimulationConfig, TrustConfig
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.models import AttackEvent, AttackType, ClaimReport, ClaimType, DeliveryTask, DirectObservation, TemporaryObstacleEpisode, VerificationOutcome
@@ -122,6 +122,64 @@ def test_peer_reports_are_delivered_and_fused_per_recipient():
     assert robots[2].accepted_reports > 0
     assert any(item.report.sender_id == 1 for item in robots[2].fusion.report_history.values())
     assert not any(item.report.sender_id == 1 for item in robots[1].fusion.report_history.values())
+
+
+def test_zero_honest_report_delay_matches_default_rollout():
+    manifest = _manifest()
+    default = _config()
+    explicit_zero = replace(default, honest_report_delay_steps=0)
+    first_world, first_robots, first_log = run_manifest_rollout(default, manifest, "source_memory")
+    second_world, second_robots, second_log = run_manifest_rollout(explicit_zero, manifest, "source_memory")
+    first_summary, _ = collect_rollout_metrics(default, manifest, "source_memory", first_world, first_robots, first_log)
+    second_summary, _ = collect_rollout_metrics(explicit_zero, manifest, "source_memory", second_world, second_robots, second_log)
+
+    assert first_summary == second_summary
+    assert first_log["timeseries"] == second_log["timeseries"]
+    assert first_log["events"] == second_log["events"]
+    assert first_summary["configured_honest_report_delay_steps"] == 0
+
+
+def test_fusion_runtime_measurement_preserves_existing_metric_values():
+    manifest = _manifest()
+    base = replace(_config(), logging=LoggingConfig(generate_plots=False, measure_fusion_runtime=False))
+    measured = replace(base, logging=replace(base.logging, measure_fusion_runtime=True))
+    base_world, base_robots, base_log = run_manifest_rollout(base, manifest, "source_memory")
+    measured_world, measured_robots, measured_log = run_manifest_rollout(measured, manifest, "source_memory")
+    base_summary, _ = collect_rollout_metrics(base, manifest, "source_memory", base_world, base_robots, base_log)
+    measured_summary, measured_collector = collect_rollout_metrics(measured, manifest, "source_memory", measured_world, measured_robots, measured_log)
+    runtime_fields = {
+        "fusion_update_runtime_mean_ms", "fusion_update_runtime_median_ms", "fusion_update_runtime_p95_ms",
+        "fusion_update_runtime_max_ms", "fusion_update_sample_count", "max_stored_evidence_count",
+    }
+
+    assert {key: value for key, value in base_summary.items() if key not in runtime_fields} == {
+        key: value for key, value in measured_summary.items() if key not in runtime_fields
+    }
+    assert measured_summary["fusion_update_sample_count"] > 0
+    assert measured_collector.fusion_runtime_samples
+
+
+def test_honest_operational_ignore_rate_comes_from_production_outcomes():
+    manifest = _manifest()
+    config = replace(
+        _config(),
+        honest_report_delay_steps=3,
+        fusion=FusionConfig(method="full_trust", max_claim_age=3),
+    )
+    world, robots, log = run_manifest_rollout(config, manifest, "full_trust")
+    summary, collector = collect_rollout_metrics(config, manifest, "full_trust", world, robots, log)
+    outcomes = collector.honest_report_outcomes
+    ignored = sum(bool(row["operationally_ignored"]) for row in outcomes)
+    rejected = sum(bool(row["rejected"]) for row in outcomes)
+
+    assert outcomes and len(outcomes) == summary["honest_report_deliveries"]
+    assert ignored > 0
+    assert all(row["accepted"] for row in outcomes)
+    assert all(row["age_at_evaluation_steps"] == 3 for row in outcomes)
+    assert summary["honest_reports_operationally_ignored"] == ignored
+    assert summary["honest_operational_ignore_rate"] == ignored / len(outcomes)
+    assert summary["honest_reports_rejected"] == rejected == 0
+    assert summary["honest_rejection_rate"] == rejected / len(outcomes)
 
 def test_high_trust_fake_obstacle_changes_route_and_low_trust_does_not():
     manifest = _manifest()
