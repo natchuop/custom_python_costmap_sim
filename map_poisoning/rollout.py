@@ -151,10 +151,8 @@ def _route_attacker_impact(
                 routing_cost_fn=lambda item, now: robot.fusion.routing_cost_excluding_sender(
                     item, now, attacker_id, malicious_claim
                 ),
-                hard_blocked_fn=lambda: math.isinf(
-                    robot.fusion.routing_cost_excluding_sender(
-                        cell, step, attacker_id, malicious_claim
-                    )
+                hard_blocked_fn=lambda: robot.fusion.blocked_excluding_sender(
+                    cell, step, attacker_id, malicious_claim
                 ),
             )
         else:
@@ -288,6 +286,7 @@ def run_manifest_rollout(
     malicious_ids = frozenset(
         report_id for event in manifest.attack_events for report_id in event.report_ids
     )
+    max_steps = config.total_steps if config.max_steps is None else min(config.total_steps, int(config.max_steps))
     log = {
         "engine": "modular_native",
         "defense_method": method,
@@ -322,12 +321,12 @@ def run_manifest_rollout(
         # Populated only by the attack-free authoring rollout.  It is not
         # written to result CSVs and cannot influence a defense replay.
         "reference_states": {} if capture_reference_state else None,
+        "steps_completed": max_steps,
     }
     traffic_state = TrafficState()
     if config.visualization.animation:
         from .live_view import init_live_log
         init_live_log(log, world, robots, config, manifest)
-    max_steps = config.total_steps
     serial = 0
     live_note = "heatmap then live maps" if config.visualization.animation else "no live animation"
     if show_progress:
@@ -577,6 +576,15 @@ def run_manifest_rollout(
                     "recipient_ids": list(event.recipients),
                 })
 
+        # Preserve the route that existed immediately before this step's
+        # reports were fused.  Attack overlap must be measured against this
+        # pre-fusion route, not against a path that may already have been
+        # replaced by an attack-triggered replan.
+        pre_fusion_routes = {
+            robot.robot_id: tuple(robot.path or ())
+            for robot in robots
+        }
+
         # Admission/fusion and immediate replanning are identical in structure
         # for all methods. No operational decision receives the malicious label.
         for robot in robots:
@@ -779,10 +787,16 @@ def run_manifest_rollout(
                     for report, _ in accepted_attack_reports
                     if robot.fusion.operational_weight(report, step) > 1e-12
                 }
+                navigation_influential_attack_cells = {
+                    tuple(report.target_cell)
+                    for report, _ in accepted_attack_reports
+                    if report.report_id in robot.last_navigation_influential_report_ids
+                }
                 direct_free_override_cells = {
                     cell for cell in attack_cells
                     if robot.belief.observation_status(cell, step) == (ClaimType.FREE, "current")
                 }
+                pre_fusion_route = pre_fusion_routes.get(robot.robot_id, ())
                 impact = _route_attacker_impact(
                     robot,
                     attacker,
@@ -801,7 +815,12 @@ def run_manifest_rollout(
                     "attack_report_cells": len(attack_cells),
                     "attack_accepted_cells": len(accepted_attack_cells),
                     "attack_influential_cells": len(influential_attack_cells),
+                    "attack_navigation_influential_cells": len(navigation_influential_attack_cells),
                     "attack_direct_free_override_cells": len(direct_free_override_cells),
+                    "attack_pre_fusion_route_overlap_cells": len(attack_cells.intersection(pre_fusion_route)),
+                    "attack_post_replan_route_overlap_cells": len(attack_cells.intersection(current_route)),
+                    # Compatibility field: this is explicitly the post-replan
+                    # value, while the pre-fusion field is the causal measure.
                     "attack_current_route_overlap_cells": len(attack_cells.intersection(current_route)),
                     "attack_victim_path_active": bool(current_route) and not robot.completed,
                     **impact,
@@ -947,8 +966,13 @@ def run_manifest_rollout(
                 "attacker_attributable_cost_on_route": route_cost,
                 "attacker_signed_route_cost_delta": route_impact["attack_signed_route_cost_delta"],
                 "attacker_route_cost_reduction": route_impact["attack_route_cost_reduction"],
-                "attacker_path_length_delta": route_impact["attack_path_length_delta"],
-                "attacker_shortcut_path_length": route_impact["attack_shortcut_path_length"],
+                 "attacker_path_length_delta": route_impact["attack_path_length_delta"],
+                 "attacker_shortcut_path_length": route_impact["attack_shortcut_path_length"],
+                 "navigation_influential_malicious_claim_count": sum(
+                     1
+                     for report_id in robot.last_navigation_influential_report_ids
+                     if report_id in malicious_ids
+                 ),
                 "preferred_route_affected_by_attacker": route_affected,
                 "map_error": (
                     _map_error(robot, world, step, truth_grid=truth_grid)
@@ -996,7 +1020,8 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
             collector.sample(**sample)
     benign_samples = [sample for sample in samples if sample["robot_id"] in manifest.benign_robot_ids]
     map_errors = [sample["map_error"] for sample in benign_samples if sample["map_error"] is not None]
-    final_errors = [sample["map_error"] for sample in benign_samples if sample["step"] == config.total_steps - 1 and sample["map_error"] is not None]
+    steps_completed = int(log.get("steps_completed", config.total_steps))
+    final_errors = [sample["map_error"] for sample in benign_samples if sample["step"] == steps_completed - 1 and sample["map_error"] is not None]
     last_injection = max(log["attack_injection_steps"], default=None)
     ever_affected = any(sample["route_affected_by_attacker"] for sample in benign_samples)
     recovery = None
@@ -1157,6 +1182,27 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
             for event in received
             if event.get("accepted") and float(event.get("operational_weight", 0.0)) > 1e-12
         }
+        type_impacts = [
+            event for event in impact_events
+            if event.get("attack_type") == attack_type
+        ]
+        navigation_influential_cells = sum(
+            int(event.get("attack_navigation_influential_cells", 0))
+            for event in type_impacts
+        )
+        navigation_influence_events = {
+            str(event.get("scenario_event_id"))
+            for event in type_impacts
+            if int(event.get("attack_navigation_influential_cells", 0)) > 0
+        }
+        pre_fusion_overlap_cells = sum(
+            int(event.get("attack_pre_fusion_route_overlap_cells", 0))
+            for event in type_impacts
+        )
+        post_replan_overlap_cells = sum(
+            int(event.get("attack_post_replan_route_overlap_cells", 0))
+            for event in type_impacts
+        )
         attack_type_metrics.update({
             f"{prefix}_events_authored": len(authored_events),
             f"{prefix}_report_cells_authored": authored_cells,
@@ -1167,6 +1213,10 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
             f"{prefix}_acceptance_rate": accepted / len(received) if received else 0.0,
             f"{prefix}_event_acceptance_rate": len(accepted_events) / len(authored_events) if authored_events else 0.0,
             f"{prefix}_event_false_acceptance_rate": len(influential_events) / len(authored_events) if authored_events else 0.0,
+            f"{prefix}_navigation_influential_cells": navigation_influential_cells,
+            f"{prefix}_navigation_influence_events": len(navigation_influence_events),
+            f"{prefix}_pre_fusion_route_overlap_cells": pre_fusion_overlap_cells,
+            f"{prefix}_post_replan_route_overlap_cells": post_replan_overlap_cells,
         })
     stale_impact_events = [
         event for event in impact_events
@@ -1174,7 +1224,7 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
     ]
     summary = {
         "method": method, "engine": "modular_native", "seed": config.seed,
-        "steps_completed": config.total_steps, "attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
+        "steps_completed": steps_completed, "attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
         "benign_total_deliveries_completed": sum(robot.deliveries_completed for robot in benign),
         "benign_delivery_time_mean_steps": (
             sum(delivery_durations) / len(delivery_durations) if delivery_durations else None
@@ -1309,6 +1359,23 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "attack_shortcut_path_length_total": sum(finite_shortcuts),
         "attack_induced_path_changes": len(attack_ids_with_path_change),
         "attacks_evaluated_for_route_impact": len(impacts_by_attack),
+        "attack_navigation_influential_cells": sum(
+            int(event.get("attack_navigation_influential_cells", 0))
+            for event in impact_events
+        ),
+        "attack_navigation_influence_events": len({
+            str(event.get("scenario_event_id"))
+            for event in impact_events
+            if int(event.get("attack_navigation_influential_cells", 0)) > 0
+        }),
+        "attack_pre_fusion_route_overlap_cells": sum(
+            int(event.get("attack_pre_fusion_route_overlap_cells", 0))
+            for event in impact_events
+        ),
+        "attack_post_replan_route_overlap_cells": sum(
+            int(event.get("attack_post_replan_route_overlap_cells", 0))
+            for event in impact_events
+        ),
         "stale_attack_report_cells": sum(int(event.get("attack_report_cells", 0)) for event in stale_impact_events),
         "stale_attack_accepted_cells": sum(int(event.get("attack_accepted_cells", 0)) for event in stale_impact_events),
         "stale_attack_influential_cells": sum(int(event.get("attack_influential_cells", 0)) for event in stale_impact_events),

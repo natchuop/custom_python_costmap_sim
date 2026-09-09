@@ -107,7 +107,7 @@ def parser():
     p.add_argument("--resume", action="store_true", help="resume matching completed multi-seed cells")
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--trust-model",choices=("bayesian","scalar"),default="bayesian"); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
-    p.add_argument("--trust-threshold",type=float,default=0.50)
+    p.add_argument("--trust-threshold",type=float,default=0.70)
     p.add_argument("--majority-sensor-confidence-threshold",type=float,default=0.50)
     p.add_argument("--trust-evidence-cap",type=float,default=12.0)
     p.add_argument("--trust-confirmation-multiplier",type=float,default=0.025)

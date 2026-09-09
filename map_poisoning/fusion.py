@@ -37,10 +37,10 @@ class FusionEngine:
         max_claim_age: int = 300,
         cost_scale: float = 40.0,
         cost_exponent: float = 1.5,
-        blocked_probability_threshold: float = 0.60,
+        blocked_probability_threshold: float = 0.50,
         congested_impact: float = 0.50,
         duplicate_window_steps: int = 0,
-        trust_threshold: float = 0.50,
+        trust_threshold: float = 0.70,
         unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST,
         majority_sensor_confidence_threshold: float = 0.50,
     ):
@@ -235,6 +235,27 @@ class FusionEngine:
     def blocked(self, cell: tuple[int, int], step: int) -> bool:
         self.set_time(step)
         return self._runner.is_hard_blocked(cell, step)
+
+    def blocked_excluding_sender(
+        self,
+        cell: tuple[int, int],
+        step: int,
+        sender_id: int,
+        predicate=None,
+    ) -> bool:
+        """Return the method's hard-block decision without one sender's claims.
+
+        Route counterfactuals must use the same hard-block contract as normal
+        planning.  A finite ``routing_cost`` is not equivalent to traversable
+        when a method's occupancy threshold says the cell is blocked.
+        """
+        self.set_time(step)
+        return self._runner.is_hard_blocked(
+            cell,
+            step,
+            excluded_sender_id=sender_id,
+            excluded_claim_predicate=predicate,
+        )
 
     def routing_cost(self, cell: tuple[int, int], step: int) -> float:
         self.set_time(step)

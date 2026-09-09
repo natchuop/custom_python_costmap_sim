@@ -24,6 +24,11 @@ For a quick headless test:
 .\run_sim.ps1 -NoAnimation -MaxSteps 10 -DeliveriesPerRobot 1
 ```
 
+With no `-Map` argument, `run_sim.ps1` uses the corrected default warehouse
+loader, including the widened passages and removed top-right corner cells.
+Converted-map variants remain available explicitly with `-Map
+maps_005_map_rotated`, `-Map maps_005_map`, or `-Map maps_002_map`.
+
 Headless single run, manifest authoring, and fixed-manifest comparison:
 
 ```powershell
@@ -88,12 +93,12 @@ a 360-degree Euclidean line-of-sight
 LiDAR with a five-cell range; observation confidence falls from 1.0 near the robot
 to 0.60 at range five. Direct and peer occupancy memories use a shared 300-step
 linear lifetime, with current LiDAR observations authoritative. Fused occupancy
-above 0.60 is treated as a hard planning obstacle for the probabilistic primary
+above 0.50 is treated as a hard planning obstacle for the probabilistic primary
 methods. Majority Vote uses a categorical BLOCKED vote gated at 0.50 sensor
 confidence, so normal five-cell LiDAR observations (confidence 0.60) are retained.
 Bayesian trust is
 the default (`alpha=9`, `beta=1`, evidence cap 12, confirmation multiplier 0.025,
-contradiction multiplier 5.0, distrust threshold 0.50). The reduced positive
+contradiction multiplier 5.0, distrust threshold 0.70). The reduced positive
 multiplier slows recovery after detected deception; scalar trust likewise uses a
 0.005 positive reward.
 `source_memory` applies immediate trust loss to historical reports but rehabilitates

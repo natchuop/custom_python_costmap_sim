@@ -178,7 +178,7 @@ def test_primary_probabilistic_methods_hard_block_fresh_high_probability_blocked
 
 def test_default_primary_probability_block_threshold_matches_sensor_confidence_scale():
     from map_poisoning.config import FusionConfig
-    assert FusionConfig().blocked_probability_threshold == 0.60
+    assert FusionConfig().blocked_probability_threshold == 0.50
 
 
 def test_default_unknown_traversal_cost_is_shared_by_primary_methods():

@@ -46,7 +46,7 @@ class TrustConfig:
     model: str = "bayesian"
     prior_alpha: float = 9.0
     prior_beta: float = 1.0
-    threshold: float = 0.50
+    threshold: float = 0.70
     evidence_cap: float = 12.0
     # Positive evidence is intentionally slower than contradiction evidence so
     # an attacker cannot regain full trust after only a few honest reports.
@@ -64,7 +64,7 @@ class FusionConfig:
     decay_rate: float = 0.006
     cost_scale: float = 40.0
     cost_exponent: float = 1.5
-    blocked_probability_threshold: float = 0.60
+    blocked_probability_threshold: float = 0.50
     max_claim_age: int = 300
     congested_impact: float = 0.50
     duplicate_window_steps: int = 0

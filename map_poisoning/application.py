@@ -19,13 +19,17 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
     requested=config; requested.validate(); root=Path(config.logging.output_directory)
     if config.map_npy:
         grid = load_npy(config.map_npy)
+        map_source = f"npy:{config.map_npy}"
     elif config.map_movingai:
         grid = load_movingai(config.map_movingai)
+        map_source = f"movingai:{config.map_movingai}"
     elif config.scenario_preset:
         from .scenario_presets import map_path_for_preset
         grid = load_npy(map_path_for_preset(config.scenario_preset))
+        map_source = f"preset:{config.scenario_preset}"
     else:
         grid = default_warehouse_map()
+        map_source = "default_warehouse_corrected_in_memory"
     if config.manifest_path:
         manifest=load_manifest(config.manifest_path)
     elif not config.map_npy and not config.map_movingai and not config.scenario_preset:
@@ -33,6 +37,7 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
     else:
         manifest=author_manifest(config, grid)
     root.mkdir(parents=True,exist_ok=True); save_manifest(manifest,root/"scenario_manifest.json")
+    print(f"Map source: {map_source} | manifest map hash: {manifest.map_hash}", flush=True)
     CsvMetrics.config(root/"requested_config.json",requested.to_dict())
     CsvMetrics.config(root/"effective_config.json",config.to_dict())
     CsvMetrics.config(root/"resolved_config.json",config.to_dict())
@@ -42,7 +47,7 @@ def run(config: SimulationConfig, *, comparison: bool = False, manifest_only: bo
         dirty=bool(subprocess.check_output(["git","status","--porcelain"],text=True,stderr=subprocess.DEVNULL).strip())
     except (OSError, subprocess.CalledProcessError):
         commit=None; dirty=None
-    CsvMetrics.config(root/"run_metadata.json",{"python_version":sys.version,"platform":platform.platform(),"engine":"modular","settings_source":"modular_cli","scenario_id":manifest.scenario_id,"manifest_hash":manifest.map_hash,"map_hash":manifest.map_hash,"scenario_manifest_hash":scenario_manifest_hash(manifest),"git_commit":commit,"git_dirty":dirty})
+    CsvMetrics.config(root/"run_metadata.json",{"python_version":sys.version,"platform":platform.platform(),"engine":"modular","settings_source":"modular_cli","map_source":map_source,"scenario_id":manifest.scenario_id,"manifest_hash":manifest.map_hash,"map_hash":manifest.map_hash,"scenario_manifest_hash":scenario_manifest_hash(manifest),"git_commit":commit,"git_dirty":dirty})
     if manifest_only: return manifest
     methods=config.comparison_methods if comparison else (config.fusion.method,)
     results = []

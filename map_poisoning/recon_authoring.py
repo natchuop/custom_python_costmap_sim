@@ -565,6 +565,13 @@ def _select_episode_attack_target(
             shortcut = _recon_false_clearance_shortcut_score(
                 reference_states, benign_ids, detour_grid, cells
             ) if attack_type == AttackType.FALSE_CLEARANCE else 0.0
+            if attack_type == AttackType.FALSE_CLEARANCE and shortcut <= 0.0:
+                # A False Clearance event is only eligible when frozen
+                # reconnaissance shows that clearing this footprint shortens
+                # at least one observed mission.  Traffic/proximity alone is
+                # not enough to call the event navigation-relevant.
+                cache[cache_key] = None
+                continue
             reblock_penalty = (
                 float(stale_features.get("recon_stale_reblock_penalty_steps", 0.0))
                 if attack_type == AttackType.STALE_REASSERTION
@@ -645,7 +652,17 @@ def _select_episode_attack_target(
                 score,
             )
         else:
-            rank_key = (score,)
+            # Consequence is the primary ranking signal.  Physical-class
+            # diversity is only a soft tie-break, so an unused permanent or
+            # temporary class cannot outrank a materially larger shortcut.
+            rank_key = (
+                float(relevance.get("recon_false_clearance_shortcut_steps", 0.0)),
+                int(
+                    preferred_physical_kind is not None
+                    and relevance.get("physical_obstacle_kind") == preferred_physical_kind
+                ),
+                score,
+            )
         candidates.append((rank_key, target, relevance))
     if not candidates:
         return None
@@ -654,7 +671,30 @@ def _select_episode_attack_target(
     # an event on a zero-consequence footprint while a positive candidate is
     # available; if none exists, leave the slot unused rather than authoring a
     # stale report that cannot affect any recon-observed mission.
-    if attack_type == AttackType.STALE_REASSERTION:
+    if attack_type == AttackType.FALSE_CLEARANCE:
+        positive_candidates = [
+            item for item in candidates
+            if float(item[2].get("recon_false_clearance_shortcut_steps", 0.0)) > 0.0
+        ]
+        if not positive_candidates:
+            return None
+        # Prefer a distinct physical target when one exists, but allow reuse
+        # after the positive-consequence candidate pool is exhausted. This
+        # preserves a fixed attack schedule without silently spending events
+        # on targets that have no frozen-recon navigation consequence.
+        if target_use_counts is not None:
+            unused_candidates = [
+                item for item in positive_candidates
+                if target_use_counts.get(
+                    str(getattr(item[1], "episode_id", None)
+                        or getattr(item[1], "obstacle_id", None)),
+                    0,
+                ) == 0
+            ]
+            candidates = unused_candidates or positive_candidates
+        else:
+            candidates = positive_candidates
+    elif attack_type == AttackType.STALE_REASSERTION:
         positive_candidates = [
             item for item in candidates
             if float(item[2].get("recon_stale_reblock_penalty_steps", 0.0)) > 0.0
@@ -672,13 +712,6 @@ def _select_episode_attack_target(
         ),
         reverse=True,
     )
-    if preferred_physical_kind is not None:
-        preferred = [
-            item for item in candidates
-            if item[2]["physical_obstacle_kind"] == preferred_physical_kind
-        ]
-        if preferred:
-            candidates = preferred
     _, target, relevance = candidates[0]
     return target, relevance
 
@@ -1186,6 +1219,7 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
     index = 0
     attack_end = config.phases.recon_steps + config.phases.attack_steps
     false_clearance_kind_uses = {"permanent": 0, "temporary": 0}
+    false_clearance_target_uses = {}
     stale_reassertion_target_uses = {}
     physical_target_relevance_cache = {}
 
@@ -1195,11 +1229,10 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
         # underused kind when it has an eligible recon/static candidate; this
         # is seed-stable and defense-independent. Stale Reassertion remains
         # tied only to cleared temporary episodes.
-        # Guarantee coverage of both physical target classes when feasible,
-        # then stop forcing a 50/50 alternation. After each class has been used
-        # at least once, select the globally most route-relevant target. This
-        # keeps False Clearance consequential without using defense-specific
-        # live routes.
+        # Prefer coverage of both physical target classes when feasible, but
+        # let frozen-recon consequence remain the primary target-ranking signal.
+        # This keeps False Clearance consequential without using
+        # defense-specific live routes.
         unused_false_clearance_kinds = [
             kind for kind, count in false_clearance_kind_uses.items() if count == 0
         ]
@@ -1223,7 +1256,9 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 ),
                 relevance_cache=physical_target_relevance_cache,
                 target_use_counts=(
-                    stale_reassertion_target_uses
+                    false_clearance_target_uses
+                    if kind == AttackType.FALSE_CLEARANCE
+                    else stale_reassertion_target_uses
                     if kind == AttackType.STALE_REASSERTION
                     else None
                 ),
@@ -1275,6 +1310,11 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
             ))
             if selected_attack == AttackType.FALSE_CLEARANCE:
                 false_clearance_kind_uses[relevance["physical_obstacle_kind"]] += 1
+                target_key = str(target_id)
+                prior_use_count = false_clearance_target_uses.get(target_key, 0)
+                false_clearance_target_uses[target_key] = prior_use_count + 1
+                if prior_use_count:
+                    warnings.append("false_clearance_target_reused_after_positive_candidates_exhausted")
             elif selected_attack == AttackType.STALE_REASSERTION:
                 stale_key = str(target_id)
                 stale_reassertion_target_uses[stale_key] = stale_reassertion_target_uses.get(stale_key, 0) + 1
@@ -1303,6 +1343,8 @@ def author_warehouse_manifest(config: SimulationConfig, grid=None) -> ScenarioMa
                 "reference_detour_score": relevance["reference_detour_score"],
                 "recon_false_clearance_shortcut_steps": relevance.get("recon_false_clearance_shortcut_steps"),
                 "recon_stale_reblock_penalty_steps": relevance.get("recon_stale_reblock_penalty_steps"),
+                "prior_use_count": prior_use_count if selected_attack == AttackType.FALSE_CLEARANCE else None,
+                "target_reused": bool(prior_use_count) if selected_attack == AttackType.FALSE_CLEARANCE else False,
                 "heatmap_reference_steps": config.phases.recon_steps,
                 "selection_basis": "frozen_reconnaissance_traffic_plus_static_geometry_and_authored_physical_schedule",
             })

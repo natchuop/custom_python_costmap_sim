@@ -54,6 +54,7 @@ RUN_PLOTS = (
     "01_attacker_trust_over_time.png",
     "02_fake_claim_influence.png",
     "02b_attacker_route_cost_influence.png",
+    "02c_attack_navigation_impact.png",
     "03_delivery_progress.png",
     "04_replans_over_time.png",
     "04b_replan_reasons_over_time.png",
@@ -269,6 +270,78 @@ def _title(data, title):
     return f"{title} — {method}, seed {seed}"
 
 
+def _trust_threshold(data):
+    """Return the configured trust threshold, including for current runs.
+
+    Older time-series files carried this value on every row.  Current runs
+    keep it in effective_config.json instead, so reporting must support both
+    schemas rather than silently omitting the threshold line.
+    """
+    threshold = next(
+        (
+            parse_float(row.get("trust_threshold"))
+            for row in data.timeseries
+            if row.get("trust_threshold") not in (None, "")
+        ),
+        None,
+    )
+    if threshold is not None:
+        return threshold
+    if data.directory is None:
+        return None
+    try:
+        config_path = Path(data.directory) / "effective_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        return parse_float(config.get("trust", {}).get("threshold"))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+
+def _trust_transition_events(data, threshold=None):
+    """Normalize legacy trust events and current trust_update crossings.
+
+    The simulator records the actual trust change as ``trust_update`` with a
+    recipient, old trust, and new trust.  The older reporter expected
+    synthesized ``attacker_distrusted``/``attacker_retrusted`` rows, which
+    made current trust plots and timelines appear empty.
+    """
+    threshold = _trust_threshold(data) if threshold is None else threshold
+    malicious = parse_int(data.summary.get("malicious_robot_id"), 0)
+    transitions = []
+    seen = set()
+    for event in data.events:
+        kind = event.get("kind", "")
+        step = parse_int(event.get("step"))
+        if step is None:
+            continue
+        if kind in {"attacker_distrusted", "attacker_retrusted"}:
+            robot_id = parse_int(event.get("robot_id"), malicious)
+            current_trust = parse_float(event.get("current_trust"), parse_float(event.get("new_trust")))
+            normalized = (step, kind, robot_id, current_trust)
+        elif kind == "trust_update" and threshold is not None:
+            sender_id = parse_int(event.get("sender_id"))
+            robot_id = parse_int(event.get("recipient_id"), parse_int(event.get("robot_id")))
+            old_trust = parse_float(event.get("old_trust"))
+            new_trust = parse_float(event.get("new_trust"))
+            if sender_id != malicious or robot_id is None or old_trust is None or new_trust is None:
+                continue
+            if old_trust >= threshold and new_trust < threshold:
+                transition_kind = "attacker_distrusted"
+            elif old_trust < threshold and new_trust >= threshold:
+                transition_kind = "attacker_retrusted"
+            else:
+                continue
+            normalized = (step, transition_kind, robot_id, new_trust)
+        else:
+            continue
+        key = normalized[:3]
+        if key in seen:
+            continue
+        seen.add(key)
+        transitions.append(normalized)
+    return sorted(transitions, key=lambda item: (item[0], item[2] if item[2] is not None else -1, item[1]))
+
+
 def _plot_trust(data, path):
     field = "attacker_trust"
     if not data.timeseries or not any(field in row for row in data.timeseries):
@@ -279,23 +352,15 @@ def _plot_trust(data, path):
         values = _series(data.timeseries, rid, field)
         if values:
             ax.plot([x for x, _ in values], [y for _, y in values], color=_robot_color(rid), label=_robot_role_label(data, rid))
-    threshold = next((parse_float(row.get("trust_threshold")) for row in data.timeseries if row.get("trust_threshold") not in (None, "")), None)
+    threshold = _trust_threshold(data)
     if threshold is not None:
         ax.axhline(threshold, color="black", linestyle=":", label=f"threshold={threshold:.3f}")
     _decorate_phases(ax, data.timeseries)
-    marker_labels = set()
-    for event in data.events:
-        kind = event.get("kind")
-        if kind not in {"attacker_distrusted", "attacker_retrusted"}:
-            continue
-        step = parse_int(event.get("step")); robot_id = parse_int(event.get("robot_id"))
-        if step is None or robot_id is None:
+    for step, kind, robot_id, current_trust in _trust_transition_events(data, threshold):
+        if robot_id is None or current_trust is None:
             continue
         marker = "v" if kind == "attacker_distrusted" else "^"
-        label = None
-        current_trust = parse_float(event.get("current_trust"))
-        if current_trust is not None:
-            ax.scatter(step, current_trust, marker=marker, color=_robot_color(robot_id), s=42, zorder=4)
+        ax.scatter(step, current_trust, marker=marker, color=_robot_color(robot_id), s=42, zorder=4)
     ax.set(title=_title(data, "Attacker trust over time"), xlabel="Simulation step", ylabel="Trust [0, 1]", ylim=(0, 1.05))
     handles = [Line2D([0], [0], color=_robot_color(rid), label=_robot_role_label(data, rid)) for rid in _benign_ids(data)]
     if threshold is not None:
@@ -315,22 +380,28 @@ def _plot_influence(data, path):
     fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     benign = _benign_ids(data)
     type_specs = (
-        ("fake_obstacle", "Fake obstacle", "#d62728"),
-        ("false_clearance", "False clearance", "#9467bd"),
-        ("stale_reassertion", "Stale reassertion", "#8c564b"),
+        ("fake_obstacle", "Fake obstacle", "#d62728", "fake"),
+        ("false_clearance", "False clearance", "#9467bd", "false_clearance"),
+        ("stale_reassertion", "Stale reassertion", "#8c564b", "stale_reassertion"),
     )
+    authored_types = {
+        str(event.get("attack_type"))
+        for event in data.manifest.get("attack_events", [])
+        if event.get("attack_type")
+    }
+    candidate_specs = [spec for spec in type_specs if not authored_types or spec[0] in authored_types]
     available = [
         spec for spec in type_specs
-        if any(
-            f"active_{spec[0]}_claim_count" in row
-            or f"influential_{spec[0]}_claim_count" in row
+        if spec in candidate_specs and any(
+            f"active_{spec[3]}_claim_count" in row
+            or f"influential_{spec[3]}_claim_count" in row
             for row in data.timeseries
         )
     ]
     # Render older run directories produced before the per-type schema was
     # added.  New runs use the explicit type columns above.
     if not available and all(field in data.timeseries[0] for field in ("active_fake_claim_count", "influential_fake_claim_count")):
-        available = [("fake_obstacle", "Fake obstacle", "#d62728")]
+        available = [("fake_obstacle", "Fake obstacle", "#d62728", "fake")]
         legacy = True
     else:
         legacy = False
@@ -338,13 +409,20 @@ def _plot_influence(data, path):
         data.warnings.append("attack influence plot skipped: influence columns are absent")
         plt.close(fig)
         return False
-    for attack_type, label, color in available:
-        active_field = "active_fake_claim_count" if legacy else f"active_{attack_type}_claim_count"
-        influential_field = "influential_fake_claim_count" if legacy else f"influential_{attack_type}_claim_count"
-        if benign:
-            reference = dict(_series(data.timeseries, benign[0], active_field, parse_int))
+    for attack_type, label, color, suffix in available:
+        active_field = "active_fake_claim_count" if legacy else f"active_{suffix}_claim_count"
+        influential_field = "influential_fake_claim_count" if legacy else f"influential_{suffix}_claim_count"
+        for rid in benign:
+            reference = dict(_series(data.timeseries, rid, active_field, parse_int))
             if reference:
-                top.step(sorted(reference), [reference[x] for x in sorted(reference)], where="post", color=color, label=f"Stored {label.lower()} claims")
+                top.step(
+                    sorted(reference),
+                    [reference[x] for x in sorted(reference)],
+                    where="post",
+                    color=color,
+                    alpha=0.75,
+                    label=f"R{rid} stored {label.lower()} claims",
+                )
         for rid in benign:
             values = _series(data.timeseries, rid, influential_field, parse_int)
             if values:
@@ -352,9 +430,9 @@ def _plot_influence(data, path):
     _decorate_phases(top, data.timeseries); _decorate_phases(bottom, data.timeseries)
     top.set(title="Stored / unexpired malicious claims by attack type", ylabel="Stored claims")
     bottom.set(
-        title="Operationally influential malicious claims by attack type",
+        title="Fusion-influential malicious claims by attack type",
         xlabel="Simulation step",
-        ylabel="Influential claims",
+        ylabel="Fusion-influential claims",
     )
     for axis in (top, bottom):
         handles, labels = axis.get_legend_handles_labels()
@@ -405,6 +483,69 @@ def _plot_route_cost(data, path):
             axis.legend()
         axis.grid(alpha=0.25)
     fig.suptitle(_title(data, "Attacker route-cost influence"))
+    _save(fig, path)
+    return True
+
+
+def _plot_attack_navigation_impact(data, path):
+    """Show event-level navigation influence separately from fusion influence."""
+    events = [
+        event for event in data.events
+        if event.get("kind") == "attack_route_impact"
+        and event.get("attack_navigation_influential_cells") is not None
+    ]
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    if events:
+        grouped = {}
+        overlap = {}
+        for event in events:
+            robot_id = parse_int(event.get("recipient_id"))
+            attack_type = str(event.get("attack_type", "attack")).replace("_", " ")
+            step = parse_int(event.get("step"))
+            if robot_id is None or step is None:
+                continue
+            label = f"R{robot_id} {attack_type}"
+            grouped.setdefault(label, []).append(
+                (step, parse_float(event.get("attack_navigation_influential_cells"), 0.0) or 0.0)
+            )
+            overlap.setdefault(label, []).append((
+                step,
+                parse_float(event.get("attack_pre_fusion_route_overlap_cells"), 0.0) or 0.0,
+                parse_float(event.get("attack_post_replan_route_overlap_cells"), 0.0) or 0.0,
+            ))
+        for label, values in sorted(grouped.items()):
+            values.sort()
+            top.plot([step for step, _ in values], [value for _, value in values], marker="o", label=label)
+        for label, values in sorted(overlap.items()):
+            values.sort()
+            bottom.plot(
+                [step for step, _, _ in values],
+                [value for _, value, _ in values],
+                marker="o",
+                linestyle="-",
+                label=f"{label} pre-fusion",
+            )
+            bottom.plot(
+                [step for step, _, _ in values],
+                [value for _, _, value in values],
+                marker="x",
+                linestyle="--",
+                alpha=0.7,
+                label=f"{label} post-replan",
+            )
+    if not events or not grouped:
+        top.text(0.5, 0.5, "No event-level navigation-influence data", transform=top.transAxes, ha="center", va="center")
+        bottom.text(0.5, 0.5, "No pre-/post-replan overlap data", transform=bottom.transAxes, ha="center", va="center")
+    _decorate_phases(top, data.timeseries)
+    _decorate_phases(bottom, data.timeseries)
+    top.set(title="Navigation-influential malicious cells at attack events", ylabel="Cells")
+    bottom.set(title="Attack footprint overlap before fusion and after replanning", xlabel="Simulation step", ylabel="Overlapping cells")
+    for axis in (top, bottom):
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(fontsize=8)
+        axis.grid(alpha=0.25)
+    fig.suptitle(_title(data, "Event-level attack navigation impact"))
     _save(fig, path)
     return True
 
@@ -654,21 +795,20 @@ def _plot_trajectories_by_phase(data, path):
 def _plot_events(data, path):
     trust_rows = {}
     deadlocks = {}
+    for step, kind, robot_id, _ in _trust_transition_events(data):
+        label = f"R{robot_id} trust"
+        trust_rows.setdefault(label, []).append((step, kind, robot_id))
     for event in data.events:
         kind = event.get("kind", "")
-        if kind in {"attacker_distrusted", "attacker_retrusted"}:
-            # Older event CSVs did not identify the affected robot.  Keep
-            # those reports renderable and use the attacker as the fallback.
-            robot_id = parse_int(event.get("robot_id"), parse_int(data.summary.get("malicious_robot_id"), 0))
-            label = f"R{robot_id} trust"
-            trust_rows.setdefault(label, []).append((parse_int(event.get("step"), 0), kind, robot_id))
-        elif kind in {"traffic_deadlock_detected", "traffic_deadlock_recovered"}:
+        if kind in {"traffic_deadlock_detected", "traffic_deadlock_recovered"}:
             deadlock_id = event.get("deadlock_id") or f"legacy-{event.get('robot_id')}-{event.get('step')}"
             deadlocks.setdefault(deadlock_id, {})[kind] = parse_int(event.get("step"), 0)
             deadlocks[deadlock_id]["robot_id"] = parse_int(event.get("robot_id"))
     deadlock_robot_ids = sorted({episode.get("robot_id") for episode in deadlocks.values() if episode.get("robot_id") is not None})
-    deadlock_labels = [f"R{rid} traffic deadlocks" for rid in deadlock_robot_ids] or ["Traffic deadlock episodes"]
+    deadlock_labels = [f"R{rid} traffic deadlocks" for rid in deadlock_robot_ids]
     labels = sorted(trust_rows) + deadlock_labels
+    if not labels:
+        labels = ["No trust/deadlock events"]
     fig, ax = plt.subplots(figsize=(11, 4))
     for index, label in enumerate(sorted(trust_rows)):
         for step, kind, robot_id in trust_rows[label]:
@@ -692,6 +832,8 @@ def _plot_events(data, path):
     if handles:
         unique = dict(zip(legend_labels, handles)); ax.legend(unique.values(), unique.keys(), fontsize=8)
     ax.grid(axis="x", alpha=0.25)
+    if labels == ["No trust/deadlock events"]:
+        ax.text(0.5, 0.55, "No trust-threshold crossings or traffic deadlock episodes recorded", transform=ax.transAxes, ha="center", va="center", color="0.4")
     _save(fig, path)
 
 
@@ -700,7 +842,7 @@ def _plot_traffic(data, path):
     for rid in _benign_ids(data):
         values = _series(data.timeseries, rid, "benign_traffic_wait_steps", parse_int)
         duration.append((f"R{rid} waits", values[-1][1] if values else 0))
-    events = (("vertex conflicts", "vertex_conflicts_detected"), ("swap conflicts", "head_on_swap_conflicts_detected"), ("reservation conflicts", "reservation_conflicts_detected"), ("traffic replans", "traffic_replans"), ("yield episodes", "traffic_yield_events"), ("deadlocks detected", "deadlocks_detected"), ("deadlocks recovered", "deadlocks_recovered"), ("overlap violations", "robot_overlap_violations"))
+    events = (("vertex conflicts", "vertex_conflicts_detected"), ("swap conflicts", "head_on_swap_conflicts_detected"), ("reservation conflicts", "reservation_conflicts_detected"), ("traffic replans", "traffic_replans"), ("yield episodes", "traffic_yield_events"), ("yield episodes completed", "traffic_yields_completed"), ("deadlocks detected", "deadlocks_detected"), ("deadlocks recovered", "deadlocks_recovered"), ("overlap violations", "robot_overlap_violations"))
     detected = parse_float(data.summary.get("deadlocks_detected"))
     recovered = parse_float(data.summary.get("deadlocks_recovered"))
     if detected is not None and recovered is not None and recovered > detected:
@@ -731,11 +873,12 @@ def _write_run_summary(data, plot_names):
     reason_diagnostics = []
     planning_diagnostics = []
     traffic_diagnostics = []
+    trust_transitions = _trust_transition_events(data)
     for rid in _benign_ids(data):
         trust = [value for _, value in _series(data.timeseries, rid, "attacker_trust")]
         influential = [value for _, value in _series(data.timeseries, rid, "influential_fake_claim_count", parse_int)]
         route = [value for _, value in _series(data.timeseries, rid, "attacker_attributable_cost_on_route")]
-        distrust_steps = [parse_int(event.get("step")) for event in data.events if event.get("kind") == "attacker_distrusted" and parse_int(event.get("robot_id")) == rid]
+        distrust_steps = [step for step, kind, robot_id, _ in trust_transitions if kind == "attacker_distrusted" and robot_id == rid]
         influence_diagnostics.append(f"  R{rid}: first distrust={distrust_steps[0] if distrust_steps else 'NA'}, final trust={trust[-1] if trust else 'NA'}, peak influential={max(influential) if influential else 'NA'}, final influential={influential[-1] if influential else 'NA'}, peak route cost={max(route) if route else 'NA'}")
         reasons = [event for event in data.events if event.get("kind") == "replan" and parse_int(event.get("robot_id")) == rid]
         reason_counts = {}
@@ -785,10 +928,12 @@ def _write_run_summary(data, plot_names):
         f"  route cost reduction mean/total: {s.get('attack_route_cost_reduction_mean', 'NA')}/{s.get('attack_route_cost_reduction_total', 'NA')}",
         f"  extra path length mean/max/total: {s.get('attack_extra_path_length_mean', 'NA')}/{s.get('attack_extra_path_length_max', 'NA')}/{s.get('attack_extra_path_length_total', 'NA')}",
         f"  shortcut path length mean/total: {s.get('attack_shortcut_path_length_mean', 'NA')}/{s.get('attack_shortcut_path_length_total', 'NA')}",
-        f"  malicious acceptance / false acceptance: {s.get('malicious_acceptance_rate', 'NA')}/{s.get('malicious_false_acceptance_rate', 'NA')}",
-        f"  fake-obstacle acceptance: {s.get('fake_obstacle_acceptance_rate', 'NA')} (false: {s.get('fake_obstacle_false_acceptance_rate', 'NA')})",
-        f"  false-clearance acceptance: {s.get('false_clearance_acceptance_rate', 'NA')} (false: {s.get('false_clearance_false_acceptance_rate', 'NA')})",
-        f"  stale-reassertion acceptance: {s.get('stale_reassertion_acceptance_rate', 'NA')} (false: {s.get('stale_reassertion_false_acceptance_rate', 'NA')})",
+        f"  navigation-influential malicious cells/events: {s.get('attack_navigation_influential_cells', 'NA')}/{s.get('attack_navigation_influence_events', 'NA')}",
+        f"  attack route overlap pre-fusion/post-replan: {s.get('attack_pre_fusion_route_overlap_cells', 'NA')}/{s.get('attack_post_replan_route_overlap_cells', 'NA')}",
+        f"  malicious acceptance / fusion false acceptance: {s.get('malicious_acceptance_rate', 'NA')}/{s.get('malicious_false_acceptance_rate', 'NA')}",
+        f"  fake-obstacle acceptance: {s.get('fake_obstacle_acceptance_rate', 'NA')} (fusion false: {s.get('fake_obstacle_false_acceptance_rate', 'NA')})",
+        f"  false-clearance acceptance: {s.get('false_clearance_acceptance_rate', 'NA')} (fusion false: {s.get('false_clearance_false_acceptance_rate', 'NA')})",
+        f"  stale-reassertion acceptance: {s.get('stale_reassertion_acceptance_rate', 'NA')} (fusion false: {s.get('stale_reassertion_false_acceptance_rate', 'NA')})",
         f"  steps route affected by attacker: {s.get('steps_route_affected_by_attacker', 'NA')}",
         *influence_diagnostics,
         "", "Traffic:",
@@ -809,7 +954,7 @@ def generate_run_report(run_directory: str | Path, *, formats=("png",)) -> dict:
     generated = []
     if "png" in formats:
         funcs = (
-            _plot_trust, _plot_influence, _plot_route_cost, _plot_progress,
+            _plot_trust, _plot_influence, _plot_route_cost, _plot_attack_navigation_impact, _plot_progress,
             _plot_replans, _plot_replan_reasons, _plot_replan_productivity,
             _plot_navigation, _plot_trajectories, _plot_trajectories_by_phase,
             _plot_events, _plot_traffic,
@@ -951,9 +1096,9 @@ def _plot_comparison_attack_types(rows, path):
         plt.close(fig)
         return False
     ax.set(
-        title="Operational malicious influence by attack type and method",
+        title="Fusion-influential malicious claims by attack type and method",
         xlabel="Simulation step",
-        ylabel="Mean influential claims",
+        ylabel="Mean fusion-influential claims",
     )
     ax.legend(fontsize=8, ncol=2)
     ax.grid(alpha=0.25)
@@ -1119,6 +1264,10 @@ MULTISEED_DIRECTIONS = {
     "attack_extra_path_length_mean": ("lower_better", "cells"),
     "attack_extra_path_length_max": ("lower_better", "cells"),
     "attack_extra_path_length_total": ("lower_better", "cells"),
+    "attack_navigation_influential_cells": ("lower_better", "cells"),
+    "attack_navigation_influence_events": ("lower_better", "events"),
+    "attack_pre_fusion_route_overlap_cells": ("diagnostic", "cells"),
+    "attack_post_replan_route_overlap_cells": ("diagnostic", "cells"),
     "attack_signed_route_cost_delta_mean": ("diagnostic", "cost"),
     "attack_route_cost_reduction_mean": ("lower_better", "cost"),
     "attack_mean_influential_malicious_cells": ("lower_better", "cells"),
@@ -1330,6 +1479,14 @@ def _write_multiseed_csvs(root, runs, requested_methods=None):
         "attack_extra_path_length_mean",
         "attack_extra_path_length_max",
         "attack_extra_path_length_total",
+        "attack_navigation_influential_cells",
+        "attack_navigation_influence_events",
+        "attack_pre_fusion_route_overlap_cells",
+        "attack_post_replan_route_overlap_cells",
+        "false_clearance_navigation_influential_cells",
+        "false_clearance_navigation_influence_events",
+        "false_clearance_pre_fusion_route_overlap_cells",
+        "false_clearance_post_replan_route_overlap_cells",
         "steps_route_affected_by_attacker",
         "time_to_distrust_malicious_robot",
         "malicious_reports_operationally_ignored",
@@ -1683,18 +1840,36 @@ def _plot_paper_a3(raw, path):
         "trust_fused": (8, 8),
         "source_memory": (8, -9),
     }
+    y_values = [y for _, _, y in points]
+    y_span_for_labels = max(max(y_values) - min(y_values), 1.0)
     for index, (method, x, y) in enumerate(points):
         ax.scatter(x, y, s=100, marker=PHYSICAL_MARKERS[method], color=_paper_color(method), edgecolor="black", linewidth=.6, zorder=3)
         offset = label_offsets[method]
+        nearby = [
+            (other_y, other_index)
+            for other_index, (_, other_x, other_y) in enumerate(points)
+            if other_index != index
+            and abs(other_x - x) <= 4.5
+            and abs(other_y - y) <= max(3.0, y_span_for_labels * .10)
+        ]
+        if nearby:
+            # Separate labels for nearly coincident methods deterministically,
+            # using the data-point ordering rather than renderer-dependent
+            # bounding-box measurements.
+            rank = sum(other_y < y or (other_y == y and other_index < index) for other_y, other_index in nearby)
+            offset = (offset[0] - 4, (-26, 26, 46)[min(rank, 2)])
         ax.annotate(_paper_method_label(method), (x, y), xytext=offset, textcoords="offset points",
                     ha="right" if offset[0] < 0 else "left", fontsize=9)
     ax.set(xlabel="False reports accepted (%)", ylabel="Mean delivery-cycle duration (steps)", title="Security/performance tradeoff")
     ax.set_xlim(0, 102)
     ax.set_xticks((0, 20, 40, 60, 80, 100))
-    y_values = [y for _, _, y in points]
     y_center = float(np.median(y_values)); minimum_span = max(14.0, abs(y_center) * .14)
     y_min, y_max = min(y_values), max(y_values); span = max(y_max - y_min, minimum_span)
-    lower = max(0.0, y_min - span * .25); upper = lower + span * 1.25
+    lower = max(0.0, y_min - span * .25)
+    # Keep explicit headroom above the maximum point.  The old formula could
+    # place the upper limit exactly at y_max when lower was clamped to zero,
+    # clipping the marker and its annotation in the rendered PNG.
+    upper = max(y_max + max(2.0, span * .12), lower + span * 1.25)
     ax.set_ylim(lower, upper)
     ax.axvspan(0, 20, color="#dcefd8", alpha=.18, zorder=0)
     ax.axhspan(lower, lower + span * .25, color="#dcefd8", alpha=.18, zorder=0)

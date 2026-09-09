@@ -10,11 +10,15 @@ from map_poisoning.reporting import (
     COMPARISON_PLOTS,
     generate_comparison_report,
     generate_run_report,
+    load_run_data,
     parse_bool,
     parse_tuple,
     _replan_category,
     REPLAN_REASON_BIN_STEPS,
     RunReportData,
+    _plot_influence,
+    _trust_threshold,
+    _trust_transition_events,
     _valid_attack_metrics,
     _recovery_trust_metrics,
     focal_comparison_method,
@@ -43,6 +47,7 @@ SUMMARY_FIELDS = {
     "reservation_conflicts_detected": "0",
     "traffic_replans": "1",
     "traffic_yield_events": "1",
+    "traffic_yields_completed": "1",
     "deadlocks_detected": "0",
     "deadlocks_recovered": "0",
     "robot_overlap_violations": "0",
@@ -178,6 +183,53 @@ def test_unsampled_trust_event_is_retained_in_report(tmp_path):
         writer.writeheader(); writer.writerows(rows)
     result = generate_run_report(run)
     assert "01_attacker_trust_over_time.png" in result["generated"]
+
+
+def test_current_trust_updates_are_reported_as_threshold_crossings(tmp_path):
+    run = tmp_path / "trust_updates"
+    _write_run(run)
+    timeseries = list(csv.DictReader((run / "robot_timeseries.csv").open(newline="", encoding="utf-8")))
+    timeseries = [{key: value for key, value in row.items() if key != "trust_threshold"} for row in timeseries]
+    with (run / "robot_timeseries.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=sorted(timeseries[0]))
+        writer.writeheader(); writer.writerows(timeseries)
+    (run / "effective_config.json").write_text(json.dumps({"trust": {"threshold": 0.7}}), encoding="utf-8")
+    with (run / "events.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["step", "kind", "sender_id", "recipient_id", "old_trust", "new_trust"])
+        writer.writeheader()
+        writer.writerows([
+            {"step": 5, "kind": "trust_update", "sender_id": 0, "recipient_id": 1, "old_trust": ".71", "new_trust": ".69"},
+            {"step": 8, "kind": "trust_update", "sender_id": 0, "recipient_id": 1, "old_trust": ".69", "new_trust": ".72"},
+            {"step": 9, "kind": "trust_update", "sender_id": 1, "recipient_id": 0, "old_trust": ".90", "new_trust": ".80"},
+        ])
+    data = load_run_data(run)
+    assert _trust_threshold(data) == .7
+    assert _trust_transition_events(data) == [
+        (5, "attacker_distrusted", 1, .69),
+        (8, "attacker_retrusted", 1, .72),
+    ]
+    result = generate_run_report(run)
+    assert "01_attacker_trust_over_time.png" in result["generated"]
+    assert "07_event_timeline.png" in result["generated"]
+
+
+def test_influence_plot_uses_fake_alias_and_all_benign_robots(tmp_path, monkeypatch):
+    run = tmp_path / "influence"
+    _write_run(run)
+    data = load_run_data(run)
+    labels = []
+    from matplotlib.axes import Axes
+
+    original_step = Axes.step
+
+    def recording_step(axis, *args, **kwargs):
+        labels.append(kwargs.get("label"))
+        return original_step(axis, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "step", recording_step)
+    assert _plot_influence(data, run / "plots" / "02_fake_claim_influence.png")
+    assert "R1 stored fake obstacle claims" in labels
+    assert "R2 stored fake obstacle claims" in labels
 
 
 def test_multiseed_attack_metrics_use_only_benign_attack_samples():

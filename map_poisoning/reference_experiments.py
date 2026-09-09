@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .batch import run_multiseed, parse_seed_spec
-from .config import LoggingConfig, SimulationConfig
+from .config import LoggingConfig, PhaseConfig, SimulationConfig
 from .map_io import packaged_movingai_map_path
 from .reporting import REFERENCE_FIGURE_METHODS, generate_reference_report
 
@@ -182,6 +182,9 @@ def main(argv=None):
                         help="run two maps x three attack sets with stale reassertion disabled")
     parser.add_argument("--scenario-preset")
     parser.add_argument("--map-npy")
+    parser.add_argument("--recon-steps", type=int, default=500)
+    parser.add_argument("--attack-steps", type=int, default=2000)
+    parser.add_argument("--recovery-steps", type=int, default=500)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--no-sweeps", action="store_true")
     parser.add_argument("--only", choices=("all", "normal", "attack_intensity", "runtime", "honest_delay"), default="all")
@@ -190,12 +193,15 @@ def main(argv=None):
     parser.add_argument("--no-measure-fusion-runtime", action="store_true")
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="stop the matrix immediately if one seed/method fails")
     args = parser.parse_args(argv)
     if args.render_only:
         generate_reference_report(args.output_directory)
         return 0
     config = SimulationConfig(
         logging=LoggingConfig(output_directory=str(args.output_directory), generate_plots=False),
+        phases=PhaseConfig(args.recon_steps, args.attack_steps, args.recovery_steps),
         scenario_preset=args.scenario_preset, map_npy=args.map_npy, max_steps=args.max_steps,
     )
     if args.attack_matrix:
@@ -205,6 +211,7 @@ def main(argv=None):
             args.output_directory,
             resume=args.resume,
             generate_per_run_plots=True,
+            fail_fast=args.fail_fast,
         )
         return 0
     levels = None

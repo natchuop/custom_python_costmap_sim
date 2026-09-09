@@ -130,6 +130,10 @@ class ModularRobot:
     verified_reports: dict[str, int] = field(default_factory=dict)
     last_trust_batches: list[dict] = field(default_factory=list)
     last_route_affecting_report_ids: set[str] = field(default_factory=set)
+    # Accepted reports whose cell traversal cost changed materially during
+    # fusion, regardless of whether the cell was on the old route.  This is a
+    # navigation metric, distinct from fusion influence and old-route impact.
+    last_navigation_influential_report_ids: set[str] = field(default_factory=set)
     # Accepted FREE reports that reopen a cell previously treated as an infinite-cost
     # obstacle. These are not necessarily on the current path; they may create a
     # genuinely cheaper shortcut and therefore deserve a uniform improvement check.
@@ -277,6 +281,7 @@ class ModularRobot:
         accepted = []
         self.last_route_affecting_report_ids.clear()
         self.last_newly_opened_report_ids.clear()
+        self.last_navigation_influential_report_ids.clear()
         remaining = set(self.path or ())
         for report in self.inbox:
             policy = decide(self.admission_policy, self.trust.score(report.sender_id), self.trust_threshold)
@@ -297,7 +302,10 @@ class ModularRobot:
                 self.belief.traversal_cost(target, step, self.fusion)
                 if shortcut_candidate else None
             )
-            before_cost = self.belief.traversal_cost(target, step, self.fusion) if route_candidate else None
+            # Measure the cell before and after every accepted report.  This
+            # captures a real operational map change even when the cell was
+            # not on the robot's previous detour route.
+            before_cost = self.belief.traversal_cost(target, step, self.fusion)
             # The malicious label is passed only for offline counterfactual
             # metrics; it never changes fusion weighting or robot decisions.
             is_malicious = report.report_id in malicious_ids
@@ -338,12 +346,18 @@ class ModularRobot:
                 and not math.isinf(after_shortcut_cost)
             ):
                 self.last_newly_opened_report_ids.add(report.report_id)
-            if route_candidate:
-                after_cost = self.belief.traversal_cost(target, step, self.fusion)
-                materially_changed = (
-                    math.isinf(before_cost) != math.isinf(after_cost)
-                    or (not math.isinf(before_cost) and not math.isinf(after_cost) and abs(after_cost - before_cost) >= 0.10)
+            after_cost = self.belief.traversal_cost(target, step, self.fusion)
+            materially_changed = (
+                math.isinf(before_cost) != math.isinf(after_cost)
+                or (
+                    not math.isinf(before_cost)
+                    and not math.isinf(after_cost)
+                    and abs(after_cost - before_cost) >= 0.10
                 )
+            )
+            if materially_changed:
+                self.last_navigation_influential_report_ids.add(report.report_id)
+            if route_candidate:
                 if materially_changed:
                     self.last_route_affecting_report_ids.add(report.report_id)
         self.inbox.clear()

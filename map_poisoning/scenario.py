@@ -4,6 +4,7 @@ import hashlib, json
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 from .config import SimulationConfig
 from .models import (
@@ -225,13 +226,111 @@ def _mission_reblock_penalty(cells, mission_pairs, grid, permanent_obstacles=())
     return max(0.0, best)
 
 
-def _instantiate_attack(kind, *, step, rng, episodes, permanent_obstacles, route_cells, use_count, selected, config, grid, forbidden, preferred_false_clearance_kind=None, stale_target_uses=None, mission_pairs=()):
+def _instantiate_attack(
+    kind,
+    *,
+    step,
+    rng,
+    episodes,
+    permanent_obstacles,
+    route_cells,
+    use_count,
+    selected,
+    config,
+    grid,
+    forbidden,
+    preferred_false_clearance_kind=None,
+    stale_target_uses=None,
+    false_clearance_target_uses=None,
+    mission_pairs=(),
+    recon_candidates=None,
+    recon_reference_states=None,
+    recon_benign_ids=(),
+    recon_heatmap=None,
+    recon_relevance_cache=None,
+):
     """Place one attack of the requested kind, or return None if it cannot be sited."""
     if kind == AttackType.FAKE_OBSTACLE:
+        if recon_candidates is not None:
+            active_cells = _active_temp_cells(episodes, step)
+            pool = [
+                candidate
+                for candidate in recon_candidates
+                if not set(map(tuple, candidate["report_cells"])).intersection(active_cells)
+            ][: config.attacks.candidate_top_k]
+            used_unique = set(selected)
+            require_new_center = len(used_unique) < config.attacks.min_unique_footprints
+            eligible = [
+                candidate
+                for candidate in pool
+                if use_count.get(tuple(candidate["center_cell"]), 0)
+                < config.attacks.max_uses_per_footprint
+                and (
+                    not require_new_center
+                    or (
+                        tuple(candidate["center_cell"]) not in used_unique
+                        and all(
+                            abs(candidate["center_cell"][0] - old[0])
+                            + abs(candidate["center_cell"][1] - old[1])
+                            >= config.attacks.min_center_spacing
+                            for old in used_unique
+                        )
+                    )
+                )
+            ]
+            if not eligible:
+                eligible = [
+                    candidate
+                    for candidate in pool
+                    if use_count.get(tuple(candidate["center_cell"]), 0)
+                    < config.attacks.max_uses_per_footprint
+                ]
+            if eligible:
+                candidate = rng.choices(
+                    eligible,
+                    weights=list(range(len(eligible), 0, -1)),
+                    k=1,
+                )[0]
+                cells = tuple(tuple(cell) for cell in candidate["report_cells"])
+                return cells, ClaimType.BLOCKED, step, None, tuple(candidate["center_cell"])
+            return None
         cells = _place_fake_cells(rng, route_cells, use_count, selected, config, grid, forbidden, _active_temp_cells(episodes, step))
         if not cells:
             return None
         return cells, ClaimType.BLOCKED, step, None, _center_cell(cells)
+    if recon_reference_states is not None and recon_heatmap is not None:
+        from .recon_authoring import _select_episode_attack_target
+
+        selected_target = _select_episode_attack_target(
+            episodes,
+            permanent_obstacles,
+            recon_reference_states,
+            step,
+            kind,
+            recon_benign_ids,
+            grid,
+            recon_heatmap,
+            preferred_physical_kind=preferred_false_clearance_kind,
+            relevance_cache=(recon_relevance_cache if recon_relevance_cache is not None else {}),
+            target_use_counts=(
+                false_clearance_target_uses
+                if kind == AttackType.FALSE_CLEARANCE
+                else stale_target_uses
+                if kind == AttackType.STALE_REASSERTION
+                else None
+            ),
+        )
+        if selected_target is None:
+            return None
+        target, _ = selected_target
+        cells = tuple(target.cells)
+        claim = ClaimType.FREE if kind == AttackType.FALSE_CLEARANCE else ClaimType.BLOCKED
+        observation = (
+            step
+            if kind == AttackType.FALSE_CLEARANCE
+            else max(0, target.clearance_step - 1)
+        )
+        return cells, claim, observation, target, _center_cell(cells)
     if kind == AttackType.FALSE_CLEARANCE:
         active = [episode for episode in episodes if _episode_is_active(episode, step)]
         permanent = list(permanent_obstacles)
@@ -362,7 +461,14 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     config.validate(); grid = demo_grid() if grid is None else grid
     # Import lazily to keep the low-level scenario model independent of the
     # rollout module during normal package import.
-    from .recon_authoring import run_reconnaissance, _recon_reblock_features
+    from .recon_authoring import (
+        _historical_visibility_delay,
+        _recon_reblock_features,
+        _select_episode_attack_target,
+        recon_heatmap_attack_candidates,
+        run_clean_reference_rollout,
+        run_reconnaissance,
+    )
     preset = preset_for_id(config.scenario_preset) if config.scenario_preset else preset_for_hash(_hash(grid))
     if config.scenario_preset:
         validate_fixed_preset(grid, preset)
@@ -393,19 +499,36 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     queues = build_fixed_task_queues((sender, *benign), targets, config.deliveries_per_robot)
     if config.deliveries_per_robot < len(targets):
         queues[sender] = build_fixed_task_queues((sender,), targets, len(targets))[sender]
-    traffic_heatmap = np.zeros(grid.shape, dtype=np.int32)
-    for cell in bootstrap_route_cells:
-        traffic_heatmap[cell] += 1
     phase_boundaries = {
         "reconnaissance_end": phases.recon_steps,
         "attack_end": phases.recon_steps + phases.attack_steps,
         "total": phases.total_steps,
     }
     static_grid = tuple(tuple(int(value) for value in row) for row in grid)
-    # Physical obstacle placement is pre-authored from static mission geometry.
-    # The single clean rollout below is still the only reconnaissance source for
-    # attack relevance, so generic maps and the warehouse use the same frozen
-    # authoring boundary without paying for a second synthetic recon pass.
+    # Bootstrap reconnaissance is attack-free and physical-obstacle-free. It
+    # supplies the same seed-stable traffic prior used by the warehouse author,
+    # so physical obstacle placement is not driven by a defense or by a
+    # geometry-only nominal route.
+    bootstrap = ScenarioManifest(
+        SCHEMA_VERSION,
+        config.seed,
+        {},
+        _hash(grid),
+        tuple(grid.shape),
+        static_grid,
+        phase_boundaries,
+        sender,
+        benign,
+        (),
+        (),
+        scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}-bootstrap",
+        protocol_id="modular_v1",
+        robot_starts={0: starts_tuple[0], 1: starts_tuple[1], 2: starts_tuple[2]},
+        task_queues=queues,
+    )
+    traffic_heatmap, _, _ = run_clean_reference_rollout(config, bootstrap)
+    traffic_heatmap = np.asarray(traffic_heatmap, dtype=np.int32)
+
     required_anchors = tuple(dict.fromkeys((*starts_tuple, *targets)))
     permanent_obstacles = author_permanent_obstacles(
         grid,
@@ -451,9 +574,64 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
     frozen_recon = run_reconnaissance(config, reference_manifest)
     route_cells = list(frozen_recon.route_cells()) or bootstrap_route_cells
     mission_pairs = frozen_recon.mission_pairs() or nominal_mission_pairs
+    traffic_heatmap = np.asarray(frozen_recon.traffic_heatmap, dtype=np.int32)
+    reference_states = frozen_recon.states()
+    recon_robots = []
+    for victim_id in benign:
+        trace = [
+            tuple(reference_states[step][victim_id]["position"])
+            for step in sorted(reference_states)
+            if victim_id in reference_states[step]
+        ]
+        if len(trace) < 2:
+            continue
+        recon_robots.append(SimpleNamespace(
+            robot_id=int(victim_id),
+            position=trace[0],
+            goal=trace[-1],
+            path=trace,
+        ))
+
+    def recon_visibility_delay(victim_id, report_cells):
+        return _historical_visibility_delay(
+            reference_states,
+            victim_id,
+            report_cells,
+            config.attacks.visibility_delay_min,
+            config.attacks.visibility_delay_max,
+        )
+
+    base_candidates = recon_heatmap_attack_candidates(
+        physical_base_grid,
+        targets,
+        recon_robots,
+        traffic_heatmap,
+        rng=place_rng,
+        require_route_overlap=True,
+        forbidden_cells=forbidden,
+        active_temp_cells=(),
+        visible_cells_by_robot={},
+        future_visibility_delay_fn=recon_visibility_delay,
+    )
+    if AttackType.FAKE_OBSTACLE in set(enabled) and not base_candidates:
+        base_candidates = recon_heatmap_attack_candidates(
+            physical_base_grid,
+            targets,
+            recon_robots,
+            traffic_heatmap,
+            rng=named_rng(config.seed, "attack_placement_visibility_fallback"),
+            require_route_overlap=True,
+            forbidden_cells=forbidden,
+            active_temp_cells=(),
+            visible_cells_by_robot={},
+            future_visibility_delay_fn=None,
+        )
     candidate_metadata=[]; use_count: dict[tuple[int,int],int]={}; selected=[]
+    authoring_warnings = []
     false_clearance_kind_uses = {"permanent": 0, "temporary": 0}
+    false_clearance_target_uses = {}
     stale_reassertion_target_uses = {}
+    physical_target_relevance_cache = {}
     while step < phases.recon_steps + phases.attack_steps and enabled:
         if not preference_bag:
             preference_bag = list(AttackType)
@@ -475,10 +653,9 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         for kind in ordered:
             preferred_false_clearance_kind = None
             if kind == AttackType.FALSE_CLEARANCE:
-                # Guarantee that both permanent and temporary targets are
-                # exercised when feasible, but do not force an artificial 50/50
-                # split afterward. Once both classes have appeared, choose the
-                # most route-relevant physical target regardless of class.
+                # Prefer both permanent and temporary targets when feasible,
+                # but let frozen-recon consequence remain the primary ranking
+                # signal rather than forcing an artificial class split.
                 unused_kinds = [
                     name for name, count in false_clearance_kind_uses.items() if count == 0
                 ]
@@ -488,14 +665,29 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
                 use_count=use_count, selected=selected, config=config, grid=grid, forbidden=forbidden,
                 preferred_false_clearance_kind=preferred_false_clearance_kind,
                 stale_target_uses=stale_reassertion_target_uses,
+                false_clearance_target_uses=false_clearance_target_uses,
                 mission_pairs=mission_pairs,
+                recon_candidates=base_candidates,
+                recon_reference_states=reference_states,
+                recon_benign_ids=benign,
+                recon_heatmap=traffic_heatmap,
+                recon_relevance_cache=physical_target_relevance_cache,
             )
             if placed is None:
                 continue
             cells, claim, observation, episode, center = placed
             eid=f"attack-{index:04}"
             rids=tuple(f"report-{index:04}-{cell_index:02}" for cell_index in range(len(cells)))
-            events.append(AttackEvent(eid, step, kind, tuple(cells), claim, observation, sender, benign, rids, (getattr(episode, "episode_id", None) or getattr(episode, "obstacle_id", None)) if episode else None)); index += 1
+            target_id = (
+                getattr(episode, "episode_id", None)
+                or getattr(episode, "obstacle_id", None)
+            ) if episode else None
+            prior_target_use_count = (
+                false_clearance_target_uses.get(str(target_id), 0)
+                if kind == AttackType.FALSE_CLEARANCE and target_id is not None
+                else 0
+            )
+            events.append(AttackEvent(eid, step, kind, tuple(cells), claim, observation, sender, benign, rids, target_id)); index += 1
             use_count[center]=use_count.get(center,0)+1; selected.append(center)
             metadata = {
                 "candidate_id": f"candidate-{index-1:04}",
@@ -509,9 +701,15 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
                 "rank": None,
                 "selection_weight": None,
                 "prior_use_count": use_count[center] - 1,
+                "target_prior_use_count": prior_target_use_count,
+                "target_reused": bool(prior_target_use_count),
                 "reference_step": phases.recon_steps - 1,
                 "heatmap_reference_steps": phases.recon_steps,
-                "selection_basis": "frozen_reconnaissance_routes_missions_and_static_geometry",
+                "selection_basis": (
+                    "frozen_reconnaissance_traffic_and_static_geometry"
+                    if kind == AttackType.FAKE_OBSTACLE
+                    else "frozen_reconnaissance_traffic_plus_static_geometry_and_authored_physical_schedule"
+                ),
             }
             if kind == AttackType.STALE_REASSERTION:
                 metadata.update(_recon_reblock_features(
@@ -534,13 +732,18 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
             if kind == AttackType.FALSE_CLEARANCE and episode is not None:
                 target_kind = "permanent" if hasattr(episode, "obstacle_id") else "temporary"
                 false_clearance_kind_uses[target_kind] += 1
+                false_clearance_target_uses[str(target_id)] = prior_target_use_count + 1
+                if prior_target_use_count:
+                    authoring_warnings.append("false_clearance_target_reused_after_positive_candidates_exhausted")
             break
         step += rng.randint(config.attacks.interval_min, config.attacks.interval_max)
     names=("attack_scheduler", "attack_types", "attack_placement", "permanent_obstacles", "temporary_obstacles", "robot_routes", "traffic")
     starts = dict(preset.robot_starts) if preset else {0: starts_tuple[0], 1: starts_tuple[1], 2: starts_tuple[2]}
     # Keep the attacker physically active with the same deterministic repeating
     # queue as the other robots; only its reporting behavior is malicious.
-    warnings=() if len(set(selected)) >= min(config.attacks.min_unique_footprints,len(selected)) else ("concentrated_attack_manifest",)
+    warnings = list(authoring_warnings)
+    if len(set(selected)) < min(config.attacks.min_unique_footprints, len(selected)):
+        warnings.append("concentrated_attack_manifest")
     # Script the attacker independently of defense-dependent benign routes.
     attacker_route=tuple(route_cells) or tuple(free)
     positions=tuple(attacker_route[step % len(attacker_route)] for step in range(phases.total_steps))
@@ -565,7 +768,7 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
         )
         for event in events for report_id in event.report_ids
     )
-    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, phase_boundaries, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="modular_v1", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=warnings, reconnaissance_heatmap=tuple(tuple(int(value) for value in row) for row in frozen_recon.traffic_heatmap), scenario_preset=config.scenario_preset, permanent_obstacles=permanent_obstacles, reconnaissance_data=frozen_recon)
+    return ScenarioManifest(SCHEMA_VERSION, config.seed, {x:derived_seed(config.seed,x) for x in names}, _hash(grid), tuple(grid.shape), static_grid, phase_boundaries, sender, benign, episodes, tuple(events), scenario_id=f"scenario-{config.seed}-{_hash(grid)[:12]}", protocol_id="modular_v1", robot_starts=starts, task_queues=queues, attacker_positions=positions, honest_attacker_reports=honest, report_audit_labels=labels, candidate_metadata=tuple(candidate_metadata), authoring_warnings=tuple(dict.fromkeys(warnings)), reconnaissance_heatmap=tuple(tuple(int(value) for value in row) for row in frozen_recon.traffic_heatmap), scenario_preset=config.scenario_preset, permanent_obstacles=permanent_obstacles, reconnaissance_data=frozen_recon)
 
 def save_manifest(manifest: ScenarioManifest, path: str | Path) -> None:
     Path(path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True), encoding="utf-8")

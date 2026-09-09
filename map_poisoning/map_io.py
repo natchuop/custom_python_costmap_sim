@@ -56,22 +56,28 @@ def default_warehouse_map() -> np.ndarray:
         )
     )
     # The converted source map traps the attacker spawn at (6, 8) behind a
-    # three-cell horizontal wall (rows 10--12).  This one-cell corridor is the
-    # smallest static-map correction that connects its bay to the warehouse
-    # floor while preserving the rest of the upstream layout.
+    # three-cell horizontal wall (rows 10--12). Open that connection, then
+    # widen the three marked upper-map passages to two cells. These explicit
+    # corrections preserve the warehouse's obstacles and shared routes.
     grid[10:13, 8] = 0
+    grid[2:14, 2:4] = 0
+    grid[2:14, 7:9] = 0
+    grid[2:7, 49:51] = 0
+    # Remove the two cells at the extreme upper-right corner; the passage
+    # remains two cells wide below the corner pocket.
+    grid[2, 49:51] = 1
     return grid
 
 
-# Attacker-bay one-cell corridor. Keep a start and a delivery in this column;
-# traffic coordination must single-file it instead of deleting the bay.
+# Attacker-bay logical corridor. Keep a start and a delivery in this column;
+# traffic coordination must preserve this attack-relevant region.
 WAREHOUSE_NARROW_CORRIDOR_CELLS: frozenset[tuple[int, int]] = frozenset(
     (row, 8) for row in range(2, 14)
 )
 WAREHOUSE_ATTACKER_START: tuple[int, int] = (6, 8)
 WAREHOUSE_CORRIDOR_DELIVERY: tuple[int, int] = (3, 8)
-# Keep exactly one delivery in the bay; extra corridor checkpoints pull every
-# robot into the one-cell aisle. The mouth stays a transit cell, not a goal.
+# Keep exactly one delivery in the bay; extra checkpoints would pull every
+# robot into the bay. The mouth stays a transit cell, not a goal.
 WAREHOUSE_EXCLUDED_ACTION_POINTS: frozenset[tuple[int, int]] = (
     WAREHOUSE_NARROW_CORRIDOR_CELLS - {WAREHOUSE_CORRIDOR_DELIVERY}
 )

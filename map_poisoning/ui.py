@@ -156,7 +156,7 @@ def launch(args) -> None:
         "scenario_preset": tk.StringVar(value=initial_preset),
         "seed": tk.StringVar(value=str(args.seed)),
         "trust_model": tk.StringVar(value=args.trust_model),
-        "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.50))),
+        "trust_threshold": tk.StringVar(value=str(getattr(args, "trust_threshold", 0.70))),
         "admission_policy": tk.StringVar(value=args.admission_policy),
         "output": tk.StringVar(value=args.output_directory or ""),
         "manifest": tk.StringVar(value=args.manifest_path or ""),
@@ -298,9 +298,14 @@ def launch(args) -> None:
         if label != "Custom NPY map":
             values["map_path"].set(path or "")
             values["scenario_preset"].set(preset or "")
-        map_status.configure(
-            text=f"Selected experimental geometry: {preset or 'default warehouse behavior'}"
-        )
+        if label == "Default warehouse":
+            map_status.configure(
+                text="Selected corrected default warehouse (fresh in-memory map + recon)"
+            )
+        else:
+            map_status.configure(
+                text=f"Selected experimental geometry: {preset or 'default warehouse behavior'}"
+            )
 
     def execute() -> None:
         try:
