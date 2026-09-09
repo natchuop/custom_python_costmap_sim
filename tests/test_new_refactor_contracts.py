@@ -6,16 +6,17 @@ import pytest
 
 from map_poisoning.cli import config_from_args, parser
 from map_poisoning.config import PRIMARY_METHODS
-from map_poisoning.models import ClaimReport, ClaimType, DeliveryTask, DirectObservation
+from map_poisoning.models import ClaimReport, ClaimType, DeliveryTask, DirectObservation, PermanentObstacle
 from map_poisoning.sensing import lidar_observations, sensor_confidence_for_distance
 from map_poisoning.trust import BayesianTrustModel
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.robot import ModularRobot
+from map_poisoning.world import World
 
 
 def test_primary_method_order_and_headless_compare_defaults():
-    assert PRIMARY_METHODS == ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory")
+    assert PRIMARY_METHODS == ("majority_vote", "full_trust", "trust_fused", "source_memory")
     args = parser().parse_args(["--headless", "--compare", "--no-plots"])
     config = config_from_args(args)
     assert config.comparison_methods == PRIMARY_METHODS
@@ -86,7 +87,7 @@ def test_source_memory_drops_immediately_and_recovers_slowly():
     assert old_memory < memory < current
 
 
-def test_direct_memory_softens_then_expires_at_300():
+def test_direct_block_memory_stays_hard_until_it_expires_at_300():
     grid = np.zeros((7, 7), dtype=np.uint8)
     belief = RobotBeliefMap(grid, memory_steps=300)
     fusion = FusionEngine("full_trust", lambda _: 1.0, max_claim_age=300)
@@ -94,15 +95,17 @@ def test_direct_memory_softens_then_expires_at_300():
     belief.observe(DirectObservation(1, (3, 3), ClaimType.BLOCKED, 0, 1.0))
     assert math.isinf(belief.traversal_cost((3, 3), 0, fusion))
     belief.begin_scan(1)
-    early = belief.traversal_cost((3, 3), 1, fusion)
-    late = belief.traversal_cost((3, 3), 299, fusion)
-    assert math.isfinite(early)
-    assert early > late >= 3.0
+    # A directly observed physical obstacle remains a hard planner wall for
+    # the full local-memory lifetime. This prevents a robot from repeatedly
+    # routing back through an obstacle it has already verified physically.
+    assert math.isinf(belief.traversal_cost((3, 3), 1, fusion))
+    assert math.isinf(belief.traversal_cost((3, 3), 299, fusion))
     assert belief.observation_status((3, 3), 300)[1] == "unknown"
+    assert math.isfinite(belief.traversal_cost((3, 3), 300, fusion))
 
 
 def test_peer_claim_expires_at_exact_lifetime_boundary():
-    engine = FusionEngine("majority_vote", lambda _: 1.0, max_claim_age=300, majority_unknown_cost=3)
+    engine = FusionEngine("majority_vote", lambda _: 1.0, max_claim_age=300, unknown_traversal_cost=3)
     engine.add(ClaimReport("r", 0, (2, 2), ClaimType.BLOCKED, 0, 1.0))
     assert engine.vote((2, 2), 299) == 1
     assert engine.vote((2, 2), 300) == 0
@@ -176,6 +179,38 @@ def test_current_lidar_block_bypasses_path_invalid_replan_cooldown():
     robot.belief.begin_scan(6)
     robot.belief.observe(DirectObservation(1, robot.path[0], ClaimType.BLOCKED, 6, 1.0))
     assert robot.should_replan_for_path_state(6)
+
+
+def test_permanent_world_obstacle_is_lidar_detected_and_rerouted():
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    trust = BayesianTrustModel()
+    robot = ModularRobot(
+        1, (3, 1), (DeliveryTask("t", (3, 5), (5, 5)),),
+        RobotBeliefMap(grid, memory_steps=300), trust,
+        FusionEngine("full_trust", trust.score, max_claim_age=300),
+        .5, "accept_all",
+    )
+    world = World(grid, (), (PermanentObstacle("permanent", ((3, 3),)),))
+    assert robot.replan(0, "initial")
+    assert (3, 3) in robot.path
+    observations = robot.sense(world, 1, (), truth_grid=world.begin_step(1, (robot.position,)))
+    observed = {item.cell: item.claim for item in observations}
+    assert observed[(3, 3)] == ClaimType.BLOCKED
+    assert robot.should_replan_for_path_state(1)
+    assert robot.replan(1, "permanent_physical_obstacle_on_route")
+    assert (3, 3) not in robot.path
+
+
+def test_older_same_sender_cell_report_is_not_operationally_accepted_or_pending():
+    robot = _validation_robot()
+    newer = ClaimReport("newer", 0, (3, 3), ClaimType.FREE, 10, 1.0)
+    robot.receive(newer)
+    assert [report.report_id for report, _ in robot.process_inbox(10)] == ["newer"]
+    older = ClaimReport("older", 0, (3, 3), ClaimType.BLOCKED, 5, 1.0, "stale-event")
+    robot.receive(older)
+    assert robot.process_inbox(11, frozenset({"older"})) == []
+    assert robot.fusion.claims_at((3, 3))[0].report.report_id == "newer"
+    assert set(robot.pending) == {"newer"}
 
 
 def test_live_map_uses_white_for_valid_free_and_gray_for_unknown_or_expired():

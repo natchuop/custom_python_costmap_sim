@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from defense_method_runner import DefenseMethodRunner, build_defense_runner
+from .config import DEFAULT_UNKNOWN_TRAVERSAL_COST
 from .models import ClaimReport
 
 
@@ -22,6 +23,7 @@ class _RunnerReport:
         self.timestamp = int(report.observation_step)
         self.sensor_confidence = float(report.sensor_confidence)
         self.is_malicious = is_malicious  # audit/counterfactual metrics only
+        self.persistent_until_verified = bool(getattr(report, "persistent_until_verified", False))
 
 
 class FusionEngine:
@@ -35,11 +37,12 @@ class FusionEngine:
         max_claim_age: int = 300,
         cost_scale: float = 40.0,
         cost_exponent: float = 1.5,
-        blocked_probability_threshold: float = 0.70,
+        blocked_probability_threshold: float = 0.50,
         congested_impact: float = 0.50,
         duplicate_window_steps: int = 0,
-        trust_threshold: float = 0.50,
-        majority_unknown_cost: float = 3.0,
+        trust_threshold: float = 0.70,
+        unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST,
+        majority_sensor_confidence_threshold: float = 0.50,
     ):
         self._runner: DefenseMethodRunner = build_defense_runner(
             method,
@@ -53,12 +56,15 @@ class FusionEngine:
             congested_impact=congested_impact,
             duplicate_window_steps=duplicate_window_steps,
             trust_threshold=trust_threshold,
-            majority_unknown_cost=majority_unknown_cost,
+            unknown_traversal_cost=unknown_traversal_cost,
+            majority_sensor_confidence_threshold=majority_sensor_confidence_threshold,
         )
         self.decay_rate = decay_rate
         self.max_claim_age = max_claim_age
         self.cost_scale = cost_scale
         self.cost_exponent = cost_exponent
+        self.unknown_traversal_cost = float(unknown_traversal_cost)
+        self.majority_sensor_confidence_threshold = float(majority_sensor_confidence_threshold)
         self.blocked_probability_threshold = blocked_probability_threshold
         self.report_history: dict[str, StoredClaim] = {}
         self._active: dict[tuple[int, tuple[int, int]], StoredClaim] = {}
@@ -83,10 +89,11 @@ class FusionEngine:
             )
             self._invalidate_claims_cache()
         # Keep only active/recent history. Persistent output logs carry the audit
-        # trail, so this dictionary should not grow for a 2500-step run.
+        # trail, so this dictionary should not grow for a 3000-step run.
         self.report_history = {
             report_id: item for report_id, item in self.report_history.items()
-            if now - item.report.observation_step < self.max_claim_age
+            if item.report.persistent_until_verified
+            or now - item.report.observation_step < self.max_claim_age
         }
         return removed
 
@@ -112,6 +119,37 @@ class FusionEngine:
         """
         return int(self._active_malicious_claim_count)
 
+    def malicious_claim_counts_by_type(
+        self,
+        attack_type_by_report_id: dict[str, str],
+        step: int | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Return active and operational malicious claims split by attack type.
+
+        Attack labels are audit metadata and never enter the fusion decision.
+        This helper only makes the reporting layer stop calling every
+        malicious claim a ``fake`` claim.
+        """
+        counts = {
+            attack_type: {"active": 0, "influential": 0}
+            for attack_type in ("fake_obstacle", "false_clearance", "stale_reassertion")
+        }
+        for item in self._active.values():
+            report = item.report
+            if report.scenario_event_id is None:
+                continue
+            attack_type = attack_type_by_report_id.get(str(report.report_id))
+            if attack_type not in counts:
+                continue
+            counts[attack_type]["active"] += 1
+            if self.operational_weight(report, step) > 1e-12:
+                counts[attack_type]["influential"] += 1
+        return counts
+
+    def active_claim_count(self) -> int:
+        """Return the number of active stored claims without changing state."""
+        return len(self._active)
+
     def operational_weight(self, report: ClaimReport, step: int | None = None) -> float:
         """Operational fusion weight for an active report, after trust gating."""
         now = self._runner.current_timestamp if step is None else int(step)
@@ -124,6 +162,24 @@ class FusionEngine:
             for claim in self._runner.claims_for(cell)
             if (claim.sender_id, cell) in self._active
         )
+
+    def newest_operational_claim_step(self, cell: tuple[int, int], step: int, *, claim=None) -> int | None:
+        """Newest timestamp for an operationally influential claim on ``cell``.
+
+        ``claim`` may be a ClaimType/int. Claims that are expired, trust-gated,
+        or otherwise have zero operational weight are ignored.
+        """
+        wanted = None if claim is None else int(claim)
+        newest = None
+        for item in self.claims_at(tuple(cell)):
+            report = item.report
+            if wanted is not None and int(report.claim) != wanted:
+                continue
+            if self.operational_weight(report, step) <= 1e-12:
+                continue
+            timestamp = int(report.observation_step)
+            newest = timestamp if newest is None else max(newest, timestamp)
+        return newest
 
     def retract(self, report: ClaimReport) -> bool:
         key = (report.sender_id, tuple(report.target_cell))
@@ -152,6 +208,18 @@ class FusionEngine:
             return previous
         return previous
 
+    def is_active_report(self, report: ClaimReport) -> bool:
+        """Return whether ``report`` is the active claim for its sender/cell.
+
+        ``DefenseMethodRunner`` deliberately refuses an out-of-order report
+        whose observation timestamp is older than the active claim.  Callers
+        need to distinguish that case from an applied replacement so a stale
+        report is not treated as operationally accepted or queued for later
+        trust verification.
+        """
+        active = self._active.get((report.sender_id, tuple(report.target_cell)))
+        return active is not None and active.report.report_id == report.report_id
+
     def sender_route_risk(self, sender_id: int, cells, step: int, trust_override: float | None = None) -> float:
         self.set_time(step)
         return self._runner.sender_route_risk(sender_id, cells, step, trust_override=trust_override)
@@ -167,6 +235,27 @@ class FusionEngine:
     def blocked(self, cell: tuple[int, int], step: int) -> bool:
         self.set_time(step)
         return self._runner.is_hard_blocked(cell, step)
+
+    def blocked_excluding_sender(
+        self,
+        cell: tuple[int, int],
+        step: int,
+        sender_id: int,
+        predicate=None,
+    ) -> bool:
+        """Return the method's hard-block decision without one sender's claims.
+
+        Route counterfactuals must use the same hard-block contract as normal
+        planning.  A finite ``routing_cost`` is not equivalent to traversable
+        when a method's occupancy threshold says the cell is blocked.
+        """
+        self.set_time(step)
+        return self._runner.is_hard_blocked(
+            cell,
+            step,
+            excluded_sender_id=sender_id,
+            excluded_claim_predicate=predicate,
+        )
 
     def routing_cost(self, cell: tuple[int, int], step: int) -> float:
         self.set_time(step)

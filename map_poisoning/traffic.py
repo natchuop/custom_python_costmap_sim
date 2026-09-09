@@ -168,6 +168,24 @@ def _restore_robot_goal_after_yield(robot: ModularRobot, step: int):
     }
 
 
+def _repair_yield_path(robot: ModularRobot, robots: list[ModularRobot], world, step: int):
+    """Repair or release a yielder whose temporary path was invalidated."""
+    if robot.traffic_mode != "YIELDING" or robot.active_yield_target is None or robot.path:
+        return None
+    occupied = other_robot_footprints(robot, robots)
+    robot.path = astar(
+        robot.position,
+        tuple(robot.active_yield_target),
+        lambda cell: 1.0 if _can_enter(world, cell, step, occupied) else float("inf"),
+    )
+    if robot.path:
+        return None
+    # A dynamic obstacle can invalidate the parking route. Release the
+    # temporary yield state so the normal mission planner can recover on this
+    # step instead of leaving the robot in an un-recoverable YIELDING state.
+    return _restore_robot_goal_after_yield(robot, step)
+
+
 def _resume_cell(robot: ModularRobot) -> tuple[int, int] | None:
     if robot.saved_yield_path:
         return tuple(robot.saved_yield_path[0])
@@ -322,6 +340,9 @@ def coordinate_robot_intents(
     for robot in robots:
         if robot.completed or robot.traffic_mode not in ("NORMAL", "YIELDING", "YIELDING_PARKED"):
             continue
+        repaired = _repair_yield_path(robot, robots, world, step)
+        if repaired:
+            events.append(repaired)
         if (
             robot.traffic_mode == "YIELDING"
             and robot.active_yield_target is not None

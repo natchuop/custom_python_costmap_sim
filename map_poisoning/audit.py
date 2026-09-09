@@ -21,10 +21,14 @@ def audit_manifest(manifest) -> dict:
         label = labels_by_id.get(report_id)
         if label is None:
             continue
-        blocked_at_observation = bool(manifest.static_grid[cell[0]][cell[1]]) or any(
-            cell in episode.cells
-            and episode.appearance_step <= event.observation_step < episode.clearance_step
-            for episode in manifest.obstacle_episodes
+        blocked_at_observation = (
+            bool(manifest.static_grid[cell[0]][cell[1]])
+            or any(cell in obstacle.cells for obstacle in manifest.permanent_obstacles)
+            or any(
+                cell in episode.cells
+                and episode.appearance_step <= event.observation_step < episode.clearance_step
+                for episode in manifest.obstacle_episodes
+            )
         )
         expected_state = ClaimType.BLOCKED if blocked_at_observation else ClaimType.FREE
         if (
@@ -46,7 +50,9 @@ def audit_manifest(manifest) -> dict:
             seen.add(report_id)
             if not (0 <= cell[0] < rows and 0 <= cell[1] < cols):
                 errors.append(f"out-of-bounds cell {cell}")
-            active = any(cell in e.cells and e.appearance_step <= event.step < e.clearance_step for e in manifest.obstacle_episodes)
+            active_temp = any(cell in e.cells and e.appearance_step <= event.step < e.clearance_step for e in manifest.obstacle_episodes)
+            permanent_blocked = any(cell in obstacle.cells for obstacle in manifest.permanent_obstacles)
+            active = active_temp or permanent_blocked
             static_blocked = bool(manifest.static_grid[cell[0]][cell[1]])
             if event.attack_type == AttackType.FAKE_OBSTACLE and (static_blocked or active or event.claim != ClaimType.BLOCKED):
                 errors.append(f"invalid fake obstacle {event.event_id}")

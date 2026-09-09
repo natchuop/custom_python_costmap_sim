@@ -87,11 +87,17 @@ def test_clearance_and_stale_attacks_cover_the_whole_temp_footprint():
         _open_grid(),
     )
     by_id = {episode.episode_id: episode for episode in manifest.obstacle_episodes}
+    permanent_by_id = {obstacle.obstacle_id: obstacle for obstacle in manifest.permanent_obstacles}
     for event in manifest.attack_events:
         if event.attack_type not in {AttackType.FALSE_CLEARANCE, AttackType.STALE_REASSERTION}:
             continue
-        episode = by_id[event.obstacle_episode_id]
-        assert tuple(event.cells) == tuple(episode.cells)
+        if event.attack_type == AttackType.STALE_REASSERTION:
+            assert event.obstacle_episode_id in by_id
+            target = by_id[event.obstacle_episode_id]
+        else:
+            target = by_id.get(event.obstacle_episode_id) or permanent_by_id.get(event.obstacle_episode_id)
+            assert target is not None
+        assert tuple(event.cells) == tuple(target.cells)
     assert audit_manifest(manifest)["passed"]
 
 

@@ -3,7 +3,7 @@
 The parent batch process serializes one immutable ``SimulationConfig`` plus
 batch-completion metadata and launches this module in a fresh interpreter.
 The worker stamps completion before terminating so interrupted parent batches
-can resume without rerunning already-complete 2500-step cells.
+can resume without rerunning already-complete 3000-step cells.
 """
 from __future__ import annotations
 

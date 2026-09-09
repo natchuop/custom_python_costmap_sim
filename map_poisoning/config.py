@@ -7,16 +7,18 @@ from typing import Any
 from .models import AttackType
 
 # Keep this order everywhere user-facing and in comparison output.
-PRIMARY_METHODS = ("latest_report", "majority_vote", "full_trust", "trust_fused", "source_memory")
-ADDITIONAL_METHODS = ("hard_threshold", "soft_probability", "time_decay", "trust_threshold")
+PRIMARY_METHODS = ("majority_vote", "full_trust", "trust_fused", "source_memory")
+ADDITIONAL_METHODS = ("latest_report", "hard_threshold", "soft_probability", "time_decay", "trust_threshold")
 ALL_METHODS = PRIMARY_METHODS + ADDITIONAL_METHODS
 MAP_VIEWS = ("combined", "local")
+# Single source of truth for the default cost of routing through unknown space.
+DEFAULT_UNKNOWN_TRAVERSAL_COST = 1.5
 
 
 @dataclass(frozen=True)
 class PhaseConfig:
-    recon_steps: int = 300
-    attack_steps: int = 1700
+    recon_steps: int = 500
+    attack_steps: int = 2000
     recovery_steps: int = 500
 
     @property
@@ -44,12 +46,12 @@ class TrustConfig:
     model: str = "bayesian"
     prior_alpha: float = 9.0
     prior_beta: float = 1.0
-    threshold: float = 0.50
+    threshold: float = 0.70
     evidence_cap: float = 12.0
     # Positive evidence is intentionally slower than contradiction evidence so
     # an attacker cannot regain full trust after only a few honest reports.
-    confirmation_multiplier: float = 0.25
-    contradiction_multiplier: float = 6.0
+    confirmation_multiplier: float = 0.025
+    contradiction_multiplier: float = 5.0
     source_memory_recovery_rate: float = 0.05
 
 
@@ -57,16 +59,20 @@ class TrustConfig:
 class FusionConfig:
     method: str = "source_memory"
     admission_policy: str = "accept_all"
-    # Retained for the legacy/additional time_decay method. The five primary
-    # methods use common linear aging over max_claim_age.
+    # Retained for the optional time_decay method. The primary comparison
+    # methods use the common claim-lifetime semantics elsewhere in the fusion layer.
     decay_rate: float = 0.006
     cost_scale: float = 40.0
     cost_exponent: float = 1.5
-    blocked_probability_threshold: float = 0.70
+    blocked_probability_threshold: float = 0.50
     max_claim_age: int = 300
     congested_impact: float = 0.50
     duplicate_window_steps: int = 0
-    majority_unknown_cost: float = 3.0
+    # Unknown-space routing cost is shared by every primary method.
+    unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST
+    # Majority Vote uses a binary confidence gate, not confidence-weighted
+    # votes.  The threshold is intentionally shared/configurable for audits.
+    majority_sensor_confidence_threshold: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,7 @@ class LoggingConfig:
     timeseries_period_steps: int = 5
     generate_plots: bool = True
     plot_format: str = "png"
+    measure_fusion_runtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,10 @@ class SimulationConfig:
     confidence_resend_delta: float = 0.10
     periodic_route_check_steps: int = 25
     periodic_route_improvement_epsilon: float = 0.01
+    condition_type: str = "baseline"
+    honest_report_delay_steps: int = 0
+    attack_intensity_condition: str | None = None
+    configured_attack_injections_per_1000_steps: float | None = None
 
     def validate(self) -> None:
         if self.seed < 0:
@@ -141,8 +152,10 @@ class SimulationConfig:
             raise ValueError("unknown admission policy")
         if self.fusion.max_claim_age < 1:
             raise ValueError("max_claim_age must be positive")
-        if self.fusion.majority_unknown_cost < 1:
-            raise ValueError("majority unknown cost must be >= 1")
+        if self.fusion.unknown_traversal_cost < 1:
+            raise ValueError("unknown traversal cost must be >= 1")
+        if not 0 <= self.fusion.majority_sensor_confidence_threshold <= 1:
+            raise ValueError("majority sensor confidence threshold must be in [0, 1]")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled):
             raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai:
@@ -165,6 +178,10 @@ class SimulationConfig:
             raise ValueError("periodic route check must be positive")
         if self.periodic_route_improvement_epsilon < 0:
             raise ValueError("periodic route improvement epsilon must be nonnegative")
+        if self.honest_report_delay_steps < 0:
+            raise ValueError("honest report delay must be nonnegative")
+        if self.condition_type not in {"baseline", "no_attack", "attack_intensity", "honest_delay", "scalability"}:
+            raise ValueError("unknown experiment condition type")
         if self.visualization.map_view not in MAP_VIEWS:
             raise ValueError("map_view must be combined or local")
         if self.visualization.fake_influence_min_cost_delta < 0 or self.visualization.route_impact_min_cost_delta < 0:

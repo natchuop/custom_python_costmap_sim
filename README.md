@@ -24,6 +24,11 @@ For a quick headless test:
 .\run_sim.ps1 -NoAnimation -MaxSteps 10 -DeliveriesPerRobot 1
 ```
 
+With no `-Map` argument, `run_sim.ps1` uses the corrected default warehouse
+loader, including the widened passages and removed top-right corner cells.
+Converted-map variants remain available explicitly with `-Map
+maps_005_map_rotated`, `-Map maps_005_map`, or `-Map maps_002_map`.
+
 Headless single run, manifest authoring, and fixed-manifest comparison:
 
 ```powershell
@@ -46,6 +51,16 @@ The fixed coordinates and converted-map SHA-256 hashes are defined in
 `map_poisoning/scenario_presets.py`. The rotated preset is explicit; the default
 warehouse authoring path remains unchanged when no custom map is supplied.
 
+The two packaged MovingAI maps can be run directly without conversion:
+
+```powershell
+python .\main.py --headless --map-movingai .\maps\room-32-32-4.map --seed 15 --max-steps 150 --defense-method source_memory --no-plots
+python .\main.py --headless --map-movingai .\maps\den312d.map --seed 15 --max-steps 150 --defense-method source_memory --no-plots
+```
+
+They are also selectable in the GUI as **MovingAI Room 32x32-4** and **MovingAI den312d**.
+Their original MovingAI geometry is loaded directly; warehouse preset coordinates are not applied.
+
 Run the dependency check before installation or on a new machine:
 
 ```powershell
@@ -56,29 +71,34 @@ The public entry point is the native modular package (`main.py` and
 `map_poisoning/`). It owns manifest authoring, sensing, peer delivery, fusion,
 planning, and metric collection.
 
-The primary comparison methods are `latest_report`, `majority_vote`, `full_trust`,
-`trust_fused`, and `source_memory`. `latest_report` is the categorical auto-accept
-baseline: the newest active peer report determines FREE or BLOCKED regardless of
-trust, with an exact-timestamp conflict treated as unknown. It does not compute an
-occupancy probability. Current local LiDAR remains authoritative for every method.
-Optional additional methods are `hard_threshold`, `soft_probability`, `time_decay`,
-and `trust_threshold`; they are only run when explicitly selected.
+The primary comparison methods are `majority_vote`, `full_trust`, `trust_fused`,
+and `source_memory`. `latest_report` remains available as an optional categorical
+auto-accept baseline: the newest active peer report determines FREE or BLOCKED
+regardless of trust, with an exact-timestamp conflict treated as unknown. It does
+not compute an occupancy probability. Current local LiDAR remains authoritative
+for every method. Other optional methods are `hard_threshold`, `soft_probability`,
+`time_decay`, and `trust_threshold`; they are only run when explicitly selected.
 
-Current primary defaults are 300 reconnaissance steps, 1700 attack steps, and
-500 recovery steps (2500 total), with attacks scheduled every 35--40 steps.
-Manifest authoring first runs one deterministic attack-free 2500-step reference.
-Its benign traffic produces the one shared heatmap, while each proposed attack
-uses the position, visibility, and route from the matching reference step. Fake
-footprints must have a positive finite clean-reference detour and first enter the
-intended victim's LiDAR 15--40 future steps later. Strategic pickup/dropoff points
-and a fixed mix of long, medium, short, and corridor routes are seed-dependent.
-The authored manifest is then replayed unchanged by every defense method. Robots use
+Current primary defaults are 500 reconnaissance steps, 2000 attack steps, and
+500 recovery steps (3000 total), with attacks scheduled every 35--40 steps.
+Manifest authoring runs deterministic attack-free reference behavior only through
+reconnaissance end. Benign reconnaissance traffic is then frozen and combined with
+static geometry to author route-relevant attacks and the shared physical obstacle
+schedule; no post-recon reference position, visibility, goal, or route is inspected
+for attack placement. Fake footprints favor reconnaissance traffic/corridors and a
+positive finite detour, with the configured 15--40-step verification-delay pattern
+used when it exists in the reconnaissance trace. The authored manifest is then
+replayed unchanged by every defense method. Robots use
 a 360-degree Euclidean line-of-sight
 LiDAR with a five-cell range; observation confidence falls from 1.0 near the robot
 to 0.60 at range five. Direct and peer occupancy memories use a shared 300-step
-linear lifetime, with current LiDAR observations authoritative. Bayesian trust is
-the default (`alpha=9`, `beta=1`, evidence cap 12, confirmation multiplier 0.25,
-contradiction multiplier 6.0, distrust threshold 0.50). The reduced positive
+linear lifetime, with current LiDAR observations authoritative. Fused occupancy
+above 0.50 is treated as a hard planning obstacle for the probabilistic primary
+methods. Majority Vote uses a categorical BLOCKED vote gated at 0.50 sensor
+confidence, so normal five-cell LiDAR observations (confidence 0.60) are retained.
+Bayesian trust is
+the default (`alpha=9`, `beta=1`, evidence cap 12, confirmation multiplier 0.025,
+contradiction multiplier 5.0, distrust threshold 0.70). The reduced positive
 multiplier slows recovery after detected deception; scalar trust likewise uses a
 0.005 positive reward.
 `source_memory` applies immediate trust loss to historical reports but rehabilitates
@@ -88,6 +108,11 @@ operational map influence; Trust Fused similarly ignores new reports received wh
 the sender is below the threshold. Majority Vote and Full Trust remain trust-agnostic
 baselines by design.
 
+Warehouse and MovingAI maps now use the same clean reconnaissance entrypoint and
+persist an immutable `FrozenReconData` snapshot in the scenario manifest. It contains
+recon-only mission/route snapshots, traffic, visibility summaries, and route-use
+indices; attack candidate ranking cannot observe replay-phase robot state.
+
 Temporary physical obstacles use collision-safe onset: if any robot already
 occupies a scheduled footprint, that obstacle yields until the complete footprint
 is empty while retaining its authored clearance time. Outputs record deferred
@@ -95,7 +120,7 @@ activation steps and verify that no false-clearance attack was injected before i
 referenced physical obstacle actually activated.
 
 Navigation replans immediately for real route-invalidating events and also performs
-a common 25-step route-optimization check for all five primary methods so gradual
+a common 25-step route-optimization check for all four primary methods so gradual
 age/trust changes can reveal a better path. `planning_checks` and actual
 `path_changes` are logged separately. Run summaries also separate route changes
 caused by temporary physical obstacles, other robots, malicious reports, and each
@@ -191,3 +216,48 @@ Aggregate results are stored below `aggregate\`, including
 The AWS repository is checked out at its `ros1` branch because the default
 branch is an archive notice. The native Python simulator works on Windows;
 ROS/Gazebo itself is not required for this simulator.
+
+## Physical AI reference diagrams
+
+The four reference methods are `full_trust`, `majority_vote`, `trust_fused`, and
+`source_memory`. When the GUI selection is exactly those four methods, the normal
+workflow runs one paired batch using a shared manifest per seed and then invokes
+the canonical Physical AI reporter.
+
+The GUI option **Run full Physical AI suite (6 map/attack batches; may take
+hours)** is OFF by default. When enabled, it runs seeds from the GUI field
+(for example, `1-10`) across four methods and these six batches:
+
+- the default map with fake-obstacle only, false-clearance only, and both attacks;
+- `room-32-32-4` with fake-obstacle only, false-clearance only, and both attacks.
+
+Stale reassertion is explicitly disabled in every batch. Each batch writes its
+aggregate diagrams and per-run plots below
+`<output root>/<map>/<attack set>/aggregate/plots/`.
+
+Reference figures are written below:
+
+```text
+<output batch>/aggregate/plots/
+```
+
+Their plot-ready source CSVs and validation metadata are in
+`<output batch>/aggregate/plot_data/` and the other files under `aggregate/`.
+A figure is blocked rather than fabricated when its required treatment or
+measurement data is absent.
+
+Run the same six-batch Physical AI suite from the command line with:
+
+```powershell
+python -m map_poisoning.reference_experiments `
+  --attack-matrix `
+  --output-directory outputs\physical_ai_seeds_1_10 `
+  --seeds 1-10
+```
+
+Regenerate the Physical AI figures from an existing compatible batch without
+rerunning simulations:
+
+```powershell
+python -m map_poisoning.reporting outputs\physical_ai_3seeds --reference
+```

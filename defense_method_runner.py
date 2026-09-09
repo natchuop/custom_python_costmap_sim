@@ -11,6 +11,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Tuple
 
+from map_poisoning.config import DEFAULT_UNKNOWN_TRAVERSAL_COST
+
 Cell = Tuple[int, int]
 FREE_CLAIM = 0
 BLOCKED_CLAIM = 1
@@ -38,6 +40,7 @@ class StoredClaim:
     sensor_confidence: float
     trust_at_report: float
     is_malicious: bool = False
+    persistent_until_verified: bool = False
 
     @property
     def confidence(self) -> float:  # convenience for older analysis helpers
@@ -47,15 +50,20 @@ class StoredClaim:
 @dataclass
 class DefenseConfig:
     method: str = "source_memory"
-    trust_threshold: float = 0.50
+    trust_threshold: float = 0.70
     decay_rate: float = 0.006
     cost_scale: float = 40.0
     cost_exponent: float = 1.5
-    blocked_probability_threshold: float = 0.70
+    blocked_probability_threshold: float = 0.50
     max_claim_age: int = 300
     congested_impact: float = 0.50
     duplicate_window_steps: int = 0
-    majority_unknown_cost: float = 3.0
+    # Shared unknown-space cost for every defense method.
+    unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST
+    # Majority Vote remains categorical: a report contributes one full vote or
+    # no vote.  This threshold gates very low-confidence sensor reports rather
+    # than scaling their vote.
+    majority_sensor_confidence_threshold: float = 0.50
 
     def validate(self) -> None:
         if self.method not in DEFENSE_METHODS:
@@ -72,8 +80,10 @@ class DefenseConfig:
             raise ValueError("max_claim_age must be at least 1")
         if not 0.0 <= self.trust_threshold <= 1.0:
             raise ValueError("trust_threshold must be in [0, 1]")
-        if self.majority_unknown_cost < 1.0:
-            raise ValueError("majority_unknown_cost must be >= 1")
+        if self.unknown_traversal_cost < 1.0:
+            raise ValueError("unknown_traversal_cost must be >= 1")
+        if not 0.0 <= self.majority_sensor_confidence_threshold <= 1.0:
+            raise ValueError("majority_sensor_confidence_threshold must be in [0, 1]")
 
 
 class DefenseMethodRunner:
@@ -124,6 +134,7 @@ class DefenseMethodRunner:
             sensor_confidence=sensor_confidence,
             trust_at_report=min(1.0, max(0.0, float(self.trust_score(sender_id)))),
             is_malicious=bool(getattr(report, "is_malicious", False)),
+            persistent_until_verified=bool(getattr(report, "persistent_until_verified", False)),
         )
         key = (stored.sender_id, cell)
         previous = self.active_claims.get(key)
@@ -156,7 +167,10 @@ class DefenseMethodRunner:
         now = self.current_timestamp if timestamp is None else int(timestamp)
         removed = 0
         for cell in list(self.claims_by_cell):
-            retained = [claim for claim in self.claims_by_cell[cell] if now - claim.timestamp < self.config.max_claim_age]
+            retained = [
+                claim for claim in self.claims_by_cell[cell]
+                if claim.persistent_until_verified or now - claim.timestamp < self.config.max_claim_age
+            ]
             removed += len(self.claims_by_cell[cell]) - len(retained)
             if retained:
                 self.claims_by_cell[cell] = retained
@@ -164,11 +178,14 @@ class DefenseMethodRunner:
                 del self.claims_by_cell[cell]
         self.active_claims = {
             key: claim for key, claim in self.active_claims.items()
-            if now - claim.timestamp < self.config.max_claim_age
+            if claim.persistent_until_verified or now - claim.timestamp < self.config.max_claim_age
         }
         # History is for recent audit/debug only; expired claims are already
         # represented by counters/output logs and should not grow unbounded.
-        self.claim_history = [claim for claim in self.claim_history if now - claim.timestamp < self.config.max_claim_age]
+        self.claim_history = [
+            claim for claim in self.claim_history
+            if claim.persistent_until_verified or now - claim.timestamp < self.config.max_claim_age
+        ]
         self.total_reports_pruned += removed
         return removed
 
@@ -199,6 +216,11 @@ class DefenseMethodRunner:
 
     def _linear_age_weight(self, claim: StoredClaim, timestamp: int) -> float:
         age = max(0, int(timestamp) - claim.timestamp)
+        if claim.persistent_until_verified:
+            # Preserve ordinary age weakening without an arbitrary disappearance
+            # boundary. At max_claim_age the influence is ~13.5% and continues
+            # decaying smoothly until direct verification/replacement removes it.
+            return math.exp(-2.0 * age / float(self.config.max_claim_age))
         return max(0.0, 1.0 - age / float(self.config.max_claim_age))
 
     def _exp_age_weight(self, claim: StoredClaim, timestamp: int) -> float:
@@ -211,7 +233,7 @@ class DefenseMethodRunner:
         if method == "latest_report":
             return 1.0
         if method == "majority_vote":
-            return 1.0
+            return 1.0 if c >= self.config.majority_sensor_confidence_threshold else 0.0
         if method == "full_trust":
             return c * self._linear_age_weight(claim, timestamp)
         if method == "trust_fused":
@@ -257,7 +279,7 @@ class DefenseMethodRunner:
 
     def _active_iter(self, cell: Cell, now: int, excluded_sender_id=None, excluded_claim_predicate=None):
         for claim in self.claims_by_cell.get(tuple(cell), ()):
-            if now - claim.timestamp >= self.config.max_claim_age:
+            if not claim.persistent_until_verified and now - claim.timestamp >= self.config.max_claim_age:
                 continue
             if not self._claim_included(claim, excluded_sender_id, excluded_claim_predicate):
                 continue
@@ -299,6 +321,8 @@ class DefenseMethodRunner:
         if self.method == "majority_vote":
             votes = 0
             for claim in self._active_iter(cell, now, excluded_sender_id, excluded_claim_predicate):
+                if self._method_weight(claim, now) <= 0.0:
+                    continue
                 votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
             return float(votes)
         return sum(
@@ -310,7 +334,7 @@ class DefenseMethodRunner:
         """Return the operational weight of one sender's active claim for a cell."""
         now = self.current_timestamp if timestamp is None else int(timestamp)
         claim = self.active_claims.get((int(sender_id), tuple(cell)))
-        if claim is None or now - claim.timestamp >= self.config.max_claim_age:
+        if claim is None or (not claim.persistent_until_verified and now - claim.timestamp >= self.config.max_claim_age):
             return 0.0
         if self.method == "latest_report":
             state, latest = self._latest_claim_state(cell, now)
@@ -359,7 +383,7 @@ class DefenseMethodRunner:
                 return math.inf
             if state == FREE_CLAIM:
                 return 1.0
-            return self.config.majority_unknown_cost
+            return self.config.unknown_traversal_cost
         if self.method == "hard_threshold":
             return math.inf if self.is_hard_blocked(cell, timestamp, excluded_sender_id=excluded_sender_id, excluded_claim_predicate=excluded_claim_predicate) else 1.0
         if self.method == "majority_vote":
@@ -368,7 +392,7 @@ class DefenseMethodRunner:
                 return math.inf
             if vote < 0:
                 return 1.0
-            return self.config.majority_unknown_cost
+            return self.config.unknown_traversal_cost
         risk = self.normalized_occupied_risk(cell, timestamp, excluded_sender_id=excluded_sender_id, excluded_claim_predicate=excluded_claim_predicate)
         return 1.0 + self.config.cost_scale * (risk ** self.config.cost_exponent)
 
@@ -385,9 +409,23 @@ class DefenseMethodRunner:
                 claim.claim == BLOCKED_CLAIM and self._method_weight(claim, now) > 0.0
                 for claim in self._active_iter(cell, now, excluded_sender_id, excluded_claim_predicate)
             )
-        if self.method != "hard_threshold":
-            return False
-        return self.occupancy_probability(cell, timestamp, excluded_sender_id=excluded_sender_id, excluded_claim_predicate=excluded_claim_predicate) > self.config.blocked_probability_threshold
+        # Primary probabilistic methods use the same planner contract as
+        # Majority Vote: fused evidence that is sufficiently certain BLOCKED
+        # becomes non-traversable.  Previously these methods *never* returned
+        # hard-blocked here, so even a fresh confidence-1.0 honest BLOCKED
+        # report about a real obstacle was only a finite soft cost.  That made
+        # Majority Vote uniquely capable of treating peer-confirmed physical
+        # obstacles as walls and caused repeated rediscovery/replanning in the
+        # trust-based methods.  The configured probability threshold already
+        # exists for this purpose; fusion/trust still determines whether the
+        # evidence reaches it.
+        if self.method in {"full_trust", "trust_fused", "source_memory", "hard_threshold"}:
+            return self.occupancy_probability(
+                cell, timestamp,
+                excluded_sender_id=excluded_sender_id,
+                excluded_claim_predicate=excluded_claim_predicate,
+            ) > self.config.blocked_probability_threshold
+        return False
 
     def footprint_cost(self, cells: Iterable[Cell], timestamp: Optional[int] = None) -> float:
         maximum = 1.0
@@ -403,7 +441,10 @@ class DefenseMethodRunner:
 
     def snapshot(self, timestamp: Optional[int] = None) -> Dict[str, object]:
         now = self.current_timestamp if timestamp is None else int(timestamp)
-        active = [claim for claims in self.claims_by_cell.values() for claim in claims if now - claim.timestamp < self.config.max_claim_age]
+        active = [
+            claim for claims in self.claims_by_cell.values() for claim in claims
+            if claim.persistent_until_verified or now - claim.timestamp < self.config.max_claim_age
+        ]
         return {
             "method": self.method,
             "timestamp": now,

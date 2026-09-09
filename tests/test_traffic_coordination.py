@@ -93,6 +93,21 @@ def test_yielded_swap_unparks_after_partner_moves():
     assert any(event["event_type"] == "traffic_yield_completed" for event in events)
 
 
+def test_yielding_robot_with_lost_path_is_repaired():
+    world = World(np.zeros((12, 12), dtype=np.uint8), ())
+    yielder = _robot(0, (5, 4), (5, 10))
+    yielder.traffic_mode = "YIELDING"
+    yielder.active_yield_target = (5, 7)
+    yielder.saved_yield_goal = (5, 10)
+    yielder.saved_yield_path = [(5, 5), (5, 6), (5, 7)]
+    yielder.path = None
+
+    coordinate_robot_intents([yielder], world, 0, TrafficState())
+
+    assert yielder.traffic_mode == "YIELDING"
+    assert yielder.path == [(5, 5), (5, 6), (5, 7)]
+
+
 def test_deadlock_summary_counts_unique_paired_episodes_only():
     events = [
         {"event_type": "traffic_deadlock_recovered", "deadlock_id": "orphan"},
