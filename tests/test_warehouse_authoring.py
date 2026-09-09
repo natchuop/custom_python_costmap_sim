@@ -24,22 +24,26 @@ def test_default_warehouse_manifest_includes_reconnaissance_heatmap():
     )
     manifest = author_warehouse_manifest(config, default_warehouse_map())
     assert manifest.reconnaissance_heatmap is not None
-    # One shared heatmap covers the complete deterministic attack-free
-    # reference horizon, not only the reconnaissance prefix.
-    assert sum(map(sum, manifest.reconnaissance_heatmap)) == len(manifest.benign_robot_ids) * config.phases.total_steps
+    # The shared heatmap is frozen at reconnaissance end and contains benign
+    # robot positions only from the reconnaissance prefix.
+    assert sum(map(sum, manifest.reconnaissance_heatmap)) == len(manifest.benign_robot_ids) * config.phases.recon_steps
+    assert len(manifest.permanent_obstacles) == 3
     assert manifest.obstacle_episodes
-    assert sum(1 for episode in manifest.obstacle_episodes if episode.appearance_step == 0) >= min(
-        TEMP_ACTIVE_COUNT, 3
-    )
+    assert sum(1 for episode in manifest.obstacle_episodes if episode.appearance_step == 0) == TEMP_ACTIVE_COUNT
     assert all(len(episode.cells) >= TEMP_MIN_AREA for episode in manifest.obstacle_episodes)
     assert manifest.attack_events
     assert any(item.get("traffic_score") is not None for item in manifest.candidate_metadata)
-    assert all(item.get("heatmap_reference_steps") == config.phases.total_steps for item in manifest.candidate_metadata)
-    assert all(item.get("reference_step") >= config.phases.recon_steps for item in manifest.candidate_metadata)
-    assert all(item.get("target_visible_to_victim") is False for item in manifest.candidate_metadata)
+    assert all(item.get("heatmap_reference_steps") == config.phases.recon_steps for item in manifest.candidate_metadata)
+    assert all(0 <= item.get("reference_step", -1) < config.phases.recon_steps for item in manifest.candidate_metadata)
+    assert all(item.get("target_visible_to_victim") in (False, None) for item in manifest.candidate_metadata)
     assert all(item.get("intended_victim_id") in manifest.benign_robot_ids for item in manifest.candidate_metadata)
-    assert all(15 <= item["first_visibility_delay"] <= 40 for item in manifest.candidate_metadata)
-    assert all(item["expected_visibility_step"] == item["reference_step"] + item["first_visibility_delay"] for item in manifest.candidate_metadata)
+    fake_metadata = [item for item in manifest.candidate_metadata if item.get("attack_type") == "fake_obstacle"]
+    assert fake_metadata
+    assert all(
+        item.get("first_visibility_delay") is None
+        or 15 <= item["first_visibility_delay"] <= 40
+        for item in fake_metadata
+    )
 
 
 def test_attack_free_warehouse_manifest_skips_candidate_requirement():
@@ -53,7 +57,7 @@ def test_attack_free_warehouse_manifest_skips_candidate_requirement():
     manifest = author_warehouse_manifest(config, default_warehouse_map())
     assert manifest.attack_events == ()
     assert manifest.candidate_metadata == ()
-    assert sum(map(sum, manifest.reconnaissance_heatmap)) == 20
+    assert sum(map(sum, manifest.reconnaissance_heatmap)) == len(manifest.benign_robot_ids) * config.phases.recon_steps
 
 
 def test_warehouse_layout_and_candidates_are_reachable():

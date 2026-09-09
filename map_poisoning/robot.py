@@ -42,11 +42,12 @@ class _PlanningBelief:
         if cell in self._temporarily_blocked:
             value = True
         else:
-            claim, status = self._belief.observation_status(cell, self._step)
-            if self._fusion.method == "trust_threshold" and status == "unknown":
-                value = False
-            else:
-                value = self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
+            # All methods use the same hard-block contract. In particular,
+            # trust_threshold must not soften a trusted BLOCKED peer report
+            # merely because the recipient has not personally explored the
+            # cell yet. That exception could make a robot repeatedly plan
+            # through a known physical obstacle and only stop at contact.
+            value = self._belief.is_blocked_for_planning(cell, self._fusion, self._step)
         self._blocked_cache[cell] = value
         return value
 
@@ -57,12 +58,7 @@ class _PlanningBelief:
         if cell in self._temporarily_blocked:
             value = math.inf
         else:
-            claim, status = self._belief.observation_status(cell, self._step)
-            if self._fusion.method == "trust_threshold" and status == "unknown":
-                peer_cost = self._fusion.soft_routing_cost(cell, self._step)
-                value = math.inf if math.isinf(peer_cost) else max(self._belief.UNKNOWN_TRAVERSAL_COST, peer_cost)
-            else:
-                value = self._belief.traversal_cost(cell, self._step, self._fusion)
+            value = self._belief.traversal_cost(cell, self._step, self._fusion)
         self._cost_cache[cell] = value
         return value
 
@@ -124,6 +120,8 @@ class ModularRobot:
     replan_records: list[ReplanRecord] = field(default_factory=list)
     no_path_causes: dict[str, int] = field(default_factory=dict)
     last_path_invalid_replan_step: int = -10**9
+    last_no_path_classification_step: int = -10**9
+    last_no_path_cause: str | None = None
     last_shared_claim: dict[tuple[int, int], ClaimType] = field(default_factory=dict)
     last_shared_step: dict[tuple[int, int], int] = field(default_factory=dict)
     last_shared_sensor_confidence: dict[tuple[int, int], float] = field(default_factory=dict)
@@ -132,6 +130,10 @@ class ModularRobot:
     verified_reports: dict[str, int] = field(default_factory=dict)
     last_trust_batches: list[dict] = field(default_factory=list)
     last_route_affecting_report_ids: set[str] = field(default_factory=set)
+    # Accepted FREE reports that reopen a cell previously treated as an infinite-cost
+    # obstacle. These are not necessarily on the current path; they may create a
+    # genuinely cheaper shortcut and therefore deserve a uniform improvement check.
+    last_newly_opened_report_ids: set[str] = field(default_factory=set)
     previous_scan_observations: dict[tuple[int, int], DirectObservation] = field(default_factory=dict)
     current_scan_observations: dict[tuple[int, int], DirectObservation] = field(default_factory=dict)
     accepted_reports: int = 0
@@ -248,7 +250,15 @@ class ModularRobot:
         if self.completed:
             return False
         if not self.path:
-            return self.position != self.goal
+            # A believed no-path state used to launch a whole-map A* every
+            # simulation step. Persistent fake obstacles could therefore make
+            # an otherwise valid run extremely slow without improving behavior.
+            # Map/trust/direct-verification events still trigger their own
+            # immediate replans; this only throttles unchanged empty-path state.
+            return (
+                self.position != self.goal
+                and step - self.last_path_invalid_replan_step >= PATH_INVALID_REPLAN_COOLDOWN_STEPS
+            )
         if not self.path_invalid_or_empty(step):
             return False
         # Current LiDAR is authoritative and must never be suppressed by the
@@ -263,9 +273,10 @@ class ModularRobot:
             return True
         return step - self.last_path_invalid_replan_step >= PATH_INVALID_REPLAN_COOLDOWN_STEPS
 
-    def process_inbox(self, step: int, malicious_ids: FrozenSet[str] = frozenset()):
+    def process_inbox(self, step: int, malicious_ids: FrozenSet[str] = frozenset(), runtime_observer=None):
         accepted = []
         self.last_route_affecting_report_ids.clear()
+        self.last_newly_opened_report_ids.clear()
         remaining = set(self.path or ())
         for report in self.inbox:
             policy = decide(self.admission_policy, self.trust.score(report.sender_id), self.trust_threshold)
@@ -274,16 +285,59 @@ class ModularRobot:
                 continue
             target = tuple(report.target_cell)
             route_candidate = target in remaining and not self.belief.has_direct_free(target, step)
+            # False-clearance style reports can matter even when the target cell is
+            # not on the *current* detour: turning an infinite-cost remembered block
+            # into traversable space may open a shorter route. Record the pre-fusion
+            # cost for FREE claims so rollout can run the same improvement-only A*
+            # check for every method. Current direct LiDAR remains authoritative in
+            # RobotBeliefMap.traversal_cost, so this cannot clear a currently observed
+            # physical obstacle.
+            shortcut_candidate = report.claim == ClaimType.FREE
+            before_shortcut_cost = (
+                self.belief.traversal_cost(target, step, self.fusion)
+                if shortcut_candidate else None
+            )
             before_cost = self.belief.traversal_cost(target, step, self.fusion) if route_candidate else None
             # The malicious label is passed only for offline counterfactual
             # metrics; it never changes fusion weighting or robot decisions.
             is_malicious = report.report_id in malicious_ids
+            before_count = self.fusion.active_claim_count() if runtime_observer is not None else None
+            if runtime_observer is not None:
+                import time
+                started_ns = time.perf_counter_ns()
             previous = self.fusion.add(report, policy.influence, is_malicious=is_malicious)
+            if runtime_observer is not None:
+                runtime_observer(
+                    report,
+                    started_ns,
+                    time.perf_counter_ns(),
+                    before_count,
+                    self.fusion.active_claim_count(),
+                )
+            # The fusion layer rejects out-of-order same-sender/same-cell
+            # reports whose observation timestamp is older than the currently
+            # active claim.  Such a report never influenced the map, so do not
+            # count it as accepted or queue it for trust verification.
+            if not self.fusion.is_active_report(report):
+                self.rejected_reports += 1
+                continue
             if previous is not None:
                 self._remove_pending(previous.report.report_id)
             self._add_pending(report)
             accepted.append((report, policy))
             self.accepted_reports += 1
+            after_shortcut_cost = (
+                self.belief.traversal_cost(target, step, self.fusion)
+                if shortcut_candidate else None
+            )
+            if (
+                shortcut_candidate
+                and before_shortcut_cost is not None
+                and after_shortcut_cost is not None
+                and math.isinf(before_shortcut_cost)
+                and not math.isinf(after_shortcut_cost)
+            ):
+                self.last_newly_opened_report_ids.add(report.report_id)
             if route_candidate:
                 after_cost = self.belief.traversal_cost(target, step, self.fusion)
                 materially_changed = (
@@ -302,7 +356,7 @@ class ModularRobot:
             # Pending validation should not outlive operational report memory.
             self.pending = {
                 report_id: report for report_id, report in self.pending.items()
-                if step - report.observation_step < self.fusion.max_claim_age
+                if report.persistent_until_verified or step - report.observation_step < self.fusion.max_claim_age
             }
             self.pending_by_cell = {}
             for report_id, report in self.pending.items():
@@ -343,8 +397,21 @@ class ModularRobot:
         period = max(1, int(self.environment_change_period_steps))
         return int(earlier_step) // period == int(later_step) // period
 
+    def _temporally_comparable(
+        self,
+        report: ClaimReport,
+        step: int,
+        truth_unchanged_since=None,
+    ) -> bool:
+        if truth_unchanged_since is not None:
+            return bool(truth_unchanged_since(report.target_cell, report.observation_step, step))
+        # Backward-compatible fallback for isolated tests/callers that do not
+        # have a World instance. Production rollouts pass the world's per-cell
+        # physical-change tracker instead of this coarse epoch approximation.
+        return self._same_environment_epoch(report.observation_step, step)
+
     def _resolve_observation(
-        self, report: ClaimReport, by_cell: dict, step: int
+        self, report: ClaimReport, by_cell: dict, step: int, truth_unchanged_since=None
     ) -> tuple[DirectObservation, bool] | None:
         # Prefer the previous scan when it is exactly contemporaneous with the
         # peer report.  This matters when a temporary obstacle changes at the
@@ -355,7 +422,7 @@ class ModularRobot:
             return exact, True
         observed = by_cell.get(report.target_cell)
         if observed is not None:
-            return observed, self._same_environment_epoch(report.observation_step, step)
+            return observed, self._temporally_comparable(report, step, truth_unchanged_since)
         # Reports arrive after sensing, so a report cannot be validated until
         # the next simulation step.  An exact same-time direct snapshot is
         # always comparable even if verification itself happens later.  Do NOT
@@ -371,10 +438,19 @@ class ModularRobot:
 
     def _report_age_weight(self, report: ClaimReport, step: int) -> float:
         age = max(0, step - report.observation_step)
+        if report.persistent_until_verified:
+            return math.exp(-2.0 * age / float(self.fusion.max_claim_age))
         return max(0.0, 1.0 - age / float(self.fusion.max_claim_age))
 
-    def verify(self, observations: Iterable[DirectObservation], step: int):
-        """Validate peer reports and perform one trust update per sender/scan."""
+    def verify(self, observations: Iterable[DirectObservation], step: int, *, truth_unchanged_since=None):
+        """Validate peer reports and perform one trust update per sender/scan.
+
+        Production rollouts provide ``truth_unchanged_since`` from ``World`` so
+        trust attribution is based on whether *that cell's* physical truth
+        actually changed after the report. This prevents an unrelated 150-step
+        temporary-obstacle epoch boundary from shielding a clearly false fake
+        obstacle from contradiction evidence.
+        """
         by_cell = {item.cell: item for item in observations}
         processed: set[str] = set()
         candidates: list[tuple[ClaimReport, DirectObservation, VerificationOutcome, float, float]] = []
@@ -418,7 +494,7 @@ class ModularRobot:
             report = self.pending.get(report_id)
             if report is None:
                 continue
-            resolved = self._resolve_observation(report, by_cell, step)
+            resolved = self._resolve_observation(report, by_cell, step, truth_unchanged_since)
             if resolved is not None:
                 observed, comparable = resolved
                 collect(report, observed, comparable)
@@ -433,7 +509,7 @@ class ModularRobot:
                 if report.claim == observed.claim:
                     continue
                 if report.report_id not in processed and report.report_id not in self.verified_reports:
-                    collect(report, observed, self._same_environment_epoch(report.observation_step, step))
+                    collect(report, observed, self._temporally_comparable(report, step, truth_unchanged_since))
                 elif report.report_id not in processed:
                     self.fusion.retract(report)
                     self._remove_pending(report.report_id)
@@ -460,12 +536,18 @@ class ModularRobot:
                 current = self.trust.score(sender_id)
                 sender_trust[sender_id] = (current, current)
                 continue
-            total_q = sum(q for _, q in weighted)
-            average_quality = total_q / len(weighted)
-            confirmed_fraction = sum(q for outcome, q in weighted if outcome == VerificationOutcome.CONFIRMED) / total_q
-            contradicted_fraction = sum(q for outcome, q in weighted if outcome == VerificationOutcome.CONTRADICTED_FRESH) / total_q
-            confirmed_weight = confirmed_fraction * average_quality
-            contradicted_weight = contradicted_fraction * average_quality
+            # Preserve one trust-state transition per sender per scan, but let
+            # the amount of independently verified cell evidence matter. Each
+            # comparable report contributes its confidence- and age-weighted
+            # evidence directly to the appropriate batch total.
+            confirmed_weight = sum(
+                q for outcome, q in weighted
+                if outcome == VerificationOutcome.CONFIRMED
+            )
+            contradicted_weight = sum(
+                q for outcome, q in weighted
+                if outcome == VerificationOutcome.CONTRADICTED_FRESH
+            )
             old_trust, new_trust = self.trust.update_batch(sender_id, confirmed_weight, contradicted_weight)
             sender_trust[sender_id] = (old_trust, new_trust)
             self.last_trust_batches.append({
@@ -560,6 +642,16 @@ class ModularRobot:
         return bool(self.path)
 
     def classify_no_path(self, world, step: int) -> str:
+        # This classifier is diagnostic only and runs several counterfactual
+        # A* searches. Reuse a recent classification while the robot remains in
+        # the same no-path episode; counts still accrue per no-path step.
+        if (
+            self.last_no_path_cause is not None
+            and step - self.last_no_path_classification_step < PATH_INVALID_REPLAN_COOLDOWN_STEPS
+        ):
+            cause = self.last_no_path_cause
+            self.no_path_causes[cause] = self.no_path_causes.get(cause, 0) + 1
+            return cause
         truth = astar(self.position, self.goal, lambda cell: math.inf if world.state(cell, step) == ClaimType.BLOCKED else 1.0)
         if truth is None:
             cause = "truth_disconnected"
@@ -574,13 +666,22 @@ class ModularRobot:
             else:
                 operational = astar(self.position, self.goal, lambda cell: self.belief.traversal_cost(cell, step, self.fusion))
                 cause = "peer_fusion_disconnected" if operational is None else "planner_or_state_error"
+        self.last_no_path_classification_step = int(step)
+        self.last_no_path_cause = cause
         self.no_path_causes[cause] = self.no_path_causes.get(cause, 0) + 1
         return cause
 
     def move(self, world, step: int, occupied: set[tuple[int, int]]) -> str:
         if self.completed:
             return "idle"
+        # A parked yielder has intentionally reached its clearance cell and
+        # is waiting for the conflicting robot to pass.  It is not a mission
+        # no-path condition and must not trigger a mission replan.
+        if self.traffic_mode == "YIELDING_PARKED":
+            return "idle"
         if self.position == self.goal:
+            self.last_no_path_cause = None
+            self.last_no_path_classification_step = -10**9
             if self.carrying:
                 self.carrying = False
                 self.deliveries_completed += 1
@@ -616,6 +717,8 @@ class ModularRobot:
             return "blocked_move"
         self.path.pop(0)
         self.position = next_cell
+        self.last_no_path_cause = None
+        self.last_no_path_classification_step = -10**9
         self.movement_steps += 1
         self.total_distance += 1.0
         self.consecutive_traffic_waits = 0

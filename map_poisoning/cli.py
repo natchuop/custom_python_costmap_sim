@@ -109,11 +109,11 @@ def parser():
     p.add_argument("--trust-model",choices=("bayesian","scalar"),default="bayesian"); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
     p.add_argument("--trust-threshold",type=float,default=0.50)
     p.add_argument("--trust-evidence-cap",type=float,default=12.0)
-    p.add_argument("--trust-confirmation-multiplier",type=float,default=0.25)
-    p.add_argument("--trust-contradiction-multiplier",type=float,default=6.0)
+    p.add_argument("--trust-confirmation-multiplier",type=float,default=0.025)
+    p.add_argument("--trust-contradiction-multiplier",type=float,default=5.0)
     p.add_argument("--source-memory-recovery-rate",type=float,default=0.05)
     p.add_argument("--attacks",default="fake_obstacle,false_clearance,stale_reassertion",help="comma separated, or 'none'")
-    p.add_argument("--recon-steps",type=int,default=300); p.add_argument("--attack-steps",type=int,default=1700); p.add_argument("--recovery-steps",type=int,default=500); p.add_argument("--max-steps",type=int)
+    p.add_argument("--recon-steps",type=int,default=500); p.add_argument("--attack-steps",type=int,default=2000); p.add_argument("--recovery-steps",type=int,default=500); p.add_argument("--max-steps",type=int)
     p.add_argument("--deliveries-per-robot",type=int,default=100)
     p.add_argument("--attack-interval-min",type=int,default=35); p.add_argument("--attack-interval-max",type=int,default=40)
     p.add_argument("--attack-visibility-min",type=int,default=15,help="minimum clean-reference steps before a fake footprint becomes visible")
@@ -121,8 +121,10 @@ def parser():
     p.add_argument("--map-view", choices=MAP_VIEWS, default="combined", help="belief visualization: combined peer/local or local observations")
     p.add_argument("--temp-obstacle-interval", type=int, default=150, help="steps between temporary-obstacle movements")
     p.add_argument("--observation-lifetime", type=int, default=300)
-    p.add_argument("--confidence-resend-delta", type=float, default=0.10)
+    p.add_argument("--confidence-resend-delta", type=float, default=0.05)
     p.add_argument("--periodic-route-check", type=int, default=25)
+    p.add_argument("--honest-report-delay", type=int, default=0)
+    p.add_argument("--measure-fusion-runtime", action="store_true")
     p.add_argument("--no-animation",action="store_true"); p.add_argument("--no-plots",action="store_true",help="Do not generate PNG reports after CSV output"); return p
 
 def config_from_args(args):
@@ -158,7 +160,7 @@ def config_from_args(args):
             source_memory_recovery_rate=float(args.source_memory_recovery_rate),
         ),
         fusion=FusionConfig(method=args.defense_method, admission_policy=args.admission_policy, max_claim_age=int(getattr(args, "observation_lifetime", 300))),
-        logging=LoggingConfig(output_directory, generate_plots=not args.no_plots),
+        logging=LoggingConfig(output_directory, generate_plots=not args.no_plots, measure_fusion_runtime=args.measure_fusion_runtime),
         visualization=VisualizationConfig(
             animation=not args.no_animation and not args.headless,
             map_view=getattr(args, "map_view", "combined"),
@@ -174,4 +176,5 @@ def config_from_args(args):
         observation_lifetime_steps=int(getattr(args, "observation_lifetime", 300)),
         confidence_resend_delta=float(getattr(args, "confidence_resend_delta", 0.10)),
         periodic_route_check_steps=int(getattr(args, "periodic_route_check", 25)),
+        honest_report_delay_steps=int(getattr(args, "honest_report_delay", 0)),
     )

@@ -30,6 +30,7 @@ DISPLAY_R1 = 12
 DISPLAY_FALSE_CLEARANCE = 13
 DISPLAY_R0 = 14
 DISPLAY_R2 = 15
+DISPLAY_PERMANENT = 16
 
 ROBOT_COLORS = {0: "#8e24aa", 1: "#fb8c00", 2: "#1976d2"}
 ROBOT_DISPLAY = {0: DISPLAY_R0, 1: DISPLAY_R1, 2: DISPLAY_R2}
@@ -52,6 +53,7 @@ _COLORS = [
     "#ef9a9a",
     "#8e24aa",
     "#1976d2",
+    "#2e7d32",
 ]
 _CMAP = ListedColormap(_COLORS)
 _NORM = BoundaryNorm(np.arange(-0.5, len(_COLORS) + 0.5, 1), _CMAP.N)
@@ -89,11 +91,61 @@ def _latest_attack(log, step):
     return latest
 
 
-def _overlay_groups(log, step):
-    latest = _latest_attack(log, step)
-    if latest is None:
+def _fake_event_still_on_any_victim_map(event, robots, step, attacker) -> bool:
+    """Whether any intended victim still has operational fake BLOCKED evidence.
+
+    Fake-obstacle overlays have no independent display timeout. They remain on
+    the truth/reference panel while at least one victim map is still affected,
+    and disappear only after direct verification, trust gating, or ordinary
+    claim aging removes the fake evidence from every victim map. The overlay is
+    visual/audit-only and never changes physical collision truth.
+    """
+    if robots is None:
+        return True
+    recipients = set(event.recipients)
+    for robot in robots:
+        if robot.robot_id == attacker or robot.robot_id not in recipients:
+            continue
+        for cell in event.cells:
+            if _fresh_direct_free(robot, tuple(cell), step):
+                continue
+            for item in robot.fusion.claims_at(tuple(cell)):
+                report = item.report
+                if (
+                    report.sender_id == attacker
+                    and report.scenario_event_id == event.event_id
+                    and report.claim == ClaimType.BLOCKED
+                    and robot.fusion.operational_weight(report, step) > 1e-12
+                ):
+                    return True
+    return False
+
+
+def _overlay_groups(log, step, robots=None):
+    events = _events_up_to(log, step)
+    if not events:
         return []
-    return [{"attack_type": latest.attack_type, "cells": list(latest.cells)}]
+    attacker = log.get("malicious_robot_id")
+    groups = []
+    for event in events:
+        if event.attack_type != AttackType.FAKE_OBSTACLE:
+            continue
+        if _fake_event_still_on_any_victim_map(event, robots, step, attacker):
+            groups.append({
+                "event_id": event.event_id,
+                "attack_type": event.attack_type,
+                "cells": list(event.cells),
+            })
+    # Preserve the previous latest-attack context for non-fake attacks while
+    # allowing all still-active fake-obstacle overlays to persist.
+    latest = events[-1]
+    if latest.attack_type != AttackType.FAKE_OBSTACLE:
+        groups.append({
+            "event_id": latest.event_id,
+            "attack_type": latest.attack_type,
+            "cells": list(latest.cells),
+        })
+    return groups
 
 
 def _paint_overlays(arr, overlays, *, attacker_view: bool):
@@ -123,7 +175,10 @@ def _dominant_blocked_sender(robot, items, step):
         report = item.report
         if int(report.claim) != int(ClaimType.BLOCKED):
             continue
-        if step - int(report.observation_step) >= robot.fusion.max_claim_age:
+        if (
+            not report.persistent_until_verified
+            and step - int(report.observation_step) >= robot.fusion.max_claim_age
+        ):
             continue
         weight = robot.fusion.operational_weight(report, step)
         if weight <= 1e-12:
@@ -179,7 +234,11 @@ def truth_display_grid(world, robots, log, step):
     arr = np.zeros(grid.shape, dtype=np.int16)
     arr[world.static_grid.astype(bool)] = DISPLAY_STATIC
     arr[(grid == 1) & (world.static_grid == 0)] = DISPLAY_DYNAMIC
-    _paint_overlays(arr, _overlay_groups(log, step), attacker_view=True)
+    for obstacle in getattr(world, "permanent_obstacles", ()):
+        for cell in obstacle.cells:
+            if arr[cell] != DISPLAY_STATIC:
+                arr[cell] = DISPLAY_PERMANENT
+    _paint_overlays(arr, _overlay_groups(log, step, robots), attacker_view=True)
     for cell in _goals(robots):
         if arr[cell] == DISPLAY_FREE:
             arr[cell] = DISPLAY_GOAL
@@ -238,12 +297,22 @@ def combined_display_grid(robot, world, log, step, robots):
             arr[cell] = DISPLAY_FREE
             continue
         direct = _direct_display_state(robot, cell, step, display_age)
-        if direct == ClaimType.BLOCKED:
+        direct_claim, direct_status = robot.belief.observation_status(cell, step)
+        # Fresh direct LiDAR is authoritative. For remembered BLOCKED state, a
+        # newer accepted peer FREE claim is allowed to clear the combined map;
+        # this is the operational False Clearance effect used by the planner.
+        if direct_status == "current" and direct_claim == ClaimType.BLOCKED:
             arr[cell] = own
             continue
         peer_state = _peer_fused_state(robot, cell, step)
-        if peer_state == ClaimType.FREE:
+        if peer_state == ClaimType.FREE and (
+            direct != ClaimType.BLOCKED
+            or robot.belief.peer_free_supersedes_direct_block(cell, robot.fusion, step)
+        ):
             arr[cell] = DISPLAY_FREE
+            continue
+        if direct == ClaimType.BLOCKED:
+            arr[cell] = own
             continue
         if peer_state == ClaimType.BLOCKED:
             sender = _dominant_blocked_sender(robot, items, step)
@@ -254,7 +323,7 @@ def combined_display_grid(robot, world, log, step, robots):
         if _explored_clear(robot, cell, step, display_age):
             arr[cell] = DISPLAY_FREE
     attacker = log.get("malicious_robot_id")
-    _paint_overlays(arr, _overlay_groups(log, step), attacker_view=robot.robot_id == attacker)
+    _paint_overlays(arr, _overlay_groups(log, step, robots), attacker_view=robot.robot_id == attacker)
 
 
     if not robot.completed:
@@ -296,6 +365,8 @@ def init_live_log(log, world, robots, config, manifest) -> None:
         "completed": {robot.robot_id: [] for robot in robots},
         "report_counts": [],
         "malicious_report_counts": [],
+        "attack_overlay_groups": [],
+        "attack_overlay_counts": [],
         "heatmap": np.zeros((rows, cols), dtype=np.int32),
         "heatmap_static_grid": np.asarray(world.static_grid, dtype=np.uint8).copy(),
         "recon_heatmap": (
@@ -320,7 +391,10 @@ def record_live_frame(log, world, robots, step, phase) -> None:
     live = log.get("live")
     if live is None:
         return
+    active_overlays = _overlay_groups(log, step, robots)
     live["truth"].append(truth_display_grid(world, robots, log, step))
+    live["attack_overlay_groups"].append(tuple(active_overlays))
+    live["attack_overlay_counts"].append(sum(len(item.get("cells", ())) for item in active_overlays))
     attacker = log["malicious_robot_id"]
     map_view = live.get("map_view", "combined")
     snapshot = {}
@@ -635,6 +709,7 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
             Patch(facecolor="#bdbdbd", label="Unknown / expired"),
             Patch(facecolor="#222222", label="Static obstacle"),
             Patch(facecolor="#43a047", label="Temporary physical obstacle"),
+            Patch(facecolor="#2e7d32", label="Permanent physical obstacle"),
             Patch(facecolor=ROBOT_COLORS[0], label="Robot 0 source (purple)"),
             Patch(facecolor=ROBOT_COLORS[1], label="Robot 1 source (orange)"),
             Patch(facecolor=ROBOT_COLORS[2], label="Robot 2 source (blue)"),
@@ -688,7 +763,8 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
     def lidar_cells(frame, robot_id):
         static = world.static_grid
         truth_grid = np.array(static, dtype=np.uint8)
-        truth_grid[live["truth"][frame] == DISPLAY_DYNAMIC] = 1
+        physical_mask = (live["truth"][frame] == DISPLAY_DYNAMIC) | (live["truth"][frame] == DISPLAY_PERMANENT)
+        truth_grid[physical_mask] = 1
         positions = {robot.robot_id: live["positions"][robot.robot_id][frame] for robot in robots}
         others = [pos for rid, pos in positions.items() if rid != robot_id]
         return lidar_observations(truth_grid, positions[robot_id], others, radius=lidar_range)
@@ -735,15 +811,21 @@ def show_belief_maps(log, world, robots, *, show=True, interval_ms=80):
                 outline.remove()
             belief_attack_outlines[rid] = []
             if selected_view == "combined" and rid != attacker:
-                latest = _latest_attack(log, frame)
-                if latest is not None:
-                    belief_attack_outlines[rid] = draw_attack_outlines(belief_axes[rid], latest.cells)
-                    artists.extend(belief_attack_outlines[rid])
+                frame_groups = live.get("attack_overlay_groups", ())
+                groups = frame_groups[frame] if frame < len(frame_groups) else ()
+                for group in groups:
+                    # Fake-obstacle outlines persist while the claim remains on
+                    # at least one victim map. Non-fake context remains latest-only.
+                    belief_attack_outlines[rid].extend(
+                        draw_attack_outlines(belief_axes[rid], group.get("cells", ()))
+                    )
+                artists.extend(belief_attack_outlines[rid])
 
         report_count = live.get("report_counts", [0])[frame] if live.get("report_counts") else 0
         malicious_report_count = live.get("malicious_report_counts", [0])[frame] if live.get("malicious_report_counts") else 0
         latest = _latest_attack(log, frame)
-        overlay_count = sum(len(item.get("cells", ())) for item in _overlay_groups(log, frame))
+        overlay_counts = live.get("attack_overlay_counts", ())
+        overlay_count = int(overlay_counts[frame]) if frame < len(overlay_counts) else 0
         status_lines = [
             f"Step: {frame}",
             f"Phase: {phase}",

@@ -1,7 +1,7 @@
 """Truth-map loading and deterministic temporary obstacle episodes."""
 from __future__ import annotations
 import numpy as np
-from .models import ClaimType, TemporaryObstacleEpisode
+from .models import ClaimType, PermanentObstacle, TemporaryObstacleEpisode
 from .rng import named_rng
 
 def demo_grid(rows: int = 32, cols: int = 42) -> np.ndarray:
@@ -12,13 +12,20 @@ def demo_grid(rows: int = 32, cols: int = 42) -> np.ndarray:
     return grid
 
 class World:
-    def __init__(self, static_grid: np.ndarray, episodes: tuple[TemporaryObstacleEpisode, ...]):
+    def __init__(self, static_grid: np.ndarray, episodes: tuple[TemporaryObstacleEpisode, ...], permanent_obstacles: tuple[PermanentObstacle, ...] = ()):
         self.static_grid = static_grid
         self.episodes = episodes
+        self.permanent_obstacles = permanent_obstacles
         self._activation_steps: dict[str, int] = {}
         self._effective_active_by_step: dict[int, frozenset[str]] = {}
         self.deferred_activation_steps = 0
         self.deferred_episode_ids: set[str] = set()
+        # Runtime per-cell physical-truth change tracking. Trust verification
+        # uses this to decide whether a later direct contradiction is actually
+        # attributable to the sender rather than to a pallet that appeared or
+        # cleared in the meantime.
+        self._previous_truth_grid: np.ndarray | None = None
+        self._cell_last_truth_change_step: dict[tuple[int, int], int] = {}
 
     def begin_step(self, step: int, occupied_cells=()) -> np.ndarray:
         """Resolve obstacle onset without spawning a footprint on a robot.
@@ -40,7 +47,13 @@ class World:
                 self._activation_steps[episode.episode_id] = step
             active_ids.add(episode.episode_id)
         self._effective_active_by_step[int(step)] = frozenset(active_ids)
-        return self.truth_grid(step)
+        grid = self.truth_grid(step)
+        if self._previous_truth_grid is not None:
+            changed = np.argwhere(grid != self._previous_truth_grid)
+            for row, col in changed:
+                self._cell_last_truth_change_step[(int(row), int(col))] = int(step)
+        self._previous_truth_grid = np.array(grid, dtype=np.uint8, copy=True)
+        return grid
 
     def _active_episodes(self, step: int):
         effective = self._effective_active_by_step.get(int(step))
@@ -61,14 +74,31 @@ class World:
         continuous-motion engine: zero is free and one is physically blocked.
         """
         grid = np.array(self.static_grid, dtype=np.uint8)
+        for obstacle in self.permanent_obstacles:
+            for cell in obstacle.cells:
+                grid[cell] = 1
         for episode in self._active_episodes(step):
             for cell in episode.cells:
                 grid[cell] = 1
         return grid
 
+
+    def truth_unchanged_since(self, cell: tuple[int, int], observation_step: int, current_step: int) -> bool:
+        """Whether physical occupancy of ``cell`` stayed unchanged after a report.
+
+        A transition at the report's own observation step is comparable: both
+        the report and the direct scan see the post-transition world for that
+        step. Only a later physical transition makes verification ambiguous.
+        """
+        cell = tuple(cell)
+        last_change = self._cell_last_truth_change_step.get(cell)
+        return last_change is None or int(last_change) <= int(observation_step)
+
     def state(self, cell: tuple[int, int], step: int) -> ClaimType:
         r, c = cell
         if not (0 <= r < self.static_grid.shape[0] and 0 <= c < self.static_grid.shape[1]) or self.static_grid[cell]: return ClaimType.BLOCKED
+        if any(cell in obstacle.cells for obstacle in self.permanent_obstacles):
+            return ClaimType.BLOCKED
         return ClaimType.BLOCKED if any(cell in e.cells for e in self._active_episodes(step)) else ClaimType.FREE
     def active(self, step: int): return self._active_episodes(step)
     def cleared(self, step: int): return [e for e in self.episodes if e.clearance_step <= step]

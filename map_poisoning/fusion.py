@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from defense_method_runner import DefenseMethodRunner, build_defense_runner
+from .config import DEFAULT_UNKNOWN_TRAVERSAL_COST
 from .models import ClaimReport
 
 
@@ -22,6 +23,7 @@ class _RunnerReport:
         self.timestamp = int(report.observation_step)
         self.sensor_confidence = float(report.sensor_confidence)
         self.is_malicious = is_malicious  # audit/counterfactual metrics only
+        self.persistent_until_verified = bool(getattr(report, "persistent_until_verified", False))
 
 
 class FusionEngine:
@@ -35,11 +37,11 @@ class FusionEngine:
         max_claim_age: int = 300,
         cost_scale: float = 40.0,
         cost_exponent: float = 1.5,
-        blocked_probability_threshold: float = 0.70,
+        blocked_probability_threshold: float = 0.60,
         congested_impact: float = 0.50,
         duplicate_window_steps: int = 0,
         trust_threshold: float = 0.50,
-        majority_unknown_cost: float = 3.0,
+        unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST,
     ):
         self._runner: DefenseMethodRunner = build_defense_runner(
             method,
@@ -53,12 +55,13 @@ class FusionEngine:
             congested_impact=congested_impact,
             duplicate_window_steps=duplicate_window_steps,
             trust_threshold=trust_threshold,
-            majority_unknown_cost=majority_unknown_cost,
+            unknown_traversal_cost=unknown_traversal_cost,
         )
         self.decay_rate = decay_rate
         self.max_claim_age = max_claim_age
         self.cost_scale = cost_scale
         self.cost_exponent = cost_exponent
+        self.unknown_traversal_cost = float(unknown_traversal_cost)
         self.blocked_probability_threshold = blocked_probability_threshold
         self.report_history: dict[str, StoredClaim] = {}
         self._active: dict[tuple[int, tuple[int, int]], StoredClaim] = {}
@@ -83,10 +86,11 @@ class FusionEngine:
             )
             self._invalidate_claims_cache()
         # Keep only active/recent history. Persistent output logs carry the audit
-        # trail, so this dictionary should not grow for a 2500-step run.
+        # trail, so this dictionary should not grow for a 3000-step run.
         self.report_history = {
             report_id: item for report_id, item in self.report_history.items()
-            if now - item.report.observation_step < self.max_claim_age
+            if item.report.persistent_until_verified
+            or now - item.report.observation_step < self.max_claim_age
         }
         return removed
 
@@ -112,6 +116,10 @@ class FusionEngine:
         """
         return int(self._active_malicious_claim_count)
 
+    def active_claim_count(self) -> int:
+        """Return the number of active stored claims without changing state."""
+        return len(self._active)
+
     def operational_weight(self, report: ClaimReport, step: int | None = None) -> float:
         """Operational fusion weight for an active report, after trust gating."""
         now = self._runner.current_timestamp if step is None else int(step)
@@ -124,6 +132,24 @@ class FusionEngine:
             for claim in self._runner.claims_for(cell)
             if (claim.sender_id, cell) in self._active
         )
+
+    def newest_operational_claim_step(self, cell: tuple[int, int], step: int, *, claim=None) -> int | None:
+        """Newest timestamp for an operationally influential claim on ``cell``.
+
+        ``claim`` may be a ClaimType/int. Claims that are expired, trust-gated,
+        or otherwise have zero operational weight are ignored.
+        """
+        wanted = None if claim is None else int(claim)
+        newest = None
+        for item in self.claims_at(tuple(cell)):
+            report = item.report
+            if wanted is not None and int(report.claim) != wanted:
+                continue
+            if self.operational_weight(report, step) <= 1e-12:
+                continue
+            timestamp = int(report.observation_step)
+            newest = timestamp if newest is None else max(newest, timestamp)
+        return newest
 
     def retract(self, report: ClaimReport) -> bool:
         key = (report.sender_id, tuple(report.target_cell))
@@ -151,6 +177,18 @@ class FusionEngine:
             self._invalidate_claims_cache()
             return previous
         return previous
+
+    def is_active_report(self, report: ClaimReport) -> bool:
+        """Return whether ``report`` is the active claim for its sender/cell.
+
+        ``DefenseMethodRunner`` deliberately refuses an out-of-order report
+        whose observation timestamp is older than the active claim.  Callers
+        need to distinguish that case from an applied replacement so a stale
+        report is not treated as operationally accepted or queued for later
+        trust verification.
+        """
+        active = self._active.get((report.sender_id, tuple(report.target_cell)))
+        return active is not None and active.report.report_id == report.report_id
 
     def sender_route_risk(self, sender_id: int, cells, step: int, trust_override: float | None = None) -> float:
         self.set_time(step)

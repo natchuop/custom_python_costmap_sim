@@ -1,7 +1,6 @@
 """Warehouse robot layout and delivery-task generation (sim2 parity)."""
 from __future__ import annotations
 
-import math
 
 from .map_io import (
     WAREHOUSE_ATTACKER_START,

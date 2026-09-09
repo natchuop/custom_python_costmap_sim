@@ -16,7 +16,7 @@ from .belief import RobotBeliefMap
 from .config import SimulationConfig
 from .fusion import FusionEngine
 from .metrics import CsvMetrics
-from .models import ClaimReport, ClaimType, VerificationOutcome
+from .models import AttackType, ClaimReport, ClaimType, VerificationOutcome
 from .planning import astar
 from .robot import ModularRobot, TRAFFIC_REROUTE_AFTER_WAITS
 from .scenario import ScenarioManifest, scenario_manifest_hash
@@ -62,14 +62,18 @@ def _make_robots(config: SimulationConfig, manifest: ScenarioManifest, method: s
             congested_impact=config.fusion.congested_impact,
             duplicate_window_steps=config.fusion.duplicate_window_steps,
             trust_threshold=config.trust.threshold,
-            majority_unknown_cost=config.fusion.majority_unknown_cost,
+            unknown_traversal_cost=config.fusion.unknown_traversal_cost,
         )
         robots.append(
             ModularRobot(
                 robot_id,
                 tuple(start),
                 tuple(tasks),
-                RobotBeliefMap(static, memory_steps=config.observation_lifetime_steps),
+                RobotBeliefMap(
+                    static,
+                    memory_steps=config.observation_lifetime_steps,
+                    unknown_traversal_cost=config.fusion.unknown_traversal_cost,
+                ),
                 trust,
                 fusion,
                 config.trust.threshold,
@@ -230,7 +234,7 @@ def run_manifest_rollout(
     capture_reference_state: bool = False,
 ) -> tuple[World, list[ModularRobot], dict]:
     """Replay a manifest with standardized sensing, trust, and replanning."""
-    world = World(np.asarray(manifest.static_grid, dtype=np.uint8), manifest.obstacle_episodes)
+    world = World(np.asarray(manifest.static_grid, dtype=np.uint8), manifest.obstacle_episodes, manifest.permanent_obstacles)
     robots = _make_robots(config, manifest, method)
     attacker = manifest.malicious_robot_id
     malicious_ids = frozenset(
@@ -255,6 +259,14 @@ def run_manifest_rollout(
         "malicious_reports_accepted": 0,
         "malicious_reports_influential": 0,
         "malicious_reports_operationally_ignored": 0,
+        "honest_reports_generated": 0,
+        "honest_report_deliveries": 0,
+        "honest_reports_accepted": 0,
+        "honest_reports_rejected": 0,
+        "honest_reports_operationally_ignored": 0,
+        "honest_report_ages": [],
+        "honest_report_outcomes": [],
+        "fusion_runtime_samples": [],
         "traffic_events": [],
         "attack_relevance": [],
         # Populated only by the attack-free authoring rollout.  It is not
@@ -281,6 +293,20 @@ def run_manifest_rollout(
         for item in (manifest.candidate_metadata or ())
         if item.get("event_id") or item.get("candidate_id")
     }
+    permanent_cells = {
+        tuple(cell)
+        for obstacle in manifest.permanent_obstacles
+        for cell in obstacle.cells
+    }
+    pending_honest: dict[int, list[tuple[int, ClaimReport]]] = {}
+    # Detailed honest-report outcome accounting is only required for the
+    # dedicated honest-delay experiment (including its delay=0 control).
+    # A normal baseline run can deliver millions of honest cell reports; doing
+    # a second fusion lookup and allocating one diagnostic row per delivery
+    # made the additive diagram instrumentation dominate simulation runtime.
+    measure_honest_outcomes = (
+        config.condition_type == "honest_delay" or config.honest_report_delay_steps > 0
+    )
     for event in manifest.attack_events:
         attacks_by_step.setdefault(int(event.step), []).append(event)
         for report_id in event.report_ids:
@@ -316,13 +342,22 @@ def run_manifest_rollout(
                     "goal": None if robot.completed else tuple(robot.goal),
                     "path": tuple(robot.path or ()),
                     "visible_cells": tuple(robot.current_scan_observations),
+                    "mission_id": (
+                        None
+                        if robot.completed or robot.task_index >= len(robot.tasks)
+                        else robot.tasks[robot.task_index].task_id
+                    ),
                 }
                 for robot in robots
             }
 
         for robot in robots:
             route_cost_before_verification = robot.remaining_route_cost(step)
-            results = robot.verify(observations_by_robot[robot.robot_id], step)
+            results = robot.verify(
+                observations_by_robot[robot.robot_id],
+                step,
+                truth_unchanged_since=world.truth_unchanged_since,
+            )
             route_cost_after_verification = robot.remaining_route_cost(step)
             if route_cost_before_verification is not None and route_cost_after_verification is not None:
                 materially_changed = (
@@ -392,6 +427,12 @@ def run_manifest_rollout(
 
         deliveries: dict[int, list[ClaimReport]] = {robot.robot_id: [] for robot in robots}
 
+        for recipient_id, report in pending_honest.pop(step, ()):
+            deliveries[recipient_id].append(report)
+            log["honest_report_deliveries"] += 1
+            if measure_honest_outcomes:
+                log["honest_report_ages"].append(step - report.observation_step)
+
         # Honest sharing. Sensor confidence is inherited from the LiDAR reading.
         for robot in robots:
             for observation in observations_by_robot[robot.robot_id]:
@@ -412,9 +453,18 @@ def run_manifest_rollout(
                     sensor_confidence=observation.sensor_confidence,
                 )
                 log["report_count_total"] += 1
+                log["honest_reports_generated"] += 1
                 for recipient in robots:
-                    if recipient.robot_id != robot.robot_id:
+                    if recipient.robot_id == robot.robot_id:
+                        continue
+                    delivery_step = step + config.honest_report_delay_steps
+                    if delivery_step == step:
                         deliveries[recipient.robot_id].append(report)
+                        log["honest_report_deliveries"] += 1
+                        if measure_honest_outcomes:
+                            log["honest_report_ages"].append(0)
+                    else:
+                        pending_honest.setdefault(delivery_step, []).append((recipient.robot_id, report))
 
         # Attack reports retain the manifest's observation_step; stale attacks
         # therefore carry their original blocked-observation timestamp.
@@ -451,6 +501,7 @@ def run_manifest_rollout(
                     event.observation_step,
                     sensor_confidence=1.0,
                     scenario_event_id=event.event_id,
+                    persistent_until_verified=(event.attack_type == AttackType.FAKE_OBSTACLE),
                 )
                 log["report_count_total"] += 1
                 log["malicious_report_count_total"] += 1
@@ -474,10 +525,53 @@ def run_manifest_rollout(
         for robot in robots:
             for report in deliveries[robot.robot_id]:
                 robot.receive(report)
-            accepted = robot.process_inbox(step, malicious_ids)
+
+            def runtime_observer(report, started_ns, finished_ns, before_count, after_count):
+                log["fusion_runtime_samples"].append({
+                    "step": step,
+                    "seed": config.seed,
+                    "method": method,
+                    "robot_id": robot.robot_id,
+                    "report_id": report.report_id,
+                    "report_is_malicious": report.report_id in malicious_ids,
+                    "fusion_update_runtime_ms": (finished_ns - started_ns) / 1_000_000.0,
+                    "update_runtime_ns": finished_ns - started_ns,
+                    "update_runtime_ms": (finished_ns - started_ns) / 1_000_000.0,
+                    "stored_evidence_count": after_count,
+                    "reports_considered": 1,
+                    "stored_evidence_count_before": before_count,
+                    "stored_evidence_count_after": after_count,
+                })
+
+            accepted = robot.process_inbox(
+                step,
+                malicious_ids,
+                runtime_observer=runtime_observer if config.logging.measure_fusion_runtime else None,
+            )
             accepted_ids = {report.report_id for report, _ in accepted}
             for report in deliveries[robot.robot_id]:
                 if report.report_id not in malicious_ids:
+                    if measure_honest_outcomes:
+                        accepted_here = report.report_id in accepted_ids
+                        operational_weight = robot.fusion.operational_weight(report, step) if accepted_here else 0.0
+                        ignored = bool(accepted_here and operational_weight <= 1e-12)
+                        log["honest_report_outcomes"].append({
+                            "step": step,
+                            "seed": config.seed,
+                            "method": method,
+                            "report_id": report.report_id,
+                            "source_id": report.sender_id,
+                            "created_step": report.observation_step,
+                            "delivered_step": step,
+                            "age_at_evaluation_steps": step - report.observation_step,
+                            "accepted": accepted_here,
+                            "rejected": not accepted_here,
+                            "operationally_ignored": ignored,
+                            "rejection_reason": "admission_rejected" if not accepted_here else "",
+                        })
+                        log["honest_reports_accepted"] += int(accepted_here)
+                        log["honest_reports_rejected"] += int(not accepted_here)
+                        log["honest_reports_operationally_ignored"] += int(ignored)
                     continue
                 accepted_here = report.report_id in accepted_ids
                 evidence = robot.fusion.evidence(report.target_cell, step) if accepted_here else None
@@ -511,18 +605,32 @@ def run_manifest_rollout(
 
             route_affected = robot.reports_affect_remaining_route(accepted, step)
             route_affecting_ids = set(robot.last_route_affecting_report_ids)
+            newly_opened_ids = set(robot.last_newly_opened_report_ids)
             affecting_attack_types = {
                 attack_type_by_report_id[report_id]
                 for report_id in route_affecting_ids
                 if report_id in attack_type_by_report_id
             }
+            shortcut_attack_types = {
+                attack_type_by_report_id[report_id]
+                for report_id in newly_opened_ids
+                if report_id in attack_type_by_report_id
+            }
             path_state = robot.should_replan_for_path_state(step)
             current_route = tuple(robot.path or ())
-            temporary_obstacle_on_route = bool(path_state and any(
-                not bool(world.static_grid[cell])
+            visible_physical_blocked_on_route = {
+                tuple(cell)
+                for cell in current_route
+                if not bool(world.static_grid[cell])
                 and bool(truth_grid[cell])
                 and robot.belief.observation_status(cell, step) == (ClaimType.BLOCKED, "current")
-                for cell in current_route
+            }
+            permanent_obstacle_on_route = bool(
+                path_state and visible_physical_blocked_on_route.intersection(permanent_cells)
+            )
+            temporary_obstacle_on_route = bool(path_state and any(
+                tuple(cell) not in permanent_cells
+                for cell in visible_physical_blocked_on_route
             ))
             other_robot_on_route = bool(path_state and any(
                 cell in set(positions.values()) - {robot.position}
@@ -531,7 +639,17 @@ def run_manifest_rollout(
             ))
             trust_route_changed = trust_verification_route_change.get(robot.robot_id, False)
             threshold_crossed = trust_threshold_crossing.get(robot.robot_id, False)
-            if path_state or route_affected or direct_verification_replan.get(robot.robot_id, False) or trust_route_changed or threshold_crossed:
+            shortcut_candidate = bool(newly_opened_ids)
+            # Traffic yielding temporarily replaces the mission path with a
+            # path to a parking/clearance cell.  Do not let a simultaneous
+            # trust, attack, or map update overwrite that path before the
+            # robot has actually yielded; doing so can strand every robot in
+            # a swap conflict indefinitely.
+            if robot.traffic_mode == "NORMAL" and (
+                path_state or route_affected or shortcut_candidate
+                or direct_verification_replan.get(robot.robot_id, False)
+                or trust_route_changed or threshold_crossed
+            ):
                 reasons = []
                 if route_affected:
                     reasons.append("peer_report_on_route")
@@ -541,6 +659,17 @@ def run_manifest_rollout(
                         f"{attack_type}_report_on_route"
                         for attack_type in sorted(affecting_attack_types)
                     )
+                if shortcut_candidate:
+                    reasons.append("peer_report_shortcut_check")
+                    if shortcut_attack_types:
+                        # Keep the existing per-attack replan metrics compatible:
+                        # False Clearance still appears under its historical token,
+                        # even though the affected cell need not lie on the old path.
+                        reasons.append("malicious_report_on_route")
+                        reasons.extend(
+                            f"{attack_type}_report_on_route"
+                            for attack_type in sorted(shortcut_attack_types)
+                        )
                 if direct_verification_replan.get(robot.robot_id, False):
                     reasons.append("direct_verification")
                 if trust_route_changed:
@@ -548,13 +677,27 @@ def run_manifest_rollout(
                 if threshold_crossed:
                     reasons.append("trust_threshold_crossing")
                 if path_state:
+                    if permanent_obstacle_on_route:
+                        reasons.append("permanent_physical_obstacle_on_route")
                     if temporary_obstacle_on_route:
                         reasons.append("temporary_physical_obstacle_on_route")
                     if other_robot_on_route:
                         reasons.append("robot_detected_on_route")
-                    if not temporary_obstacle_on_route and not other_robot_on_route:
+                    if not permanent_obstacle_on_route and not temporary_obstacle_on_route and not other_robot_on_route:
                         reasons.append("path_invalid_or_empty")
-                robot.replan(step, "+".join(reasons) or "map_change")
+                robot.replan(
+                    step,
+                    "+".join(reasons) or "map_change",
+                    only_if_improved=(
+                        shortcut_candidate
+                        and not path_state
+                        and not route_affected
+                        and not direct_verification_replan.get(robot.robot_id, False)
+                        and not trust_route_changed
+                        and not threshold_crossed
+                    ),
+                    improvement_epsilon=config.periodic_route_improvement_epsilon,
+                )
                 _log_replan(log, method, robot, step)
                 planned_this_step.add(robot.robot_id)
 
@@ -564,6 +707,24 @@ def run_manifest_rollout(
             for attack_event in attacks_by_step.get(step, ()):
                 if robot.robot_id not in attack_event.recipients:
                     continue
+                attack_cells = {tuple(cell) for cell in attack_event.cells}
+                accepted_attack_reports = [
+                    (report, weight)
+                    for report, weight in accepted
+                    if report.scenario_event_id == attack_event.event_id
+                ]
+                accepted_attack_cells = {
+                    tuple(report.target_cell) for report, _ in accepted_attack_reports
+                }
+                influential_attack_cells = {
+                    tuple(report.target_cell)
+                    for report, _ in accepted_attack_reports
+                    if robot.fusion.operational_weight(report, step) > 1e-12
+                }
+                direct_free_override_cells = {
+                    cell for cell in attack_cells
+                    if robot.belief.observation_status(cell, step) == (ClaimType.FREE, "current")
+                }
                 impact = _route_attacker_impact(
                     robot,
                     attacker,
@@ -577,13 +738,21 @@ def run_manifest_rollout(
                     "scenario_event_id": attack_event.event_id,
                     "attack_type": attack_event.attack_type.value,
                     "recipient_id": robot.robot_id,
+                    # These fields separate admission/trust success from an
+                    # opportunity to affect navigation at the injection step.
+                    "attack_report_cells": len(attack_cells),
+                    "attack_accepted_cells": len(accepted_attack_cells),
+                    "attack_influential_cells": len(influential_attack_cells),
+                    "attack_direct_free_override_cells": len(direct_free_override_cells),
+                    "attack_current_route_overlap_cells": len(attack_cells.intersection(current_route)),
+                    "attack_victim_path_active": bool(current_route) and not robot.completed,
                     **impact,
                 })
 
         # Common periodic optimization catches gradual age/trust-memory changes.
         if step > 0 and step % config.periodic_route_check_steps == 0:
             for robot in robots:
-                if robot.completed or robot.robot_id in planned_this_step:
+                if robot.completed or robot.robot_id in planned_this_step or robot.traffic_mode != "NORMAL":
                     continue
                 robot.replan(
                     step,
@@ -625,11 +794,22 @@ def run_manifest_rollout(
                     robot.consecutive_traffic_waits = 0
             no_path_cause = robot.classify_no_path(world, step) if action == "no_path" else None
             robot.record_position()
-            if action == "blocked_move" or (action == "task_transition" and not robot.completed):
+            if robot.traffic_mode == "NORMAL" and (action == "blocked_move" or (action == "task_transition" and not robot.completed)):
                 robot.replan(step, action)
                 _log_replan(log, method, robot, step)
-            elif action == "traffic_wait" and robot.consecutive_traffic_waits >= TRAFFIC_REROUTE_AFTER_WAITS:
+            elif robot.traffic_mode == "NORMAL" and action == "traffic_wait" and robot.consecutive_traffic_waits >= TRAFFIC_REROUTE_AFTER_WAITS:
                 robot.replan(step, "traffic_wait_reroute", other_reserved | other_cells)
+                _log_replan(log, method, robot, step)
+            elif (
+                robot.traffic_mode == "NORMAL"
+                and action == "no_path"
+                and no_path_cause == "planner_or_state_error"
+            ):
+                # The diagnostic counterfactual found a valid operational
+                # route, so an empty robot path is an internal state mismatch,
+                # not an attack-induced map disconnect. Recover immediately
+                # instead of waiting for the ordinary path-invalid cooldown.
+                robot.replan(step, "planner_state_recovery")
                 _log_replan(log, method, robot, step)
             if robot.deliveries_completed > deliveries_before_move:
                 log["events"].append({
@@ -722,6 +902,13 @@ def _persist_event(event: dict, attacker_id: int) -> bool:
 
 def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest, method: str, world, robots, log: dict) -> tuple[dict, CsvMetrics]:
     collector = CsvMetrics()
+    measure_honest_outcomes = (
+        config.condition_type == "honest_delay" or config.honest_report_delay_steps > 0
+    )
+    for sample in log.get("fusion_runtime_samples", ()):
+        collector.fusion_runtime(**sample)
+    for outcome in log.get("honest_report_outcomes", ()):
+        collector.honest_report_outcome(**outcome)
     attacker_id = log.get("malicious_robot_id", manifest.malicious_robot_id)
     for event in log["events"]:
         if not _persist_event(event, attacker_id):
@@ -739,12 +926,37 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
     last_injection = max(log["attack_injection_steps"], default=None)
     ever_affected = any(sample["route_affected_by_attacker"] for sample in benign_samples)
     recovery = None
+    recovery_step = None
     if ever_affected and last_injection is not None:
-        for step in range(last_injection, config.total_steps):
-            step_samples = [sample for sample in benign_samples if sample["step"] == step]
+        for step in sorted({int(sample["step"]) for sample in benign_samples if int(sample["step"]) >= last_injection}):
+            step_samples = [sample for sample in benign_samples if int(sample["step"]) == step]
             if step_samples and all(not sample["route_affected_by_attacker"] for sample in step_samples):
                 recovery = step - last_injection
+                recovery_step = step
                 break
+    if last_injection is None:
+        recovery_status = "no_attack_injection"
+    elif not ever_affected:
+        recovery_status = "never_affected"
+    elif recovery_step is None:
+        recovery_status = "not_recovered_by_end"
+    else:
+        recovery_status = "recovered"
+    affected_steps = {
+        int(sample["step"])
+        for sample in benign_samples
+        if bool(sample.get("route_affected_by_attacker"))
+    }
+    collector.reference_recovery_episode(
+        seed=config.seed,
+        method=method,
+        manifest_hash=scenario_manifest_hash(manifest),
+        attack_episode_id="aggregate_attack_episode",
+        effect_start_step=min(affected_steps) if affected_steps else None,
+        recovery_step=recovery_step,
+        recovery_duration_steps=recovery,
+        recovery_status=recovery_status,
+    )
     trust_events = log["trust_events"]
     traffic_counts = summarize_traffic_events(log.get("traffic_events", []))
     initial_trust = config.trust.prior_alpha / max(1e-12, config.trust.prior_alpha + config.trust.prior_beta)
@@ -790,6 +1002,9 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
     def percentile(values, quantile):
         return float(np.percentile(values, quantile)) if values else None
 
+    runtime_values = [float(row["fusion_update_runtime_ms"]) for row in log.get("fusion_runtime_samples", [])]
+    honest_ages = [float(value) for value in log.get("honest_report_ages", [])]
+
     impact_events = [event for event in log["events"] if event.get("kind") == "attack_route_impact"]
     benign_replan_events = [
         event for event in log["events"]
@@ -818,11 +1033,10 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
             per_attack_extra_lengths.append(max(extra_lengths))
         if any(bool(event.get("attack_induced_path_change")) for event in events):
             attack_ids_with_path_change.add(attack_id)
-    affected_steps = {
-        int(sample["step"])
-        for sample in benign_samples
-        if bool(sample.get("route_affected_by_attacker"))
-    }
+    stale_impact_events = [
+        event for event in impact_events
+        if event.get("attack_type") == AttackType.STALE_REASSERTION.value
+    ]
     summary = {
         "method": method, "engine": "modular_native", "seed": config.seed,
         "steps_completed": config.total_steps, "attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
@@ -945,8 +1159,54 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "attack_extra_path_length_total": sum(per_attack_extra_lengths),
         "attack_induced_path_changes": len(attack_ids_with_path_change),
         "attacks_evaluated_for_route_impact": len(impacts_by_attack),
+        "stale_attack_report_cells": sum(int(event.get("attack_report_cells", 0)) for event in stale_impact_events),
+        "stale_attack_accepted_cells": sum(int(event.get("attack_accepted_cells", 0)) for event in stale_impact_events),
+        "stale_attack_influential_cells": sum(int(event.get("attack_influential_cells", 0)) for event in stale_impact_events),
+        "stale_attack_direct_free_override_cells": sum(int(event.get("attack_direct_free_override_cells", 0)) for event in stale_impact_events),
+        "stale_attack_current_route_overlap_cells": sum(int(event.get("attack_current_route_overlap_cells", 0)) for event in stale_impact_events),
+        "stale_attack_active_route_opportunities": sum(bool(event.get("attack_victim_path_active")) for event in stale_impact_events),
         "steps_route_affected_by_attacker": len(affected_steps),
         "recovery_time_steps": recovery,
+        "recovery_status": recovery_status,
+        "recovery_origin_step": last_injection,
+        "recovery_step": recovery_step,
+        "last_attack_injection_step": last_injection,
+        "configured_honest_report_delay_steps": config.honest_report_delay_steps,
+        "honest_outcome_measurement_active": measure_honest_outcomes,
+        "honest_reports_generated": log["honest_reports_generated"],
+        "honest_report_deliveries": log["honest_report_deliveries"],
+        "honest_reports_accepted": log["honest_reports_accepted"] if measure_honest_outcomes else None,
+        "honest_reports_rejected": log["honest_reports_rejected"] if measure_honest_outcomes else None,
+        "honest_reports_operationally_ignored": log["honest_reports_operationally_ignored"] if measure_honest_outcomes else None,
+        "honest_rejection_rate": (
+            log["honest_reports_rejected"] / log["honest_report_deliveries"]
+            if measure_honest_outcomes and log["honest_report_deliveries"] else None
+        ),
+        "honest_operational_ignore_rate": (
+            log["honest_reports_operationally_ignored"] / log["honest_report_deliveries"]
+            if measure_honest_outcomes and log["honest_report_deliveries"] else None
+        ),
+        "honest_report_age_mean_steps": sum(honest_ages) / len(honest_ages) if honest_ages else None,
+        "honest_report_age_p95_steps": percentile(honest_ages, 95),
+        "fusion_update_runtime_mean_ms": sum(runtime_values) / len(runtime_values) if runtime_values else None,
+        "fusion_update_runtime_median_ms": percentile(runtime_values, 50),
+        "fusion_update_runtime_p95_ms": percentile(runtime_values, 95),
+        "fusion_update_runtime_max_ms": max(runtime_values) if runtime_values else None,
+        "fusion_update_sample_count": len(runtime_values),
+        "max_stored_evidence_count": max(
+            (int(row["stored_evidence_count_after"]) for row in log.get("fusion_runtime_samples", [])),
+            default=0,
+        ),
+        "condition_type": config.condition_type,
+        "attack_intensity_condition": config.attack_intensity_condition,
+        "configured_attack_interval_min_steps": (
+            config.attacks.interval_min if config.condition_type == "attack_intensity" else None
+        ),
+        "configured_attack_interval_max_steps": (
+            config.attacks.interval_max if config.condition_type == "attack_intensity" else None
+        ),
+        "configured_attack_injections_per_1000_steps": config.configured_attack_injections_per_1000_steps,
+        "actual_attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
         "manifest_hash": manifest.map_hash, "map_hash": manifest.map_hash,
         "scenario_manifest_hash": scenario_manifest_hash(manifest),
     }

@@ -17,6 +17,22 @@ def load_movingai(path: str | Path) -> np.ndarray:
     return np.array([[0 if char in ".gGsS" else 1 for char in row] for row in rows],dtype=np.uint8)
 
 
+PACKAGED_MOVINGAI_MAPS = {
+    "room-32-32-4": "maps/room-32-32-4.map",
+    "den312d": "maps/den312d.map",
+}
+
+def packaged_movingai_map_path(map_id: str) -> str:
+    try:
+        relative = PACKAGED_MOVINGAI_MAPS[map_id]
+    except KeyError as exc:
+        raise ValueError(f"unknown packaged MovingAI map: {map_id}") from exc
+    path = Path(__file__).resolve().parents[1] / relative
+    if not path.exists():
+        raise FileNotFoundError(f"packaged MovingAI map is missing: {path}")
+    return str(path)
+
+
 def default_warehouse_map() -> np.ndarray:
     """Convert ``warehouse-world/maps/005/map_rotated.pgm`` in memory.
 

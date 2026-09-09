@@ -2,7 +2,8 @@ import numpy as np
 
 from map_poisoning.audit import audit_manifest
 from map_poisoning.config import AttackConfig, PhaseConfig, SimulationConfig
-from map_poisoning.models import AttackType
+from map_poisoning.models import AttackType, TemporaryObstacleEpisode
+from map_poisoning.recon_authoring import _select_episode_attack_target
 from map_poisoning.scenario import author_manifest
 
 
@@ -72,3 +73,58 @@ def test_no_enabled_attacks_authors_an_empty_stream():
     manifest = author_manifest(_config(()), _grid())
     assert manifest.attack_events == ()
     assert manifest.obstacle_episodes
+
+
+def test_stale_reassertion_uses_distinct_recently_cleared_episodes():
+    grid = _grid()
+    manifest = author_manifest(
+        _config((AttackType.STALE_REASSERTION.value,)),
+        grid,
+    )
+    events = [event for event in manifest.attack_events if event.attack_type == AttackType.STALE_REASSERTION]
+    assert events
+    episode_by_id = {episode.episode_id: episode for episode in manifest.obstacle_episodes}
+    target_ids = [event.obstacle_episode_id for event in events]
+    assert len(target_ids) == len(set(target_ids))
+    for event in events:
+        episode = episode_by_id[event.obstacle_episode_id]
+        age = event.step - episode.clearance_step
+        assert 30 <= age <= 100
+        assert event.observation_step == episode.clearance_step - 1
+
+
+def test_stale_reassertion_prefers_positive_recon_reblock_penalty_over_zero():
+    grid = np.zeros((9, 9), dtype=np.uint8)
+    grid[[0, -1], :] = 1
+    grid[:, [0, -1]] = 1
+    positive = TemporaryObstacleEpisode("positive", ((4, 4),), 10, 50)
+    zero = TemporaryObstacleEpisode("zero", ((2, 4),), 10, 50)
+    reference_states = {
+        0: {
+            1: {
+                "position": (4, 1),
+                "goal": (4, 7),
+                "visible_cells": (),
+            }
+        }
+    }
+    # Deliberately make the zero-penalty candidate much more attractive to the
+    # older traffic score. Positive mission-level reblocking impact must still
+    # dominate it for Stale Reassertion.
+    heatmap = np.zeros(grid.shape, dtype=np.int32)
+    heatmap[2, 4] = 1000
+    selected = _select_episode_attack_target(
+        (positive, zero),
+        (),
+        reference_states,
+        100,
+        AttackType.STALE_REASSERTION,
+        (1,),
+        grid,
+        heatmap,
+        target_use_counts={},
+    )
+    assert selected is not None
+    episode, relevance = selected
+    assert episode.episode_id == "positive"
+    assert relevance["recon_stale_reblock_penalty_steps"] > 0

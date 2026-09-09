@@ -41,8 +41,11 @@ class BayesianTrustModel(TrustModel):
     alpha0: float = 9.0
     beta0: float = 1.0
     evidence_cap: float = 12.0
-    confirmation_multiplier: float = 0.25
-    contradiction_multiplier: float = 6.0
+    # Trust changes are applied to verified report cells.  Keep positive
+    # evidence deliberately small, and require roughly two strong, distinct
+    # contradicted cells to cross the default distrust threshold.
+    confirmation_multiplier: float = 0.025
+    contradiction_multiplier: float = 5.0
     memory_recovery_rate: float = 0.05
 
     def __post_init__(self):
@@ -134,8 +137,8 @@ def make_trust_model(
     beta: float = 1.0,
     *,
     evidence_cap: float = 12.0,
-    confirmation_multiplier: float = 0.25,
-    contradiction_multiplier: float = 6.0,
+    confirmation_multiplier: float = 0.025,
+    contradiction_multiplier: float = 5.0,
     memory_recovery_rate: float = 0.05,
 ) -> TrustModel:
     if name == "bayesian":

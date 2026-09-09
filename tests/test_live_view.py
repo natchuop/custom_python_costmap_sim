@@ -344,3 +344,89 @@ def test_reference_heatmap_background_excludes_one_step_dynamic_obstacles():
     background = np.asarray(fig.axes[0].images[0].get_array())
     assert background[dynamic_cell] != DISPLAY_DYNAMIC
     fig.clf()
+
+
+def test_false_clearance_supersedes_older_direct_block_memory_but_not_current_lidar():
+    import math
+    import numpy as np
+    from map_poisoning.live_view import DISPLAY_R1
+
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    world = type("World", (), {"static_grid": grid})()
+    log = {"malicious_robot_id": 0}
+    victim = type(
+        "Robot", (), {
+            "robot_id": 1, "completed": True, "tasks": (), "task_index": 0, "carrying": False,
+            "belief": RobotBeliefMap(grid, memory_steps=300),
+            "fusion": FusionEngine("trust_threshold", lambda _: 0.8, trust_threshold=0.5),
+        }
+    )()
+    attacker = type("Robot", (), {"robot_id": 0})()
+
+    victim.belief.begin_scan(5)
+    victim.belief.observe(DirectObservation(1, (3, 3), ClaimType.BLOCKED, 5, 1.0))
+    victim.belief.begin_scan(10)  # old direct block is now memory, not current LiDAR
+    victim.fusion.add(ClaimReport("fc", 0, (3, 3), ClaimType.FREE, 10, 1.0, "attack-fc"), is_malicious=True)
+
+    assert combined_display_grid(victim, world, log, 10, robots=(attacker, victim))[3, 3] == DISPLAY_FREE
+    assert victim.belief.traversal_cost((3, 3), 10, victim.fusion) == 1.0
+
+    victim.belief.begin_scan(11)
+    victim.belief.observe(DirectObservation(1, (3, 3), ClaimType.BLOCKED, 11, 1.0))
+    assert combined_display_grid(victim, world, log, 11, robots=(attacker, victim))[3, 3] == DISPLAY_R1
+    assert math.isinf(victim.belief.traversal_cost((3, 3), 11, victim.fusion))
+
+
+def test_fake_overlay_persists_until_all_victim_maps_clear_it():
+    from map_poisoning.live_view import _overlay_groups
+    from map_poisoning.models import AttackEvent, AttackType
+
+    event = AttackEvent(
+        "attack-persist", 5, AttackType.FAKE_OBSTACLE, ((2, 2),), ClaimType.BLOCKED,
+        5, 0, (1, 2), ("report-persist",),
+    )
+    log = {"malicious_robot_id": 0, "attack_events": (event,)}
+    attacker = type("Robot", (), {"robot_id": 0})()
+    victims = []
+    for rid in (1, 2):
+        fusion = FusionEngine("full_trust", lambda _: 1.0)
+        belief = RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=300)
+        victim = type("Robot", (), {"robot_id": rid, "fusion": fusion, "belief": belief})()
+        fusion.add(
+            ClaimReport("report-persist", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-persist"),
+            is_malicious=True,
+        )
+        victims.append(victim)
+
+    robots = (attacker, *victims)
+    assert any(group.get("event_id") == "attack-persist" for group in _overlay_groups(log, 6, robots))
+    victims[0].fusion.retract(ClaimReport("report-persist", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-persist"))
+    assert any(group.get("event_id") == "attack-persist" for group in _overlay_groups(log, 6, robots))
+    victims[1].fusion.retract(ClaimReport("report-persist", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-persist"))
+    assert not _overlay_groups(log, 6, robots)
+
+
+def test_persistent_fake_overlay_has_no_independent_age_timeout():
+    from map_poisoning.live_view import _overlay_groups
+    from map_poisoning.models import AttackEvent, AttackType
+
+    event = AttackEvent(
+        "attack-old", 5, AttackType.FAKE_OBSTACLE, ((2, 2),), ClaimType.BLOCKED,
+        5, 0, (1,), ("report-old",),
+    )
+    log = {"malicious_robot_id": 0, "attack_events": (event,)}
+    attacker = type("Robot", (), {"robot_id": 0})()
+    fusion = FusionEngine("full_trust", lambda _: 1.0, max_claim_age=30)
+    victim = type(
+        "Robot", (), {
+            "robot_id": 1,
+            "fusion": fusion,
+            "belief": RobotBeliefMap(np.zeros((6, 6), dtype=np.uint8), memory_steps=300),
+        }
+    )()
+    report = ClaimReport("report-old", 0, (2, 2), ClaimType.BLOCKED, 5, 1.0, "attack-old", True)
+    fusion.add(report, is_malicious=True)
+    fusion.prune(100)
+    assert any(group.get("event_id") == "attack-old" for group in _overlay_groups(log, 100, (attacker, victim)))
+    fusion.retract(report)
+    assert not _overlay_groups(log, 100, (attacker, victim))

@@ -5,16 +5,24 @@ import math
 import numpy as np
 
 from .models import Cell, ClaimType, DirectObservation
+from .config import DEFAULT_UNKNOWN_TRAVERSAL_COST
 
 
 class RobotBeliefMap:
-    UNKNOWN_TRAVERSAL_COST = 3.0
     DEFAULT_MEMORY_STEPS = 300
 
-    def __init__(self, static_grid: np.ndarray, memory_steps: int = DEFAULT_MEMORY_STEPS):
+    def __init__(
+        self,
+        static_grid: np.ndarray,
+        memory_steps: int = DEFAULT_MEMORY_STEPS,
+        unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST,
+    ):
         self.static_grid = np.asarray(static_grid, dtype=np.uint8)
         self.rows, self.cols = self.static_grid.shape
         self.memory_steps = max(1, int(memory_steps))
+        if float(unknown_traversal_cost) < 1.0:
+            raise ValueError("unknown_traversal_cost must be >= 1")
+        self.unknown_traversal_cost = float(unknown_traversal_cost)
         self.direct: dict[Cell, DirectObservation] = {}
         self.current_visible: set[Cell] = set()
         self.current_scan_step: int | None = None
@@ -92,12 +100,41 @@ class RobotBeliefMap:
     def has_direct_free(self, cell: Cell, step: int | None = None) -> bool:
         return self.direct_state(cell, step) == ClaimType.FREE
 
+    def peer_free_supersedes_direct_block(self, cell: Cell, fusion, step: int) -> bool:
+        """Whether a newer operational peer FREE claim supersedes stale local BLOCKED memory.
+
+        Current direct LiDAR remains authoritative. This rule exists so an
+        accepted False Clearance can actually clear an obstacle the victim saw
+        earlier, while an older/stale peer FREE report cannot erase newer local
+        blocked knowledge.
+        """
+        direct = self.direct.get(cell)
+        if direct is None or direct.claim != ClaimType.BLOCKED:
+            return False
+        _, status = self.observation_status(cell, step)
+        if status == "current":
+            return False
+        if fusion.evidence(cell, step) >= -1e-12:
+            return False
+        newest_free = fusion.newest_operational_claim_step(cell, step, claim=ClaimType.FREE)
+        return newest_free is not None and int(newest_free) > int(direct.step)
+
     def is_blocked_for_planning(self, cell: Cell, fusion, step: int, *, hard_blocked_fn=None) -> bool:
         if not self.in_bounds(cell) or self.static_grid[cell]:
             return True
         claim, status = self.observation_status(cell, step)
         if status == "current":
             return claim == ClaimType.BLOCKED
+        if status == "memory" and claim == ClaimType.BLOCKED:
+            # A directly observed obstacle remains a hard wall for planning
+            # throughout its direct-memory lifetime. Previously remembered
+            # BLOCKED cells were converted to a finite traversal penalty, so a
+            # robot could repeatedly choose a path back through a physical
+            # obstacle it had already seen. A newer operational peer FREE
+            # report may still supersede stale local BLOCKED memory (the False
+            # Clearance attack), but current LiDAR can never be overridden.
+            if not self.peer_free_supersedes_direct_block(cell, fusion, step):
+                return True
         check = hard_blocked_fn or (lambda: fusion.footprint_hard_blocked([cell], step))
         return bool(check())
 
@@ -113,13 +150,18 @@ class RobotBeliefMap:
         if math.isinf(peer_cost):
             return math.inf
         if status == "unknown" or claim is None:
-            return max(self.UNKNOWN_TRAVERSAL_COST, peer_cost)
+            return max(self.unknown_traversal_cost, peer_cost)
+        # An accepted, newer FREE report can clear stale local BLOCKED memory
+        # (False Clearance). A current direct BLOCKED scan was handled above
+        # and is never overridden.
+        if claim == ClaimType.BLOCKED and self.peer_free_supersedes_direct_block(cell, fusion, step):
+            return max(1.0, peer_cost)
         strength = self.memory_strength(cell, step)
         if claim == ClaimType.FREE:
             # Known free memory gradually returns toward unknown cost.
-            direct_cost = self.UNKNOWN_TRAVERSAL_COST - (self.UNKNOWN_TRAVERSAL_COST - 1.0) * strength
+            direct_cost = self.unknown_traversal_cost - (self.unknown_traversal_cost - 1.0) * strength
         else:
             # Remembered obstacles are finite and fade toward unknown, avoiding
             # permanent ghost walls while retaining strong recent evidence.
-            direct_cost = self.UNKNOWN_TRAVERSAL_COST + fusion.cost_scale * (strength ** fusion.cost_exponent)
+            direct_cost = self.unknown_traversal_cost + fusion.cost_scale * (strength ** fusion.cost_exponent)
         return max(direct_cost, peer_cost)

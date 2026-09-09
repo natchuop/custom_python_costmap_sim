@@ -4,7 +4,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from map_poisoning.config import AttackConfig, FusionConfig, PhaseConfig, SimulationConfig, TrustConfig
+from map_poisoning.config import AttackConfig, FusionConfig, LoggingConfig, PhaseConfig, SimulationConfig, TrustConfig
 from map_poisoning.belief import RobotBeliefMap
 from map_poisoning.fusion import FusionEngine
 from map_poisoning.models import AttackEvent, AttackType, ClaimReport, ClaimType, DeliveryTask, DirectObservation, TemporaryObstacleEpisode, VerificationOutcome
@@ -122,6 +122,63 @@ def test_peer_reports_are_delivered_and_fused_per_recipient():
     assert robots[2].accepted_reports > 0
     assert any(item.report.sender_id == 1 for item in robots[2].fusion.report_history.values())
     assert not any(item.report.sender_id == 1 for item in robots[1].fusion.report_history.values())
+
+def test_zero_honest_report_delay_matches_default_rollout():
+    manifest = _manifest()
+    default = _config()
+    explicit_zero = replace(default, honest_report_delay_steps=0)
+    first_world, first_robots, first_log = run_manifest_rollout(default, manifest, "source_memory")
+    second_world, second_robots, second_log = run_manifest_rollout(explicit_zero, manifest, "source_memory")
+    first_summary, _ = collect_rollout_metrics(default, manifest, "source_memory", first_world, first_robots, first_log)
+    second_summary, _ = collect_rollout_metrics(explicit_zero, manifest, "source_memory", second_world, second_robots, second_log)
+
+    assert first_summary == second_summary
+    assert first_log["timeseries"] == second_log["timeseries"]
+    assert first_log["events"] == second_log["events"]
+    assert first_summary["configured_honest_report_delay_steps"] == 0
+
+
+def test_fusion_runtime_measurement_preserves_existing_metric_values():
+    manifest = _manifest()
+    base = replace(_config(), logging=LoggingConfig(generate_plots=False, measure_fusion_runtime=False))
+    measured = replace(base, logging=replace(base.logging, measure_fusion_runtime=True))
+    base_world, base_robots, base_log = run_manifest_rollout(base, manifest, "source_memory")
+    measured_world, measured_robots, measured_log = run_manifest_rollout(measured, manifest, "source_memory")
+    base_summary, _ = collect_rollout_metrics(base, manifest, "source_memory", base_world, base_robots, base_log)
+    measured_summary, measured_collector = collect_rollout_metrics(measured, manifest, "source_memory", measured_world, measured_robots, measured_log)
+    runtime_fields = {
+        "fusion_update_runtime_mean_ms", "fusion_update_runtime_median_ms", "fusion_update_runtime_p95_ms",
+        "fusion_update_runtime_max_ms", "fusion_update_sample_count", "max_stored_evidence_count",
+    }
+
+    assert {key: value for key, value in base_summary.items() if key not in runtime_fields} == {
+        key: value for key, value in measured_summary.items() if key not in runtime_fields
+    }
+    assert measured_summary["fusion_update_sample_count"] > 0
+    assert measured_collector.fusion_runtime_samples
+
+
+def test_honest_operational_ignore_rate_comes_from_production_outcomes():
+    manifest = _manifest()
+    config = replace(
+        _config(),
+        honest_report_delay_steps=3,
+        fusion=FusionConfig(method="full_trust", max_claim_age=3),
+    )
+    world, robots, log = run_manifest_rollout(config, manifest, "full_trust")
+    summary, collector = collect_rollout_metrics(config, manifest, "full_trust", world, robots, log)
+    outcomes = collector.honest_report_outcomes
+    ignored = sum(bool(row["operationally_ignored"]) for row in outcomes)
+    rejected = sum(bool(row["rejected"]) for row in outcomes)
+
+    assert outcomes and len(outcomes) == summary["honest_report_deliveries"]
+    assert ignored > 0
+    assert all(row["accepted"] for row in outcomes)
+    assert all(row["age_at_evaluation_steps"] == 3 for row in outcomes)
+    assert summary["honest_reports_operationally_ignored"] == ignored
+    assert summary["honest_operational_ignore_rate"] == ignored / len(outcomes)
+    assert summary["honest_reports_rejected"] == rejected == 0
+    assert summary["honest_rejection_rate"] == rejected / len(outcomes)
 
 def test_high_trust_fake_obstacle_changes_route_and_low_trust_does_not():
     manifest = _manifest()
@@ -415,3 +472,154 @@ def test_trust_threshold_drops_when_a_fake_obstacle_is_observed():
         and event.get("outcome") == "contradicted_fresh"
         for event in log["events"]
     )
+
+
+def test_baseline_does_not_materialize_delay_diagnostic_rows():
+    """Normal runs keep diagram instrumentation additive and lightweight.
+
+    Per-report honest outcome rows are needed by the honest-delay experiment,
+    not ordinary baseline runs that may deliver millions of honest cell claims.
+    """
+    manifest = _manifest()
+    config = _config()
+    world, robots, log = run_manifest_rollout(config, manifest, "source_memory")
+    summary, collector = collect_rollout_metrics(config, manifest, "source_memory", world, robots, log)
+
+    assert log["honest_report_deliveries"] > 0
+    assert log["honest_report_outcomes"] == []
+    assert not getattr(collector, "honest_report_outcomes", [])
+    assert summary["honest_outcome_measurement_active"] is False
+    assert summary["honest_reports_accepted"] is None
+    assert summary["honest_reports_rejected"] is None
+    assert summary["honest_reports_operationally_ignored"] is None
+
+
+def test_trust_threshold_unknown_peer_block_is_a_hard_planner_wall():
+    """Trusted BLOCKED peer evidence must route around an unexplored cell."""
+    import numpy as np
+    from map_poisoning.belief import RobotBeliefMap
+    from map_poisoning.fusion import FusionEngine
+    from map_poisoning.models import ClaimReport, DeliveryTask
+    from map_poisoning.robot import ModularRobot
+    from map_poisoning.trust import ScalarTrustModel
+
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    trust = ScalarTrustModel(initial=0.8)
+    fusion = FusionEngine("trust_threshold", trust.score, trust_threshold=0.5)
+    robot = ModularRobot(
+        1,
+        (3, 1),
+        (DeliveryTask("t", (3, 1), (3, 5)),),
+        RobotBeliefMap(grid, memory_steps=300),
+        trust,
+        fusion,
+        0.5,
+        "accept_all",
+    )
+    robot.carrying = True
+    report = ClaimReport("peer-wall", 0, (3, 3), ClaimType.BLOCKED, 0, 1.0)
+    robot.receive(report)
+    robot.process_inbox(0)
+    assert robot.replan(0, "peer_report_on_route")
+    assert (3, 3) not in robot.path
+
+
+def test_per_cell_truth_tracking_penalizes_false_report_across_unrelated_epoch_change():
+    """An unrelated pallet change must not make a fake-cell contradiction ambiguous."""
+    import numpy as np
+    from map_poisoning.belief import RobotBeliefMap
+    from map_poisoning.fusion import FusionEngine
+    from map_poisoning.models import ClaimReport, DirectObservation, TemporaryObstacleEpisode, VerificationOutcome
+    from map_poisoning.robot import ModularRobot
+    from map_poisoning.trust import BayesianTrustModel
+    from map_poisoning.world import World
+
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    world = World(grid, (TemporaryObstacleEpisode("moving", ((6, 6),), 150, 250),))
+    for step in (149, 150, 151):
+        world.begin_step(step)
+
+    trust = BayesianTrustModel()
+    robot = ModularRobot(
+        1, (1, 1), (), RobotBeliefMap(grid, 300), trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.5),
+        0.5, "accept_all",
+    )
+    report = ClaimReport("fake-cross-epoch", 0, (2, 2), ClaimType.BLOCKED, 149, 1.0, "attack-x")
+    robot.receive(report)
+    robot.process_inbox(149)
+    before = trust.score(0)
+    result = robot.verify(
+        [DirectObservation(1, (2, 2), ClaimType.FREE, 151, 1.0)],
+        151,
+        truth_unchanged_since=world.truth_unchanged_since,
+    )
+    assert result[0][1] == VerificationOutcome.CONTRADICTED_FRESH
+    assert trust.score(0) < before
+
+
+def test_per_cell_truth_tracking_protects_report_when_target_cell_really_changed():
+    import numpy as np
+    from map_poisoning.belief import RobotBeliefMap
+    from map_poisoning.fusion import FusionEngine
+    from map_poisoning.models import ClaimReport, DirectObservation, TemporaryObstacleEpisode, VerificationOutcome
+    from map_poisoning.robot import ModularRobot
+    from map_poisoning.trust import BayesianTrustModel
+    from map_poisoning.world import World
+
+    grid = np.zeros((8, 8), dtype=np.uint8)
+    target = (2, 2)
+    world = World(grid, (TemporaryObstacleEpisode("moving", (target,), 150, 250),))
+    for step in (149, 150, 151):
+        world.begin_step(step)
+
+    trust = BayesianTrustModel()
+    robot = ModularRobot(
+        1, (1, 1), (), RobotBeliefMap(grid, 300), trust,
+        FusionEngine("trust_threshold", trust.score, trust_threshold=0.5),
+        0.5, "accept_all",
+    )
+    report = ClaimReport("honest-before-change", 0, target, ClaimType.FREE, 149, 1.0)
+    robot.receive(report)
+    robot.process_inbox(149)
+    before = trust.score(0)
+    result = robot.verify(
+        [DirectObservation(1, target, ClaimType.BLOCKED, 151, 1.0)],
+        151,
+        truth_unchanged_since=world.truth_unchanged_since,
+    )
+    assert result[0][1] == VerificationOutcome.TEMPORALLY_AMBIGUOUS_OR_EXPIRED
+    assert trust.score(0) == before
+
+def test_newer_peer_free_reopens_stale_block_for_improvement_only_replan():
+    """A False-Clearance-style FREE can open a cheaper route off the old detour."""
+    grid = np.zeros((7, 7), dtype=np.uint8)
+    trust = ScalarTrustModel(initial=0.8)
+    fusion = FusionEngine("trust_threshold", trust.score, trust_threshold=0.5)
+    robot = ModularRobot(
+        1,
+        (3, 1),
+        (DeliveryTask("t", (3, 1), (3, 5)),),
+        RobotBeliefMap(grid, memory_steps=300),
+        trust,
+        fusion,
+        0.5,
+        "accept_all",
+    )
+    robot.carrying = True
+    # Previously observed physical obstacle forces an initial detour.
+    robot.belief.observe(DirectObservation(1, (3, 3), ClaimType.BLOCKED, 0, 1.0))
+    assert robot.replan(0, "initial")
+    old_path = tuple(robot.path)
+    assert (3, 3) not in old_path
+
+    # At step 1 the obstacle is remembered, not currently visible. A newer
+    # trusted FREE claim should reopen it and be detected even though the cell
+    # is not on the current detour path.
+    report = ClaimReport("fc-open", 0, (3, 3), ClaimType.FREE, 1, 1.0)
+    robot.receive(report)
+    robot.process_inbox(1)
+    assert "fc-open" in robot.last_newly_opened_report_ids
+    assert robot.replan(1, "peer_report_shortcut_check+false_clearance_report_on_route", only_if_improved=True)
+    assert tuple(robot.path) != old_path
+    assert (3, 3) in robot.path

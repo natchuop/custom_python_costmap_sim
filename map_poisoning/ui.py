@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import threading
 
 from .application import run
 from .cli import config_from_args, result_location_message, suggested_output_directory
 from .config import ALL_METHODS, PRIMARY_METHODS
-from .map_io import load_npy
+from .map_io import load_npy, packaged_movingai_map_path
 from .models import AttackType
+from .reporting import REFERENCE_FIGURE_METHODS, generate_reference_report
 from .scenario_presets import PRESETS, map_path_for_preset, preset_for_hash, preset_for_id, validate_fixed_preset
 
 
@@ -18,6 +20,11 @@ MAP_OPTIONS = {
     "Map 002 (converted)": (map_path_for_preset("warehouse_002"), "warehouse_002"),
     "Map 005 (converted)": (map_path_for_preset("warehouse_005"), "warehouse_005"),
     "Map 005 rotated (converted)": (map_path_for_preset("warehouse_005_rotated"), "warehouse_005_rotated"),
+}
+
+MOVINGAI_MAP_OPTIONS = {
+    "MovingAI Room 32x32-4": packaged_movingai_map_path("room-32-32-4"),
+    "MovingAI den312d": packaged_movingai_map_path("den312d"),
 }
 
 
@@ -30,6 +37,11 @@ def _preset_for_map_path(map_path: str | None) -> str | None:
 
 
 def _map_option_for_args(args) -> str:
+    if args.map_movingai:
+        requested = Path(args.map_movingai).resolve()
+        for label, path in MOVINGAI_MAP_OPTIONS.items():
+            if Path(path).resolve() == requested:
+                return label
     if args.map_npy:
         requested = Path(args.map_npy).resolve()
         for label, (path, _) in MAP_OPTIONS.items():
@@ -52,6 +64,51 @@ def validate_gui_map_preset(map_path: str | None, preset_id: str | None) -> None
     if not path.exists():
         raise ValueError(f"selected map does not exist: {map_path}")
     validate_fixed_preset(load_npy(path), preset_for_id(preset_id))
+
+
+def is_physical_ai_method_selection(methods) -> bool:
+    """Return whether the UI selection is exactly the four reference methods."""
+    methods = tuple(methods)
+    return len(methods) == len(REFERENCE_FIGURE_METHODS) and set(methods) == set(REFERENCE_FIGURE_METHODS)
+
+
+def generate_physical_ai_report(output_directory: str | Path) -> dict:
+    """Delegate UI reporting to the canonical Physical AI reporter."""
+    matrix = Path(output_directory) / "physical_ai_attack_matrix.json"
+    if matrix.exists():
+        import json
+        return json.loads(matrix.read_text(encoding="utf-8"))
+    return generate_reference_report(output_directory)
+
+
+def run_physical_ai_workflow(config, seeds, *, full_suite: bool = False):
+    """Run the paired four-method batch or the six-batch Physical AI matrix."""
+    root = config.logging.output_directory
+    if full_suite:
+        from .reference_experiments import run_physical_ai_attack_matrix
+
+        run_physical_ai_attack_matrix(
+            config,
+            tuple(seeds),
+            root,
+            resume=False,
+            generate_per_run_plots=True,
+        )
+    else:
+        from .batch import run_multiseed
+
+        report_config = replace(
+            config,
+            logging=replace(config.logging, generate_plots=False),
+        )
+        run_multiseed(
+            report_config,
+            tuple(seeds),
+            methods=REFERENCE_FIGURE_METHODS,
+            comparison=True,
+            generate_per_run_plots=False,
+        )
+    return generate_physical_ai_report(root)
 
 
 def launch(args) -> None:
@@ -119,6 +176,7 @@ def launch(args) -> None:
         "multi_seed": tk.BooleanVar(value=bool(getattr(args, "seeds", None))),
         "seeds": tk.StringVar(value=getattr(args, "seeds", None) or "1-3"),
         "live_view": tk.BooleanVar(value=False),
+        "full_physical_ai_suite": tk.BooleanVar(value=False),
     }
     initial_methods = {args.defense_method}
     extra = getattr(args, "comparison_methods", None)
@@ -152,7 +210,7 @@ def launch(args) -> None:
     ttk.Label(form, text="Run configuration", font=("TkDefaultFont", 12, "bold")).grid(
         row=0, column=0, columnspan=3, sticky="w", pady=(0, 7)
     )
-    dropdown("Map", "map", tuple(MAP_OPTIONS) + ("Custom NPY map",), 1)
+    dropdown("Map", "map", tuple(MAP_OPTIONS) + tuple(MOVINGAI_MAP_OPTIONS) + ("Custom NPY map",), 1)
     entry("Map NPY path", "map_path", 2)
     dropdown("Scenario preset", "scenario_preset", ("",) + tuple(PRESETS), 3)
     map_status = ttk.Label(form)
@@ -185,7 +243,12 @@ def launch(args) -> None:
         text="Show live maps (recon heatmap first, then 4 belief windows)",
         variable=values["live_view"],
     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=2)
-    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 12)
+    ttk.Checkbutton(
+        form,
+        text="Run full Physical AI suite (6 map/attack batches; may take hours)",
+        variable=values["full_physical_ai_suite"],
+    ).grid(row=12, column=0, columnspan=3, sticky="w", pady=2)
+    dropdown("Belief map view", "map_view", ("Combined observations", "Local observations"), 13)
     ttk.Label(
         form,
         text=(
@@ -194,29 +257,29 @@ def launch(args) -> None:
         ),
         wraplength=650,
         justify="left",
-    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
+    ).grid(row=14, column=0, columnspan=3, sticky="w", pady=3)
 
-    ttk.Separator(form).grid(row=14, column=0, columnspan=3, sticky="ew", pady=9)
+    ttk.Separator(form).grid(row=15, column=0, columnspan=3, sticky="ew", pady=9)
     ttk.Label(form, text="Experiment settings", font=("TkDefaultFont", 12, "bold")).grid(
-        row=15, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        row=16, column=0, columnspan=3, sticky="w", pady=(0, 4)
     )
-    entry("Reconnaissance steps", "recon", 16)
-    entry("Poisoning steps", "attack", 17)
-    entry("Recovery steps", "recovery", 18)
-    entry("Deliveries per robot", "deliveries", 19)
-    entry("Maximum steps (optional)", "max_steps", 20)
-    entry("Attack interval: minimum steps", "interval_min", 21)
-    entry("Attack interval: maximum steps", "interval_max", 22)
-    entry("Fake target: minimum steps to visibility", "visibility_min", 23)
-    entry("Fake target: maximum steps to visibility", "visibility_max", 24)
-    entry("Temporary obstacle movement interval", "temp_interval", 25)
-    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 26)
-    entry("Trust threshold", "trust_threshold", 27)
+    entry("Reconnaissance steps", "recon", 17)
+    entry("Poisoning steps", "attack", 18)
+    entry("Recovery steps", "recovery", 19)
+    entry("Deliveries per robot", "deliveries", 20)
+    entry("Maximum steps (optional)", "max_steps", 21)
+    entry("Attack interval: minimum steps", "interval_min", 22)
+    entry("Attack interval: maximum steps", "interval_max", 23)
+    entry("Fake target: minimum steps to visibility", "visibility_min", 24)
+    entry("Fake target: maximum steps to visibility", "visibility_max", 25)
+    entry("Temporary obstacle movement interval", "temp_interval", 26)
+    dropdown("Trust model", "trust_model", ("bayesian", "scalar"), 27)
+    entry("Trust threshold", "trust_threshold", 28)
     dropdown(
-        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 28
+        "Admission policy", "admission_policy", ("accept_all", "hard_reject", "auto_soft"), 29
     )
     attacks_frame = ttk.LabelFrame(form, text="Enabled attack types", padding=7)
-    attacks_frame.grid(row=29, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+    attacks_frame.grid(row=30, column=0, columnspan=3, sticky="ew", pady=(9, 0))
     for column, attack in enumerate(AttackType):
         ttk.Checkbutton(
             attacks_frame, text=attack.value.replace("_", " ").title(),
@@ -225,8 +288,14 @@ def launch(args) -> None:
     form.columnconfigure(1, weight=1)
 
     def select_map(*_):
-        path, preset = MAP_OPTIONS.get(values["map"].get(), (None, None))
-        if values["map"].get() != "Custom NPY map":
+        label = values["map"].get()
+        if label in MOVINGAI_MAP_OPTIONS:
+            values["map_path"].set(MOVINGAI_MAP_OPTIONS[label])
+            values["scenario_preset"].set("")
+            map_status.configure(text=f"Selected experimental geometry: {label}")
+            return
+        path, preset = MAP_OPTIONS.get(label, (None, None))
+        if label != "Custom NPY map":
             values["map_path"].set(path or "")
             values["scenario_preset"].set(preset or "")
         map_status.configure(
@@ -235,10 +304,16 @@ def launch(args) -> None:
 
     def execute() -> None:
         try:
-            args.map_npy = values["map_path"].get().strip() or None
-            args.map_movingai = None
-            args.scenario_preset = values["scenario_preset"].get() or None
-            validate_gui_map_preset(args.map_npy, args.scenario_preset)
+            selected_map = values["map"].get()
+            if selected_map in MOVINGAI_MAP_OPTIONS:
+                args.map_npy = None
+                args.map_movingai = MOVINGAI_MAP_OPTIONS[selected_map]
+                args.scenario_preset = None
+            else:
+                args.map_npy = values["map_path"].get().strip() or None
+                args.map_movingai = None
+                args.scenario_preset = values["scenario_preset"].get() or None
+                validate_gui_map_preset(args.map_npy, args.scenario_preset)
             args.seed = int(values["seed"].get())
             selected_methods = tuple(method for method in ALL_METHODS if method_enabled[method].get())
             if not selected_methods:
@@ -246,9 +321,12 @@ def launch(args) -> None:
             args.defense_method = selected_methods[0]
             args.compare = len(selected_methods) > 1
             args.comparison_methods = ",".join(selected_methods) if args.compare else None
+            full_suite = bool(values["full_physical_ai_suite"].get())
+            if full_suite and not is_physical_ai_method_selection(selected_methods):
+                raise ValueError("Run full Physical AI suite requires exactly the four Physical AI methods.")
             args.output_directory = values["output"].get().strip() or None
             args.manifest_path = values["manifest"].get().strip() or None
-            args.seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
+            args.seeds = values["seeds"].get().strip() if (values["multi_seed"].get() or full_suite) else None
             args.no_animation = (not values["live_view"].get()) or args.compare
             args.map_view = "combined" if values["map_view"].get() == "Combined observations" else "local"
             args.recon_steps = int(values["recon"].get())
@@ -292,6 +370,7 @@ def launch(args) -> None:
         )
         compare = bool(args.compare)
         multi_seed = bool(args.seeds)
+        physical_ai_workflow = is_physical_ai_method_selection(selected_methods)
 
         def finish(error=None) -> None:
             run_button.configure(state="normal")
@@ -299,16 +378,32 @@ def launch(args) -> None:
                 status_label.configure(text="Run failed.")
                 messagebox.showerror("Unable to run", str(error))
                 return
-            message = result_location_message(
-                config.logging.output_directory, compare=compare, multi_seed=multi_seed,
+            plot_directory = (
+                Path(config.logging.output_directory)
+                if full_suite
+                else Path(config.logging.output_directory) / "aggregate" / "plots"
+                if physical_ai_workflow
+                else Path(config.logging.output_directory) / "plots"
             )
-            status_label.configure(text=f"Done. Diagrams: {config.logging.output_directory}\\plots")
+            message = (
+                f"Created results in {config.logging.output_directory}\n\n"
+                f"Physical AI aggregate diagrams:\n{plot_directory}"
+                if physical_ai_workflow
+                else result_location_message(
+                    config.logging.output_directory, compare=compare, multi_seed=multi_seed,
+                )
+            )
+            status_label.configure(text=f"Done. Diagrams: {plot_directory}")
             print(message, flush=True)
             messagebox.showinfo("Completed", message)
 
         def work() -> None:
             try:
-                if args.seeds:
+                if physical_ai_workflow:
+                    from .batch import parse_seed_spec
+                    seeds = parse_seed_spec(args.seeds) if args.seeds else (config.seed,)
+                    run_physical_ai_workflow(config, seeds, full_suite=full_suite)
+                elif args.seeds:
                     from .batch import parse_seed_spec, run_multiseed
                     methods = config.comparison_methods if compare else (config.fusion.method,)
                     run_multiseed(config, parse_seed_spec(args.seeds), methods=methods, comparison=compare, generate_per_run_plots=False)
@@ -342,7 +437,7 @@ def launch(args) -> None:
             seed = int(values["seed"].get().strip() or "15")
         except ValueError:
             seed = 15
-        seeds = values["seeds"].get().strip() if values["multi_seed"].get() else None
+        seeds = values["seeds"].get().strip() if (values["multi_seed"].get() or values["full_physical_ai_suite"].get()) else None
         return suggested_output_directory(
             method=next((method for method in ALL_METHODS if method_enabled[method].get()), "source_memory"),
             seed=seed,
@@ -366,7 +461,7 @@ def launch(args) -> None:
             values["output"].set(path)
 
     values["map"].trace_add("write", select_map)
-    for key in ("map", "map_path", "scenario_preset", "seed", "seeds", "multi_seed"):
+    for key in ("map", "map_path", "scenario_preset", "seed", "seeds", "multi_seed", "full_physical_ai_suite"):
         values[key].trace_add("write", refresh_output)
     for variable in list(attack_enabled.values()) + list(method_enabled.values()):
         variable.trace_add("write", refresh_output)
@@ -376,11 +471,17 @@ def launch(args) -> None:
             from .batch import parse_seed_spec
             count = len(parse_seed_spec(values["seeds"].get()))
             methods = sum(1 for variable in method_enabled.values() if variable.get()) or 1
-            seed_preview.configure(text=f"{count} seeds x {methods} methods = {count * methods} simulations" if values["multi_seed"].get() else "")
+            active = values["multi_seed"].get() or values["full_physical_ai_suite"].get()
+            if values["full_physical_ai_suite"].get():
+                preview = f"{count} seeds x 4 methods x 6 batches = {count * 4 * 6} simulations"
+            else:
+                preview = f"{count} seeds x {methods} methods = {count * methods} simulations"
+            seed_preview.configure(text=preview if active else "")
         except Exception:
             seed_preview.configure(text="")
     values["seeds"].trace_add("write", update_preview)
     values["multi_seed"].trace_add("write", update_preview)
+    values["full_physical_ai_suite"].trace_add("write", update_preview)
     for variable in method_enabled.values():
         variable.trace_add("write", update_preview)
     select_map()
