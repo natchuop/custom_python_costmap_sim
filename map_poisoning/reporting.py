@@ -309,30 +309,50 @@ def _plot_trust(data, path):
 
 
 def _plot_influence(data, path):
-    required = {"active_fake_claim_count", "influential_fake_claim_count"}
-    if not data.timeseries or not required.issubset(data.timeseries[0]):
-        data.warnings.append("fake influence plot skipped: influence columns are absent")
+    if not data.timeseries:
+        data.warnings.append("attack influence plot skipped: influence columns are absent")
         return False
     fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     benign = _benign_ids(data)
-    if benign:
-        reference = dict(_series(data.timeseries, benign[0], "active_fake_claim_count", parse_int))
-        disagreements = 0
-        for rid in benign[1:]:
-            if dict(_series(data.timeseries, rid, "active_fake_claim_count", parse_int)) != reference:
-                disagreements += 1
-        if disagreements:
-            data.warnings.append("stored fake claim counts disagree across benign robots; using first benign robot")
-        if reference:
-            top.step(sorted(reference), [reference[x] for x in sorted(reference)], where="post", label="Stored / unexpired fake claims")
-    for rid in benign:
-        values = _series(data.timeseries, rid, "influential_fake_claim_count", parse_int)
-        if values:
-            bottom.step([x for x, _ in values], [y for _, y in values], where="post", color=_robot_color(rid), label=f"R{rid} influential")
+    type_specs = (
+        ("fake_obstacle", "Fake obstacle", "#d62728"),
+        ("false_clearance", "False clearance", "#9467bd"),
+        ("stale_reassertion", "Stale reassertion", "#8c564b"),
+    )
+    available = [
+        spec for spec in type_specs
+        if any(
+            f"active_{spec[0]}_claim_count" in row
+            or f"influential_{spec[0]}_claim_count" in row
+            for row in data.timeseries
+        )
+    ]
+    # Render older run directories produced before the per-type schema was
+    # added.  New runs use the explicit type columns above.
+    if not available and all(field in data.timeseries[0] for field in ("active_fake_claim_count", "influential_fake_claim_count")):
+        available = [("fake_obstacle", "Fake obstacle", "#d62728")]
+        legacy = True
+    else:
+        legacy = False
+    if not available:
+        data.warnings.append("attack influence plot skipped: influence columns are absent")
+        plt.close(fig)
+        return False
+    for attack_type, label, color in available:
+        active_field = "active_fake_claim_count" if legacy else f"active_{attack_type}_claim_count"
+        influential_field = "influential_fake_claim_count" if legacy else f"influential_{attack_type}_claim_count"
+        if benign:
+            reference = dict(_series(data.timeseries, benign[0], active_field, parse_int))
+            if reference:
+                top.step(sorted(reference), [reference[x] for x in sorted(reference)], where="post", color=color, label=f"Stored {label.lower()} claims")
+        for rid in benign:
+            values = _series(data.timeseries, rid, influential_field, parse_int)
+            if values:
+                bottom.step([x for x, _ in values], [y for _, y in values], where="post", color=color, alpha=0.65, label=f"R{rid} {label.lower()}")
     _decorate_phases(top, data.timeseries); _decorate_phases(bottom, data.timeseries)
-    top.set(title="Stored / unexpired fake claims", ylabel="Stored claims")
+    top.set(title="Stored / unexpired malicious claims by attack type", ylabel="Stored claims")
     bottom.set(
-        title="Currently navigation-relevant fake claims",
+        title="Operationally influential malicious claims by attack type",
         xlabel="Simulation step",
         ylabel="Influential claims",
     )
@@ -343,7 +363,7 @@ def _plot_influence(data, path):
         axis.grid(alpha=0.25)
     from matplotlib.ticker import MaxNLocator
     top.yaxis.set_major_locator(MaxNLocator(integer=True)); bottom.yaxis.set_major_locator(MaxNLocator(integer=True))
-    fig.suptitle(_title(data, "Fake claim influence over time"))
+    fig.suptitle(_title(data, "Attack-type claim influence over time"))
     _save(fig, path)
     return True
 
@@ -357,14 +377,26 @@ def _plot_route_cost(data, path):
     for rid in _benign_ids(data):
         values = _series(data.timeseries, rid, field)
         if values and any(value for _, value in values): top.plot([x for x, _ in values], [y for _, y in values], color=_robot_color(rid), label=f"R{rid} benign")
+        signed = _series(data.timeseries, rid, "attacker_signed_route_cost_delta")
+        if signed and any(value for _, value in signed if math.isfinite(value) and value != 0):
+            top.plot(
+                [x for x, _ in signed],
+                [y for _, y in signed],
+                color=_robot_color(rid),
+                linestyle="--",
+                alpha=0.75,
+                label=f"R{rid} signed delta",
+            )
         affected = _series(data.timeseries, rid, "preferred_route_affected_by_attacker", lambda value: int(parse_bool(value)))
         if affected and any(value for _, value in affected): bottom.step([x for x, _ in affected], [y for _, y in affected], where="post", color=_robot_color(rid), label=f"R{rid} benign")
     _decorate_phases(top, data.timeseries); _decorate_phases(bottom, data.timeseries)
-    top.set(title="Attacker-attributable cost on stored route", ylabel="Cost delta")
+    top.set(title="Added and signed attacker route cost", ylabel="Cost delta")
     bottom.set(title="Preferred route affected by attacker", xlabel="Simulation step", ylabel="Affected [0/1]", ylim=(-0.05, 1.05))
-    if not any(value for rid in _benign_ids(data) for _, value in _series(data.timeseries, rid, field)):
+    added_values = [value for rid in _benign_ids(data) for _, value in _series(data.timeseries, rid, field) if math.isfinite(value)]
+    signed_values = [value for rid in _benign_ids(data) for _, value in _series(data.timeseries, rid, "attacker_signed_route_cost_delta") if math.isfinite(value)]
+    if not any(value != 0 for value in added_values) and not any(value != 0 for value in signed_values):
         top.set_ylim(0, 1)
-        top.text(0.5, 0.5, "No attacker-attributable cost on stored routes in this run", transform=top.transAxes, ha="center", va="center")
+        top.text(0.5, 0.5, "No attacker-attributable route-cost change in this run", transform=top.transAxes, ha="center", va="center")
     if not any(value for rid in _benign_ids(data) for _, value in _series(data.timeseries, rid, "preferred_route_affected_by_attacker", lambda value: int(parse_bool(value)))):
         bottom.text(0.5, 0.5, "Preferred route was never changed by current attacker evidence", transform=bottom.transAxes, ha="center", va="center")
     for axis in (top, bottom):
@@ -749,7 +781,14 @@ def _write_run_summary(data, plot_names):
         f"  malicious reports operationally ignored: {s.get('malicious_reports_operationally_ignored', 'NA')}",
         f"  attacks causing counterfactual path changes: {s.get('attack_induced_path_changes', 'NA')}",
         f"  route penalty mean/max/total: {s.get('attack_route_penalty_mean', 'NA')}/{s.get('attack_route_penalty_max', 'NA')}/{s.get('attack_route_penalty_total', 'NA')}",
+        f"  signed route cost delta mean/min/max: {s.get('attack_signed_route_cost_delta_mean', 'NA')}/{s.get('attack_signed_route_cost_delta_min', 'NA')}/{s.get('attack_signed_route_cost_delta_max', 'NA')}",
+        f"  route cost reduction mean/total: {s.get('attack_route_cost_reduction_mean', 'NA')}/{s.get('attack_route_cost_reduction_total', 'NA')}",
         f"  extra path length mean/max/total: {s.get('attack_extra_path_length_mean', 'NA')}/{s.get('attack_extra_path_length_max', 'NA')}/{s.get('attack_extra_path_length_total', 'NA')}",
+        f"  shortcut path length mean/total: {s.get('attack_shortcut_path_length_mean', 'NA')}/{s.get('attack_shortcut_path_length_total', 'NA')}",
+        f"  malicious acceptance / false acceptance: {s.get('malicious_acceptance_rate', 'NA')}/{s.get('malicious_false_acceptance_rate', 'NA')}",
+        f"  fake-obstacle acceptance: {s.get('fake_obstacle_acceptance_rate', 'NA')} (false: {s.get('fake_obstacle_false_acceptance_rate', 'NA')})",
+        f"  false-clearance acceptance: {s.get('false_clearance_acceptance_rate', 'NA')} (false: {s.get('false_clearance_false_acceptance_rate', 'NA')})",
+        f"  stale-reassertion acceptance: {s.get('stale_reassertion_acceptance_rate', 'NA')} (false: {s.get('stale_reassertion_false_acceptance_rate', 'NA')})",
         f"  steps route affected by attacker: {s.get('steps_route_affected_by_attacker', 'NA')}",
         *influence_diagnostics,
         "", "Traffic:",
@@ -869,6 +908,59 @@ def _plot_comparison_influence(rows, path, field, title, ylabel):
     _save(fig, path); return True
 
 
+def _plot_comparison_attack_types(rows, path):
+    """Compare operational malicious influence without pooling attack types."""
+    has_type_schema = any(
+        f"influential_{attack_type}_claim_count" in row
+        for _, data in rows
+        for row in data.timeseries
+        for attack_type in ("fake_obstacle", "false_clearance", "stale_reassertion")
+    )
+    if not has_type_schema:
+        return _plot_comparison_influence(
+            rows,
+            path,
+            "influential_fake_claim_count",
+            "Fake influence over time by method",
+            "Mean influential fake cells",
+        )
+    fig, ax = plt.subplots(figsize=(12, 6))
+    plotted = False
+    specs = (
+        ("fake_obstacle", "fake obstacle", "#d62728"),
+        ("false_clearance", "false clearance", "#9467bd"),
+        ("stale_reassertion", "stale reassertion", "#8c564b"),
+    )
+    for method, data in rows:
+        benign = set(_benign_ids(data))
+        for attack_type, label, color in specs:
+            field = f"influential_{attack_type}_claim_count"
+            grouped = {}
+            for row in data.timeseries:
+                if parse_int(row.get("robot_id")) not in benign:
+                    continue
+                value = parse_float(row.get(field))
+                step = parse_int(row.get("step"))
+                if value is not None and step is not None:
+                    grouped.setdefault(step, []).append(value)
+            if grouped:
+                points = sorted((step, sum(values) / len(values)) for step, values in grouped.items())
+                ax.plot([x for x, _ in points], [y for _, y in points], color=color, label=f"{method} · {label}")
+                plotted = True
+    if not plotted:
+        plt.close(fig)
+        return False
+    ax.set(
+        title="Operational malicious influence by attack type and method",
+        xlabel="Simulation step",
+        ylabel="Mean influential claims",
+    )
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(alpha=0.25)
+    _save(fig, path)
+    return True
+
+
 def _comparison_split_plot(rows, left_metrics, right_metrics, title, path):
     methods = [name for name, _ in rows]
     fig, (left, right) = plt.subplots(1, 2, figsize=(13, 5))
@@ -961,7 +1053,7 @@ def generate_comparison_report(comparison_directory: str | Path, *, formats=("pn
             ("03_no_path_and_blockage.png", lambda p: _comparison_split_plot(rows, (("benign_no_path_steps", "no-path"), ("benign_blocked_world", "blocked world")), (("benign_traffic_wait_steps", "traffic waits"),), "No-path, blockage, and traffic burden", p)),
             ("04_attack_resilience.png", lambda p: _comparison_attack_plot(rows, p)),
             ("05_trust_detection.png", lambda p: _comparison_trust_plot(rows, p)),
-            ("06_fake_influence_over_time.png", lambda p: _plot_comparison_influence(rows, p, "influential_fake_claim_count", "Fake influence over time by method", "Mean influential fake cells")),
+            ("06_fake_influence_over_time.png", lambda p: _plot_comparison_attack_types(rows, p)),
             ("07_route_influence_over_time.png", lambda p: _plot_comparison_influence(rows, p, "attacker_attributable_cost_on_route", "Attacker route influence over time", "Mean attacker cost on stored route")),
             ("08_traffic_overhead.png", lambda p: _comparison_traffic_plot(rows, p)),
         )
@@ -1027,6 +1119,12 @@ MULTISEED_DIRECTIONS = {
     "attack_extra_path_length_mean": ("lower_better", "cells"),
     "attack_extra_path_length_max": ("lower_better", "cells"),
     "attack_extra_path_length_total": ("lower_better", "cells"),
+    "attack_signed_route_cost_delta_mean": ("diagnostic", "cost"),
+    "attack_route_cost_reduction_mean": ("lower_better", "cost"),
+    "attack_mean_influential_malicious_cells": ("lower_better", "cells"),
+    "attack_fraction_samples_malicious_influenced": ("lower_better", "ratio"),
+    "malicious_acceptance_rate": ("lower_better", "ratio"),
+    "malicious_false_acceptance_rate": ("lower_better", "ratio"),
     "steps_route_affected_by_attacker": ("lower_better", "steps"),
     "recovery_start_attacker_trust_mean": ("diagnostic", "trust"),
     "recovery_trust_gain": ("diagnostic", "trust"),
@@ -1078,18 +1176,34 @@ def _attack_phase_benign_samples(data):
 def _valid_attack_metrics(data):
     rows = _attack_phase_benign_samples(data)
     fake = [parse_float(row.get("influential_fake_claim_count")) for row in rows]
+    malicious = [parse_float(row.get("influential_malicious_claim_count")) for row in rows]
     cost = [parse_float(row.get("attacker_attributable_cost_on_route")) for row in rows]
+    signed_cost = [parse_float(row.get("attacker_signed_route_cost_delta")) for row in rows]
+    reductions = [parse_float(row.get("attacker_route_cost_reduction")) for row in rows]
     fake = [value for value in fake if value is not None]
+    malicious = [value for value in malicious if value is not None]
     cost = [value for value in cost if value is not None]
+    signed_cost = [value for value in signed_cost if value is not None and math.isfinite(value)]
+    reductions = [value for value in reductions if value is not None and math.isfinite(value)]
     affected = [parse_bool(row.get("preferred_route_affected_by_attacker"), None)
                 for row in rows]
     affected = [value for value in affected if value is not None]
-    return {
+    result = {
         "attack_mean_influential_fake_cells": sum(fake) / len(fake) if fake else None,
         "attack_fraction_samples_influenced": sum(value > 0 for value in fake) / len(fake) if fake else None,
+        "attack_mean_influential_malicious_cells": sum(malicious) / len(malicious) if malicious else None,
+        "attack_fraction_samples_malicious_influenced": sum(value > 0 for value in malicious) / len(malicious) if malicious else None,
         "attack_mean_attacker_route_cost": sum(cost) / len(cost) if cost else None,
+        "attack_mean_signed_route_cost_delta": sum(signed_cost) / len(signed_cost) if signed_cost else None,
+        "attack_mean_route_cost_reduction": sum(reductions) / len(reductions) if reductions else None,
         "attack_fraction_route_affected": sum(affected) / len(affected) if affected else None,
     }
+    for attack_type in ("fake_obstacle", "false_clearance", "stale_reassertion"):
+        values = [parse_float(row.get(f"influential_{attack_type}_claim_count")) for row in rows]
+        values = [value for value in values if value is not None]
+        result[f"attack_mean_influential_{attack_type}_cells"] = sum(values) / len(values) if values else None
+        result[f"attack_fraction_samples_{attack_type}_influenced"] = sum(value > 0 for value in values) / len(values) if values else None
+    return result
 
 def _recovery_trust_metrics(data):
     benign = _benign_ids(data)
@@ -1130,6 +1244,9 @@ def _phase_outcome_metrics(data):
             fake = [parse_float(row.get("influential_fake_claim_count")) for row in rows]
             fake = [value for value in fake if value is not None]
             result["mean_influential_fake_cells_during_attack"] = sum(fake) / len(fake) if fake else None
+            malicious = [parse_float(row.get("influential_malicious_claim_count")) for row in rows]
+            malicious = [value for value in malicious if value is not None]
+            result["mean_influential_malicious_cells_during_attack"] = sum(malicious) / len(malicious) if malicious else None
     return result
 
 def _seed_metric(data, field):

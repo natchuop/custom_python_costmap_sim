@@ -934,12 +934,18 @@ def _run_reconnaissance_rollout(config: SimulationConfig, manifest: ScenarioMani
     )
     # A caller may hand us a full manifest; recon is nevertheless always clean.
     reference_manifest = replace(manifest, attack_events=(), report_audit_labels=())
+    # The internal method name is retained for compatibility with the native
+    # planner, but this is a neutral authoring pass: peer sharing is disabled
+    # and the malicious robot is virtual, so no defense-specific trust/fusion
+    # behavior or attacker traffic can affect frozen candidate placement.
     _, robots, log = run_manifest_rollout(
         reference_config,
         reference_manifest,
         "full_trust",
         show_progress=False,
         capture_reference_state=True,
+        neutral_recon=True,
+        virtual_attacker_recon=True,
     )
     frozen = freeze_recon_data(config, reference_manifest, log)
     return frozen, robots, log

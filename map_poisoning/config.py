@@ -70,6 +70,9 @@ class FusionConfig:
     duplicate_window_steps: int = 0
     # Unknown-space routing cost is shared by every primary method.
     unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST
+    # Majority Vote uses a binary confidence gate, not confidence-weighted
+    # votes.  The threshold is intentionally shared/configurable for audits.
+    majority_sensor_confidence_threshold: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,8 @@ class SimulationConfig:
             raise ValueError("max_claim_age must be positive")
         if self.fusion.unknown_traversal_cost < 1:
             raise ValueError("unknown traversal cost must be >= 1")
+        if not 0 <= self.fusion.majority_sensor_confidence_threshold <= 1:
+            raise ValueError("majority sensor confidence threshold must be in [0, 1]")
         if any(item not in {x.value for x in AttackType} for item in self.attacks.enabled):
             raise ValueError("unknown attack type")
         if self.map_npy and self.map_movingai:

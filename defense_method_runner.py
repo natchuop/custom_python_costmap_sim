@@ -60,6 +60,10 @@ class DefenseConfig:
     duplicate_window_steps: int = 0
     # Shared unknown-space cost for every defense method.
     unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST
+    # Majority Vote remains categorical: a report contributes one full vote or
+    # no vote.  This threshold gates very low-confidence sensor reports rather
+    # than scaling their vote.
+    majority_sensor_confidence_threshold: float = 0.50
 
     def validate(self) -> None:
         if self.method not in DEFENSE_METHODS:
@@ -78,6 +82,8 @@ class DefenseConfig:
             raise ValueError("trust_threshold must be in [0, 1]")
         if self.unknown_traversal_cost < 1.0:
             raise ValueError("unknown_traversal_cost must be >= 1")
+        if not 0.0 <= self.majority_sensor_confidence_threshold <= 1.0:
+            raise ValueError("majority_sensor_confidence_threshold must be in [0, 1]")
 
 
 class DefenseMethodRunner:
@@ -227,7 +233,7 @@ class DefenseMethodRunner:
         if method == "latest_report":
             return 1.0
         if method == "majority_vote":
-            return 1.0
+            return 1.0 if c >= self.config.majority_sensor_confidence_threshold else 0.0
         if method == "full_trust":
             return c * self._linear_age_weight(claim, timestamp)
         if method == "trust_fused":
@@ -315,6 +321,8 @@ class DefenseMethodRunner:
         if self.method == "majority_vote":
             votes = 0
             for claim in self._active_iter(cell, now, excluded_sender_id, excluded_claim_predicate):
+                if self._method_weight(claim, now) <= 0.0:
+                    continue
                 votes += 1 if claim.claim == BLOCKED_CLAIM else -1 if claim.claim == FREE_CLAIM else 0
             return float(votes)
         return sum(

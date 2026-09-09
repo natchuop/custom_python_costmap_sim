@@ -460,7 +460,15 @@ def author_manifest(config: SimulationConfig, grid=None) -> ScenarioManifest:
             type_rng.shuffle(preference_bag)
         preferred = preference_bag.pop(0)
         feasible = set(_feasible_attack_types(enabled, step, episodes, grid, permanent_obstacles))
-        if preferred in feasible:
+        used_types = {event.attack_type for event in events}
+        unseen_feasible = [kind for kind in enabled if kind in feasible and kind not in used_types]
+        if unseen_feasible:
+            # Coverage is a scenario-authoring invariant, not a defense
+            # advantage: when a requested attack type has a valid target, give
+            # it one opportunity before repeatedly sampling types already
+            # represented in the manifest.
+            ordered = [*unseen_feasible, *[kind for kind in enabled if kind in feasible and kind not in unseen_feasible]]
+        elif preferred in feasible:
             ordered = [preferred, *[kind for kind in enabled if kind != preferred and kind in feasible]]
         else:
             ordered = [kind for kind in enabled if kind in feasible]

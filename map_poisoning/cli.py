@@ -108,6 +108,7 @@ def parser():
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--trust-model",choices=("bayesian","scalar"),default="bayesian"); p.add_argument("--admission-policy",choices=("auto_soft","accept_all","hard_reject"),default="accept_all")
     p.add_argument("--trust-threshold",type=float,default=0.50)
+    p.add_argument("--majority-sensor-confidence-threshold",type=float,default=0.50)
     p.add_argument("--trust-evidence-cap",type=float,default=12.0)
     p.add_argument("--trust-confirmation-multiplier",type=float,default=0.025)
     p.add_argument("--trust-contradiction-multiplier",type=float,default=5.0)
@@ -159,7 +160,12 @@ def config_from_args(args):
             contradiction_multiplier=float(args.trust_contradiction_multiplier),
             source_memory_recovery_rate=float(args.source_memory_recovery_rate),
         ),
-        fusion=FusionConfig(method=args.defense_method, admission_policy=args.admission_policy, max_claim_age=int(getattr(args, "observation_lifetime", 300))),
+        fusion=FusionConfig(
+            method=args.defense_method,
+            admission_policy=args.admission_policy,
+            max_claim_age=int(getattr(args, "observation_lifetime", 300)),
+            majority_sensor_confidence_threshold=float(getattr(args, "majority_sensor_confidence_threshold", 0.50)),
+        ),
         logging=LoggingConfig(output_directory, generate_plots=not args.no_plots, measure_fusion_runtime=args.measure_fusion_runtime),
         visualization=VisualizationConfig(
             animation=not args.no_animation and not args.headless,

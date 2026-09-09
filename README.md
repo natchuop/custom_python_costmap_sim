@@ -89,9 +89,9 @@ LiDAR with a five-cell range; observation confidence falls from 1.0 near the rob
 to 0.60 at range five. Direct and peer occupancy memories use a shared 300-step
 linear lifetime, with current LiDAR observations authoritative. Fused occupancy
 above 0.60 is treated as a hard planning obstacle for the probabilistic primary
-methods; this threshold matches the simulator's 0.60 minimum valid LiDAR
-confidence closely enough that persistent honest obstacle reports are not
-artificially weaker than Majority Vote's categorical BLOCKED vote. Bayesian trust is
+methods. Majority Vote uses a categorical BLOCKED vote gated at 0.50 sensor
+confidence, so normal five-cell LiDAR observations (confidence 0.60) are retained.
+Bayesian trust is
 the default (`alpha=9`, `beta=1`, evidence cap 12, confirmation multiplier 0.025,
 contradiction multiplier 5.0, distrust threshold 0.50). The reduced positive
 multiplier slows recovery after detected deception; scalar trust likewise uses a

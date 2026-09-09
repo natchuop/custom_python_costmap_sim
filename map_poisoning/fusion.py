@@ -42,6 +42,7 @@ class FusionEngine:
         duplicate_window_steps: int = 0,
         trust_threshold: float = 0.50,
         unknown_traversal_cost: float = DEFAULT_UNKNOWN_TRAVERSAL_COST,
+        majority_sensor_confidence_threshold: float = 0.50,
     ):
         self._runner: DefenseMethodRunner = build_defense_runner(
             method,
@@ -56,12 +57,14 @@ class FusionEngine:
             duplicate_window_steps=duplicate_window_steps,
             trust_threshold=trust_threshold,
             unknown_traversal_cost=unknown_traversal_cost,
+            majority_sensor_confidence_threshold=majority_sensor_confidence_threshold,
         )
         self.decay_rate = decay_rate
         self.max_claim_age = max_claim_age
         self.cost_scale = cost_scale
         self.cost_exponent = cost_exponent
         self.unknown_traversal_cost = float(unknown_traversal_cost)
+        self.majority_sensor_confidence_threshold = float(majority_sensor_confidence_threshold)
         self.blocked_probability_threshold = blocked_probability_threshold
         self.report_history: dict[str, StoredClaim] = {}
         self._active: dict[tuple[int, tuple[int, int]], StoredClaim] = {}
@@ -115,6 +118,33 @@ class FusionEngine:
         Operational fusion never uses this audit label.
         """
         return int(self._active_malicious_claim_count)
+
+    def malicious_claim_counts_by_type(
+        self,
+        attack_type_by_report_id: dict[str, str],
+        step: int | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Return active and operational malicious claims split by attack type.
+
+        Attack labels are audit metadata and never enter the fusion decision.
+        This helper only makes the reporting layer stop calling every
+        malicious claim a ``fake`` claim.
+        """
+        counts = {
+            attack_type: {"active": 0, "influential": 0}
+            for attack_type in ("fake_obstacle", "false_clearance", "stale_reassertion")
+        }
+        for item in self._active.values():
+            report = item.report
+            if report.scenario_event_id is None:
+                continue
+            attack_type = attack_type_by_report_id.get(str(report.report_id))
+            if attack_type not in counts:
+                continue
+            counts[attack_type]["active"] += 1
+            if self.operational_weight(report, step) > 1e-12:
+                counts[attack_type]["influential"] += 1
+        return counts
 
     def active_claim_count(self) -> int:
         """Return the number of active stored claims without changing state."""

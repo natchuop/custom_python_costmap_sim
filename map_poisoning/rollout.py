@@ -33,10 +33,21 @@ def _phase(config: SimulationConfig, step: int) -> str:
     return "RECOVERY"
 
 
-def _make_robots(config: SimulationConfig, manifest: ScenarioManifest, method: str):
+def _make_robots(
+    config: SimulationConfig,
+    manifest: ScenarioManifest,
+    method: str,
+    *,
+    include_attacker: bool = True,
+):
     static = np.asarray(manifest.static_grid, dtype=np.uint8)
     robots = []
-    for robot_id in (manifest.malicious_robot_id, *manifest.benign_robot_ids):
+    robot_ids = (
+        (manifest.malicious_robot_id, *manifest.benign_robot_ids)
+        if include_attacker
+        else tuple(manifest.benign_robot_ids)
+    )
+    for robot_id in robot_ids:
         tasks = (manifest.task_queues or {}).get(robot_id)
         start = (manifest.robot_starts or {}).get(robot_id)
         if not tasks or start is None:
@@ -63,6 +74,7 @@ def _make_robots(config: SimulationConfig, manifest: ScenarioManifest, method: s
             duplicate_window_steps=config.fusion.duplicate_window_steps,
             trust_threshold=config.trust.threshold,
             unknown_traversal_cost=config.fusion.unknown_traversal_cost,
+            majority_sensor_confidence_threshold=config.fusion.majority_sensor_confidence_threshold,
         )
         robots.append(
             ModularRobot(
@@ -90,9 +102,22 @@ def _route_attacker_cost(
     attacker_id: int,
     step: int,
     minimum_cost_delta: float,
-) -> tuple[float, bool]:
-    impact = _route_attacker_impact(robot, attacker_id, step, minimum_cost_delta)
-    return impact["attack_route_penalty"], impact["attack_induced_path_change"]
+) -> dict:
+    return _route_attacker_impact(robot, attacker_id, step, minimum_cost_delta)
+
+
+def _empty_route_impact() -> dict:
+    return {
+        "attack_route_penalty": 0.0,
+        "attack_signed_route_cost_delta": 0.0,
+        "attack_route_cost_reduction": 0.0,
+        "attack_extra_path_length": 0,
+        "attack_path_length_delta": 0,
+        "attack_shortcut_path_length": 0,
+        "attack_induced_path_change": False,
+        "with_attacker_path_length": 0,
+        "without_attacker_path_length": 0,
+    }
 
 
 def _route_attacker_impact(
@@ -108,13 +133,7 @@ def _route_attacker_impact(
     equally good A* tie paths are not attacker influence.
     """
     if not robot.path or robot.completed:
-        return {
-            "attack_route_penalty": 0.0,
-            "attack_extra_path_length": 0,
-            "attack_induced_path_change": False,
-            "with_attacker_path_length": 0,
-            "without_attacker_path_length": 0,
-        }
+        return _empty_route_impact()
 
     malicious_claim = lambda claim: claim.is_malicious
     cost_cache: dict[tuple[bool, tuple[int, int]], float] = {}
@@ -154,7 +173,11 @@ def _route_attacker_impact(
     if with_attacker is None:
         return {
             "attack_route_penalty": math.inf if without_attacker is not None else 0.0,
+            "attack_signed_route_cost_delta": math.inf if without_attacker is not None else 0.0,
+            "attack_route_cost_reduction": 0.0,
             "attack_extra_path_length": None,
+            "attack_path_length_delta": None,
+            "attack_shortcut_path_length": 0,
             "attack_induced_path_change": without_attacker is not None,
             "with_attacker_path_length": None,
             "without_attacker_path_length": None if without_attacker is None else max(0, len(without_attacker) - 1),
@@ -162,8 +185,12 @@ def _route_attacker_impact(
     if without_attacker is None:
         return {
             "attack_route_penalty": 0.0,
-            "attack_extra_path_length": 0,
-            "attack_induced_path_change": False,
+            "attack_signed_route_cost_delta": -math.inf,
+            "attack_route_cost_reduction": math.inf,
+            "attack_extra_path_length": None,
+            "attack_path_length_delta": None,
+            "attack_shortcut_path_length": None,
+            "attack_induced_path_change": True,
             "with_attacker_path_length": max(0, len(with_attacker) - 1),
             "without_attacker_path_length": None,
         }
@@ -177,16 +204,23 @@ def _route_attacker_impact(
     without_cost = path_cost(
         without_attacker, lambda cell: planning_cost(cell, exclude_malicious=True)
     )
-    penalty = max(0.0, with_cost - without_cost)
+    signed_delta = with_cost - without_cost
+    penalty = max(0.0, signed_delta)
+    reduction = max(0.0, -signed_delta)
     route_changed = tuple(with_attacker) != tuple(without_attacker)
     # A retained claim can add a small soft cost while leaving the chosen route
     # untouched.  That is map influence, but not navigation influence.
     with_length = max(0, len(with_attacker) - 1)
     without_length = max(0, len(without_attacker) - 1)
+    path_delta = with_length - without_length
     return {
         "attack_route_penalty": penalty,
-        "attack_extra_path_length": max(0, with_length - without_length),
-        "attack_induced_path_change": route_changed and penalty >= minimum_cost_delta,
+        "attack_signed_route_cost_delta": signed_delta,
+        "attack_route_cost_reduction": reduction,
+        "attack_extra_path_length": max(0, path_delta),
+        "attack_path_length_delta": path_delta,
+        "attack_shortcut_path_length": max(0, -path_delta),
+        "attack_induced_path_change": route_changed and abs(signed_delta) >= minimum_cost_delta,
         "with_attacker_path_length": with_length,
         "without_attacker_path_length": without_length,
     }
@@ -232,10 +266,24 @@ def run_manifest_rollout(
     *,
     show_progress: bool = True,
     capture_reference_state: bool = False,
+    neutral_recon: bool = False,
+    virtual_attacker_recon: bool = False,
 ) -> tuple[World, list[ModularRobot], dict]:
-    """Replay a manifest with standardized sensing, trust, and replanning."""
+    """Replay a manifest with standardized sensing, trust, and replanning.
+
+    ``neutral_recon`` is used only by attack authoring.  It removes peer
+    sharing from the clean reference prefix so candidate placement cannot
+    depend on a defense method.  ``virtual_attacker_recon`` additionally
+    removes the malicious robot from physical traffic during that prefix; the
+    attacker is then only a scripted report source during authoring.
+    """
     world = World(np.asarray(manifest.static_grid, dtype=np.uint8), manifest.obstacle_episodes, manifest.permanent_obstacles)
-    robots = _make_robots(config, manifest, method)
+    robots = _make_robots(
+        config,
+        manifest,
+        method,
+        include_attacker=not virtual_attacker_recon,
+    )
     attacker = manifest.malicious_robot_id
     malicious_ids = frozenset(
         report_id for event in manifest.attack_events for report_id in event.report_ids
@@ -243,6 +291,8 @@ def run_manifest_rollout(
     log = {
         "engine": "modular_native",
         "defense_method": method,
+        "recon_mode": "neutral_local_sensing" if neutral_recon else "replay",
+        "attacker_recon_mode": "virtual_report_source" if virtual_attacker_recon else "physical_robot",
         "malicious_robot_id": attacker,
         "phase": [],
         "events": [],
@@ -283,8 +333,8 @@ def run_manifest_rollout(
     if show_progress:
         print(f"Simulating {max_steps} steps with {method} ({live_note})...", flush=True)
     route_eval_period = max(1, int(config.visualization.route_impact_eval_period_steps))
-    latest_route_metrics: dict[int, tuple[float, bool]] = {
-        robot.robot_id: (0.0, False) for robot in robots
+    latest_route_metrics: dict[int, dict] = {
+        robot.robot_id: _empty_route_impact() for robot in robots
     }
     attacks_by_step: dict[int, list] = {}
     attack_type_by_report_id: dict[str, str] = {}
@@ -371,8 +421,14 @@ def run_manifest_rollout(
                 if materially_changed:
                     trust_verification_route_change[robot.robot_id] = True
             for batch in robot.last_trust_batches:
+                # Current trust changes routing influence only for these
+                # methods.  Full Trust and Majority Vote retain their own
+                # semantics, while Trust Fused freezes trust at report time;
+                # a threshold crossing must not create an indirect replan for
+                # them.
                 if (
-                    float(batch["old_trust"]) >= config.trust.threshold
+                    method in {"source_memory", "trust_threshold"}
+                    and float(batch["old_trust"]) >= config.trust.threshold
                     and float(batch["new_trust"]) < config.trust.threshold
                 ):
                     trust_threshold_crossing[robot.robot_id] = True
@@ -427,44 +483,45 @@ def run_manifest_rollout(
 
         deliveries: dict[int, list[ClaimReport]] = {robot.robot_id: [] for robot in robots}
 
-        for recipient_id, report in pending_honest.pop(step, ()):
-            deliveries[recipient_id].append(report)
-            log["honest_report_deliveries"] += 1
-            if measure_honest_outcomes:
-                log["honest_report_ages"].append(step - report.observation_step)
+        if not neutral_recon:
+            for recipient_id, report in pending_honest.pop(step, ()):
+                deliveries[recipient_id].append(report)
+                log["honest_report_deliveries"] += 1
+                if measure_honest_outcomes:
+                    log["honest_report_ages"].append(step - report.observation_step)
 
-        # Honest sharing. Sensor confidence is inherited from the LiDAR reading.
-        for robot in robots:
-            for observation in observations_by_robot[robot.robot_id]:
-                if not robot.should_share_observation(
-                    observation.cell,
-                    observation.claim,
-                    step,
-                    observation.sensor_confidence,
-                ):
-                    continue
-                serial += 1
-                report = ClaimReport(
-                    f"peer-{step:06}-{robot.robot_id}-{serial:06}",
-                    robot.robot_id,
-                    observation.cell,
-                    observation.claim,
-                    step,
-                    sensor_confidence=observation.sensor_confidence,
-                )
-                log["report_count_total"] += 1
-                log["honest_reports_generated"] += 1
-                for recipient in robots:
-                    if recipient.robot_id == robot.robot_id:
+            # Honest sharing. Sensor confidence is inherited from the LiDAR reading.
+            for robot in robots:
+                for observation in observations_by_robot[robot.robot_id]:
+                    if not robot.should_share_observation(
+                        observation.cell,
+                        observation.claim,
+                        step,
+                        observation.sensor_confidence,
+                    ):
                         continue
-                    delivery_step = step + config.honest_report_delay_steps
-                    if delivery_step == step:
-                        deliveries[recipient.robot_id].append(report)
-                        log["honest_report_deliveries"] += 1
-                        if measure_honest_outcomes:
-                            log["honest_report_ages"].append(0)
-                    else:
-                        pending_honest.setdefault(delivery_step, []).append((recipient.robot_id, report))
+                    serial += 1
+                    report = ClaimReport(
+                        f"peer-{step:06}-{robot.robot_id}-{serial:06}",
+                        robot.robot_id,
+                        observation.cell,
+                        observation.claim,
+                        step,
+                        sensor_confidence=observation.sensor_confidence,
+                    )
+                    log["report_count_total"] += 1
+                    log["honest_reports_generated"] += 1
+                    for recipient in robots:
+                        if recipient.robot_id == robot.robot_id:
+                            continue
+                        delivery_step = step + config.honest_report_delay_steps
+                        if delivery_step == step:
+                            deliveries[recipient.robot_id].append(report)
+                            log["honest_report_deliveries"] += 1
+                            if measure_honest_outcomes:
+                                log["honest_report_ages"].append(0)
+                        else:
+                            pending_honest.setdefault(delivery_step, []).append((recipient.robot_id, report))
 
         # Attack reports retain the manifest's observation_step; stale attacks
         # therefore carry their original blocked-observation timestamp.
@@ -591,6 +648,7 @@ def run_manifest_rollout(
                     "operational_weight": operational_weight,
                     "operationally_ignored": operationally_ignored,
                     "is_malicious": True,
+                    "attack_type": attack_type_by_report_id.get(str(report.report_id)),
                     "evidence_after": evidence,
                     "scenario_event_id": report.scenario_event_id,
                 })
@@ -842,8 +900,14 @@ def run_manifest_rollout(
                     step,
                     config.visualization.route_impact_min_cost_delta,
                 )
-            route_cost, route_affected = latest_route_metrics[robot.robot_id]
-            active_fake_claims = robot.fusion.active_malicious_claim_count()
+            route_impact = latest_route_metrics[robot.robot_id]
+            route_cost = route_impact["attack_route_penalty"]
+            route_affected = route_impact["attack_induced_path_change"]
+            malicious_counts = robot.fusion.malicious_claim_counts_by_type(
+                attack_type_by_report_id,
+                step,
+            )
+            active_fake_claims = malicious_counts[AttackType.FAKE_OBSTACLE.value]["active"]
             sample = {
                 "step": step,
                 "phase": phase,
@@ -870,11 +934,21 @@ def run_manifest_rollout(
                 "attacker_trust": robot.trust.score(attacker),
                 "attacker_source_memory": robot.trust.memory_score(attacker),
                 "attacker_is_trusted": robot.trust.score(attacker) >= config.trust.threshold,
+                "active_malicious_claim_count": sum(item["active"] for item in malicious_counts.values()),
+                "influential_malicious_claim_count": sum(item["influential"] for item in malicious_counts.values()),
                 "active_fake_claim_count": active_fake_claims,
-                "influential_fake_claim_count": active_fake_claims if route_affected else 0,
+                "influential_fake_claim_count": malicious_counts[AttackType.FAKE_OBSTACLE.value]["influential"],
+                "active_false_clearance_claim_count": malicious_counts[AttackType.FALSE_CLEARANCE.value]["active"],
+                "influential_false_clearance_claim_count": malicious_counts[AttackType.FALSE_CLEARANCE.value]["influential"],
+                "active_stale_reassertion_claim_count": malicious_counts[AttackType.STALE_REASSERTION.value]["active"],
+                "influential_stale_reassertion_claim_count": malicious_counts[AttackType.STALE_REASSERTION.value]["influential"],
                 "attacker_route_cost_delta": route_cost,
                 "route_affected_by_attacker": route_affected,
                 "attacker_attributable_cost_on_route": route_cost,
+                "attacker_signed_route_cost_delta": route_impact["attack_signed_route_cost_delta"],
+                "attacker_route_cost_reduction": route_impact["attack_route_cost_reduction"],
+                "attacker_path_length_delta": route_impact["attack_path_length_delta"],
+                "attacker_shortcut_path_length": route_impact["attack_shortcut_path_length"],
                 "preferred_route_affected_by_attacker": route_affected,
                 "map_error": (
                     _map_error(robot, world, step, truth_grid=truth_grid)
@@ -1023,16 +1097,77 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         impacts_by_attack.setdefault(str(event.get("scenario_event_id")), []).append(event)
     per_attack_penalties = []
     per_attack_extra_lengths = []
+    per_attack_signed_deltas = []
+    per_attack_cost_reductions = []
+    per_attack_shortcuts = []
     attack_ids_with_path_change = set()
     for attack_id, events in impacts_by_attack.items():
-        finite_penalties = [float(event["attack_route_penalty"]) for event in events if event.get("attack_route_penalty") is not None]
+        penalties = [float(event["attack_route_penalty"]) for event in events if event.get("attack_route_penalty") is not None]
         extra_lengths = [int(event["attack_extra_path_length"]) for event in events if event.get("attack_extra_path_length") is not None]
-        if finite_penalties:
-            per_attack_penalties.append(max(finite_penalties))
+        signed_deltas = [float(event["attack_signed_route_cost_delta"]) for event in events if event.get("attack_signed_route_cost_delta") is not None]
+        reductions = [float(event["attack_route_cost_reduction"]) for event in events if event.get("attack_route_cost_reduction") is not None]
+        shortcuts = [int(event["attack_shortcut_path_length"]) for event in events if event.get("attack_shortcut_path_length") is not None]
+        if penalties:
+            per_attack_penalties.append(max(penalties))
         if extra_lengths:
             per_attack_extra_lengths.append(max(extra_lengths))
+        if signed_deltas:
+            per_attack_signed_deltas.append(max(signed_deltas))
+        if reductions:
+            per_attack_cost_reductions.append(max(reductions))
+        if shortcuts:
+            per_attack_shortcuts.append(max(shortcuts))
         if any(bool(event.get("attack_induced_path_change")) for event in events):
             attack_ids_with_path_change.add(attack_id)
+
+    def finite_metric(events, field):
+        return [
+            float(event[field])
+            for event in events
+            if event.get(field) is not None and math.isfinite(float(event[field]))
+        ]
+
+    finite_signed_deltas = finite_metric(impact_events, "attack_signed_route_cost_delta")
+    finite_reductions = finite_metric(impact_events, "attack_route_cost_reduction")
+    finite_shortcuts = finite_metric(impact_events, "attack_shortcut_path_length")
+
+    attack_type_metrics = {}
+    for attack_type in (item.value for item in AttackType):
+        prefix = f"{attack_type}"
+        authored_events = [event for event in manifest.attack_events if event.attack_type.value == attack_type]
+        authored_cells = sum(len(event.cells) for event in authored_events)
+        received = [
+            event for event in log["events"]
+            if event.get("kind") == "report_received"
+            and event.get("attack_type") == attack_type
+        ]
+        # Report-received rows are retained for malicious reports only.  They
+        # represent delivered report cells, so this denominator is explicit
+        # and comparable across methods sharing one manifest.
+        accepted = sum(bool(event.get("accepted")) for event in received)
+        influential = sum(
+            bool(event.get("accepted")) and float(event.get("operational_weight", 0.0)) > 1e-12
+            for event in received
+        )
+        accepted_events = {
+            str(event.get("scenario_event_id")) for event in received if event.get("accepted")
+        }
+        influential_events = {
+            str(event.get("scenario_event_id"))
+            for event in received
+            if event.get("accepted") and float(event.get("operational_weight", 0.0)) > 1e-12
+        }
+        attack_type_metrics.update({
+            f"{prefix}_events_authored": len(authored_events),
+            f"{prefix}_report_cells_authored": authored_cells,
+            f"{prefix}_report_cells_delivered": len(received),
+            f"{prefix}_report_cells_accepted": accepted,
+            f"{prefix}_report_cells_influential": influential,
+            f"{prefix}_false_acceptance_rate": influential / len(received) if received else 0.0,
+            f"{prefix}_acceptance_rate": accepted / len(received) if received else 0.0,
+            f"{prefix}_event_acceptance_rate": len(accepted_events) / len(authored_events) if authored_events else 0.0,
+            f"{prefix}_event_false_acceptance_rate": len(influential_events) / len(authored_events) if authored_events else 0.0,
+        })
     stale_impact_events = [
         event for event in impact_events
         if event.get("attack_type") == AttackType.STALE_REASSERTION.value
@@ -1144,6 +1279,8 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "false_acceptance_count": log["false_acceptance_count"],
         "false_acceptance_rate": log["false_acceptance_count"] / max(1, log["malicious_report_deliveries"]),
         "malicious_report_deliveries": log["malicious_report_deliveries"],
+        "malicious_acceptance_rate": log["malicious_reports_accepted"] / max(1, log["malicious_report_deliveries"]),
+        "malicious_false_acceptance_rate": log["false_acceptance_count"] / max(1, log["malicious_report_deliveries"]),
         "malicious_reports_accepted": log["malicious_reports_accepted"],
         "malicious_reports_influential": log["malicious_reports_influential"],
         "malicious_reports_operationally_ignored": log["malicious_reports_operationally_ignored"],
@@ -1157,6 +1294,19 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         ),
         "attack_extra_path_length_max": max(per_attack_extra_lengths, default=0),
         "attack_extra_path_length_total": sum(per_attack_extra_lengths),
+        "attack_signed_route_cost_delta_mean": (
+            sum(finite_signed_deltas) / len(finite_signed_deltas) if finite_signed_deltas else 0.0
+        ),
+        "attack_signed_route_cost_delta_min": min(finite_signed_deltas, default=0.0),
+        "attack_signed_route_cost_delta_max": max(finite_signed_deltas, default=0.0),
+        "attack_route_cost_reduction_mean": (
+            sum(finite_reductions) / len(finite_reductions) if finite_reductions else 0.0
+        ),
+        "attack_route_cost_reduction_total": sum(finite_reductions),
+        "attack_shortcut_path_length_mean": (
+            sum(finite_shortcuts) / len(finite_shortcuts) if finite_shortcuts else 0.0
+        ),
+        "attack_shortcut_path_length_total": sum(finite_shortcuts),
         "attack_induced_path_changes": len(attack_ids_with_path_change),
         "attacks_evaluated_for_route_impact": len(impacts_by_attack),
         "stale_attack_report_cells": sum(int(event.get("attack_report_cells", 0)) for event in stale_impact_events),
@@ -1209,6 +1359,7 @@ def collect_rollout_metrics(config: SimulationConfig, manifest: ScenarioManifest
         "actual_attack_actions": len([report for report in log["reports"] if report["is_malicious"]]),
         "manifest_hash": manifest.map_hash, "map_hash": manifest.map_hash,
         "scenario_manifest_hash": scenario_manifest_hash(manifest),
+        **attack_type_metrics,
     }
     return summary, collector
 
